@@ -1247,7 +1247,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
             title={sharedSession ? 'Session sharing enabled' : 'Enable session sharing'}
           >
             <Share2 className="w-3 h-3" />
-            <span className="hidden xl:inline">{sharedSession ? 'Shared' : 'Private'}</span>
           </button>
 
           {(connected || offlineSuspended) && (

@@ -32,6 +32,14 @@
 - Backend: Express, WebSocket, `ssh2`, `multer`
 - Runtime: Node.js
 
+## 目录结构
+
+- `web/`: 前端工程，包含 `index.html` 和 `src/`
+- `server/`: 后端路由、SSH 会话管理和服务端工具函数
+- `conf/`: 默认配置和示例环境变量
+- `dist/`: 生产构建产物
+- `Dockerfile` / `docker-compose.yaml`: 容器化部署配置
+
 ## 本地运行
 
 ### 前置要求
@@ -49,7 +57,8 @@ npm install
 
 ```bash
 npm run dev
-``` aszzzz
+```
+
 默认监听：
 
 - `http://0.0.0.0:3000`
@@ -61,12 +70,30 @@ npm run build
 npm run start
 ```
 
+### Docker Compose
+
+```bash
+docker compose up -d --build
+```
+
+如需自定义密钥和端口，可先基于 `conf/.env.example` 创建自己的 `.env`。
+
 ## 配置说明
 
-项目会在根目录读写以下文件：
+源码仓库中的默认配置文件：
 
-- `webssh_config.json`: 应用配置，如主题、字号、会话保活时长、登录保护
-- `ssh_secrets.json`: 加密保存的 SSH 主机凭据
+- `conf/webssh_config.json`: 应用默认配置，如主题、字号、会话保活时长、登录保护
+- `conf/.env.example`: 环境变量示例
+
+运行时数据默认行为：
+
+- 本地直接运行时：
+  - 配置文件读取 `conf/webssh_config.json`
+  - SSH 凭据保存到根目录 `ssh_secrets.json`
+  - 本地主密钥保存到根目录 `.webssh_master_key`
+- Docker Compose 运行时：
+  - 配置文件、SSH 凭据和主密钥都保存在卷 `/app/data`
+  - 通过 `WEBSSH_DATA_DIR` 和 `WEBSSH_CONFIG_DIR` 控制路径
 
 默认可配置项包括：
 
@@ -94,6 +121,7 @@ npm run start
 - `/ssh/list` 只返回主机元数据和 `hasCredential`，不会返回密码、私钥或 passphrase。
 - 新 SSH 连接通过 POST 创建后端会话，WebSocket URL 不携带 SSH 凭据。
 - 生产环境必须配置 `WEBSSH_MASTER_KEY`，并使用 HTTPS/WSS；不要依赖自动生成的本地密钥做多实例部署。
+- 不建议把 `ssh_secrets.json` 纳入仓库；它属于运行时敏感数据，不属于 `conf/` 里的源码配置。
 - 应用登录密码使用 `scrypt` 哈希保存，`/config` 不会返回密码或密码哈希；生产环境应配置 `WEBSSH_AUTH_SECRET`。
 - `httpsEnforced` 开启后，HTTP 和 `ws://` 请求会被拒绝；反向代理需要正确传递 `X-Forwarded-Proto: https`。如果配置里未设置，仍可回退使用 `WEBSSH_REQUIRE_HTTPS=true`。
 - 登录接口按来源 IP 限制为 15 分钟最多 5 次失败，触发后临时锁定 15 分钟。

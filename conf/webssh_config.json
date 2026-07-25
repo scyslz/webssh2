@@ -7,6 +7,5 @@
   "httpsEnforced": false,
   "originCheckEnabled": false,
   "authEnabled": false,
-  "authUsername": "",
-  "authPassword": ""
+  "authUsername": ""
 }

@@ -46,15 +46,7 @@ export const Header: React.FC<HeaderProps> = ({
           <h1 className={`font-bold text-xs tracking-tight ${isLight ? 'text-slate-900' : 'text-slate-100'}`}>
             WebSSH
           </h1>
-          <span
-            className={`text-[9px] font-medium border px-1 py-0.2 rounded ${
-              isLight
-                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                : 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
-            }`}
-          >
-            v1.0.0
-          </span>
+          
         </div>
       </div>
 

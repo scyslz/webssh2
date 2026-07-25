@@ -1,0 +1,24 @@
+services:
+  webssh2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: webssh2:latest
+    container_name: webssh2
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      WEBSSH_DATA_DIR: /app/data
+      WEBSSH_CONFIG_DIR: /app/data
+      WEBSSH_MASTER_KEY: "${WEBSSH_MASTER_KEY:-replace-with-a-high-entropy-secret}"
+      WEBSSH_AUTH_SECRET: "${WEBSSH_AUTH_SECRET:-replace-with-a-different-high-entropy-secret}"
+      WEBSSH_REQUIRE_HTTPS: "${WEBSSH_REQUIRE_HTTPS:-false}"
+      WEBSSH_ALLOWED_ORIGINS: "${WEBSSH_ALLOWED_ORIGINS:-}"
+    volumes:
+      - webssh2-data:/app/data
+
+volumes:
+  webssh2-data:
