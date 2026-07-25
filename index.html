@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover" />
+    <title>WebSSH</title>
+    <script>
+      (function(){
+        var p = window.location.pathname.replace(/\/index\.html?$/, '').replace(/\/+$/, '');
+        window.__BASE__ = p || '';
+        if (p && p !== '') {
+          var base = document.createElement('base');
+          base.href = p + '/';
+          document.head.insertBefore(base, document.head.firstChild);
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="src/main.tsx"></script>
+  </body>
+</html>

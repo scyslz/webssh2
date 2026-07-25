@@ -1,0 +1,81 @@
+@import "tailwindcss";
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+body {
+  position: fixed;
+  inset: 0;
+  overscroll-behavior: none;
+  touch-action: none;
+}
+
+@media (hover: none) and (pointer: coarse) {
+  input:not([type="range"]):not([type="checkbox"]):not([type="radio"]):not([type="file"]),
+  textarea,
+  select {
+    font-size: 16px !important;
+  }
+}
+
+.xterm {
+  height: 100%;
+  background-color: transparent !important;
+  touch-action: pan-y;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.xterm-viewport {
+  overflow-y: auto !important;
+  background-color: transparent !important;
+  scrollbar-gutter: stable both-edges;
+  scrollbar-width: auto;
+  padding-right: 10px;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.xterm-viewport::-webkit-scrollbar {
+  width: 14px;
+}
+
+.xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.xterm-viewport::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.55);
+  border-radius: 9999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+.xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.8);
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+.xterm-screen {
+  background-color: transparent !important;
+  touch-action: pan-y;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.xterm-screen canvas {
+  touch-action: pan-y;
+  -webkit-user-select: none;
+  user-select: none;
+}

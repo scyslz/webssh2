@@ -1,0 +1,12 @@
+{
+  "savePass": true,
+  "timeout": 1200,
+  "fontSize": 12,
+  "fontFamily": "Consolas, Monaco, \"Courier New\", monospace",
+  "theme": "dracula",
+  "httpsEnforced": false,
+  "originCheckEnabled": false,
+  "authEnabled": false,
+  "authUsername": "",
+  "authPassword": ""
+}

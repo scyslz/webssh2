@@ -1,0 +1,6 @@
+{
+  "name": "WebSSH",
+  "description": "A web-based SSH terminal and SFTP file manager",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
