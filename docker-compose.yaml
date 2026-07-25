@@ -1,9 +1,6 @@
 services:
   webssh2:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: webssh2:latest
+    image: scyslz/webssh2:latest
     container_name: webssh2
     restart: unless-stopped
     ports:
