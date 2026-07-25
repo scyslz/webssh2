@@ -8,10 +8,9 @@
 - Terminal 和 SFTP 一体化。一个连接同时支持命令执行、目录浏览、文件上传下载、文本文件在线编辑，减少工具切换。
 - 会话可恢复。支持后台 SSH 会话保活、同浏览器标签重连、强制接管，网络抖动或误关标签后更容易继续工作。
 - 移动端可用。针对手机和平板做了输入、粘贴、快捷键栏、选择复制等适配，不只是桌面端可用。
-- 保存常用主机。支持保存 SSH 连接配置，便于重复登录测试机、生产机、跳板机。
 - 支持密码和私钥登录。兼容常见 SSH 认证方式，覆盖多数运维场景。
 - 内置基础访问保护。支持应用级登录保护，避免服务裸露后任何人都能直接进入连接页。
-- 可配置体验。支持主题、终端字号、后台会话超时等设置，便于按团队习惯调整。
+- 可配置体验。支持主题、终端字号、后台会话超时等设置。
 
 ## 功能清单
 
@@ -24,6 +23,13 @@
 - 会话恢复与接管
 - 登录鉴权保护
 - 多主题切换
+
+## Snapshot
+<img width="196" height="341" alt="image" src="https://github.com/user-attachments/assets/3de17455-4ed6-4d70-9a2e-7e2f99f8ecf8" /> 
+
+<img width="948" height="413" alt="image" src="https://github.com/user-attachments/assets/41a54ade-9c05-49f4-9a09-f8c6c3308ec9" />
+
+
 
 ## 技术栈
 
@@ -71,6 +77,31 @@ npm run start
 ```
 
 ### Docker Compose
+```
+services:
+  webssh2:
+      dockerfile: Dockerfile
+    image: scyslz/webssh2:latest
+    container_name: webssh2
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      WEBSSH_DATA_DIR: /app/data
+      WEBSSH_CONFIG_DIR: /app/data
+      WEBSSH_MASTER_KEY: "${WEBSSH_MASTER_KEY:-replace-with-a-high-entroapy-secret}"
+      WEBSSH_AUTH_SECRET: "${WEBSSH_AUTH_SECRET:-replace-with-a-different-high-entropy-secret}"
+      WEBSSH_REQUIRE_HTTPS: "${WEBSSH_REQUIRE_HTTPS:-false}"
+      WEBSSH_ALLOWED_ORIGINS: "${WEBSSH_ALLOWED_ORIGINS:-}"
+    volumes:
+      - webssh2-data:/app/data
+
+volumes:
+  webssh2-data:
+
+```
 
 ```bash
 docker compose up -d --build
