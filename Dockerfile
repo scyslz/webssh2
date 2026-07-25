@@ -16,7 +16,9 @@ ENV NODE_ENV=production
 ENV PORT=3000
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+RUN npm ci --omit=dev && \
+    npm cache clean --force && \
+    rm -rf /usr/local/lib/node_modules/npm /usr/local/share/man /root/.npm /tmp/*
 
 COPY --from=builder /app/dist ./dist
 COPY conf/webssh_config.json ./defaults/webssh_config.json
@@ -26,5 +28,5 @@ RUN mkdir -p /app/data
 
 EXPOSE 3000
 
-ENTRYPOINT ["sh", "/app/docker-entrypoint.sh"]
-CMD ["npm", "run", "start"]
+ENTRYPOINT ["/bin/sh", "/app/docker-entrypoint.sh"]
+CMD ["node", "dist/server.cjs"]
