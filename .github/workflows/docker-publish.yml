@@ -3,22 +3,58 @@ name: Build and Push Docker Image
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
-env:
-  IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/webssh2
-
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch / Tag / Commit"
+        required: false
+        default: "main"
 
 jobs:
   build-and-push:
-    environment: PROD
+    name: Build Docker Image
     runs-on: ubuntu-latest
+
+    environment:
+      name: PROD
+
     permissions:
       contents: read
 
+    env:
+      IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/webssh2
+
     steps:
+      - name: Debug (GitHub Context)
+        run: |
+          echo "event_name=${{ github.event_name }}"
+          echo "github.ref=${{ github.ref }}"
+          echo "github.ref_name=${{ github.ref_name }}"
+          echo "github.sha=${{ github.sha }}"
+          echo "workflow input ref=${{ github.event.inputs.ref }}"
+          echo "environment=PROD"
+
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Debug (Environment Secrets)
+        shell: bash
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          echo "Docker username length: ${#DOCKER_USERNAME}"
+
+          if [ -n "$DOCKER_PASSWORD" ]; then
+            echo "Docker password: OK"
+          else
+            echo "Docker password: MISSING"
+            exit 1
+          fi
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -27,7 +63,6 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Login to Docker Hub
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
@@ -39,21 +74,28 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=,suffix=,format=short
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' }}
+
+      - name: Debug (Generated Tags)
+        run: |
+          echo "Image: $IMAGE_NAME"
+          echo ""
+          echo "Tags:"
+          echo "${{ steps.meta.outputs.tags }}"
+          echo ""
+          echo "Labels:"
+          echo "${{ steps.meta.outputs.labels }}"
 
       - name: Build and Push
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
           platforms: linux/amd64,linux/arm64
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-
           cache-from: type=gha
           cache-to: type=gha,mode=max
