@@ -8,22 +8,9 @@ import { SFTPView } from './components/SFTPView';
 import { ConnectionModal } from './components/ConnectionModal';
 import { SavedHostsModal } from './components/SavedHostsModal';
 import { SettingsModal } from './components/SettingsModal';
-import { SessionsModal } from './components/SessionsModal';
+import { SessionsModal, BackendSession } from './components/SessionsModal';
 import { LoginPage } from './components/LoginPage';
 import { Terminal, FolderTree, Shield, Plus, Server, Sparkles, Command } from 'lucide-react';
-
-interface BackendSession {
-  id: string;
-  host: string;
-  port: number;
-  username: string;
-  createdAt: number;
-  lastActivity: number;
-  attachedClients: number;
-  shared?: boolean;
-  credentialId?: string;
-  ownerClientId?: string;
-}
 
 export default function App() {
   const activeTabsStorageKey = 'webssh_active_tabs';
@@ -521,7 +508,6 @@ export default function App() {
       <Header
         onNewConnection={() => setConnModalOpen(true)}
         onOpenSessions={() => {
-          fetchServerSessions();
           setSessionsModalOpen(true);
         }}
         onOpenSavedHosts={() => setSavedHostsModalOpen(true)}
@@ -696,6 +682,8 @@ export default function App() {
       <SessionsModal
         isOpen={sessionsModalOpen}
         onClose={() => setSessionsModalOpen(false)}
+        sessions={serverSessions}
+        onRefresh={fetchServerSessions}
         onAttachSession={handleAttachBackendSession}
         onKillSession={handleSessionKilled}
         tabs={tabs}

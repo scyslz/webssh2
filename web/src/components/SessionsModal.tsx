@@ -1,9 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 import { X, Server, RefreshCw, Trash2, ExternalLink, Activity, Radio } from 'lucide-react';
 import { SSHTab } from '../types';
 import { apiFetch, apiUrl } from '../api';
 
-interface BackendSession {
+export interface BackendSession {
   id: string;
   host: string;
   port: number;
@@ -19,6 +19,8 @@ interface BackendSession {
 interface SessionsModalProps {
   isOpen: boolean;
   onClose: () => void;
+  sessions: BackendSession[];
+  onRefresh?: () => void;
   onAttachSession: (session: BackendSession, force?: boolean) => void;
   onKillSession: (sessionId: string) => void;
   tabs: SSHTab[];
@@ -28,15 +30,13 @@ interface SessionsModalProps {
 export const SessionsModal: React.FC<SessionsModalProps> = ({
   isOpen,
   onClose,
+  sessions,
+  onRefresh,
   onAttachSession,
   onKillSession,
   tabs,
   theme,
 }) => {
-  const [sessions, setSessions] = useState<BackendSession[]>([]);
-  const [loading, setLoading] = useState<boolean>(false);
-  const [error, setError] = useState<string | null>(null);
-
   const isLight = theme === 'light';
 
   const getRestoreTone = (tabCount: number, attachedClients: number) => {
@@ -71,29 +71,6 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
       hour12: false,
     });
 
-  const fetchSessions = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await apiFetch(apiUrl('/ssh/sessions'));
-      if (!res.ok) throw new Error('Failed to fetch sessions');
-      const data = await res.json();
-      if (Array.isArray(data)) {
-        setSessions(data);
-      }
-    } catch (err: any) {
-      setError(err.message || 'Error loading active sessions');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    if (isOpen) {
-      fetchSessions();
-    }
-  }, [isOpen]);
-
   const handleKillSession = async (sessionId: string) => {
     try {
       await apiFetch(apiUrl('/ssh/sessions/kill'), {
@@ -102,7 +79,6 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
         body: JSON.stringify({ sessionId }),
       });
       onKillSession(sessionId);
-      fetchSessions();
     } catch (err) {
       // ignore
     }
@@ -135,13 +111,12 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
 
           <div className="flex items-center gap-1">
             <button
-              onClick={fetchSessions}
-              disabled={loading}
+              onClick={onRefresh}
               className={`p-1.5 rounded-lg border transition cursor-pointer ${
                 isLight
                   ? 'hover:bg-slate-200 border-slate-300 text-slate-600'
                   : 'hover:bg-slate-800 border-slate-700 text-slate-300'
-              } ${loading ? 'animate-spin' : ''}`}
+              }`}
               title="Refresh Sessions"
             >
               <RefreshCw className="w-3.5 h-3.5" />
@@ -161,28 +136,13 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
 
         {/* Sessions List Content */}
         <div className="p-4 flex-1 overflow-y-auto space-y-2 min-h-[220px]">
-          {loading && (
-            <div className="flex flex-col items-center justify-center py-12 text-slate-400 gap-2 font-mono text-xs">
-              <RefreshCw className="w-5 h-5 animate-spin text-emerald-500" />
-              <span>Scanning server sessions...</span>
-            </div>
-          )}
-
-          {!loading && error && (
-            <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-lg text-rose-400 text-xs font-mono">
-              {error}
-            </div>
-          )}
-
-          {!loading && !error && sessions.length === 0 && (
+          {sessions.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-12 text-slate-400 gap-2">
               <Radio className="w-8 h-8 text-slate-600 animate-pulse" />
               <p className="text-xs font-medium">No active SSH sessions running on server.</p>
               <p className="text-[11px] text-slate-500">Connect to a server to create persistent sessions.</p>
             </div>
-          )}
-
-          {!loading &&
+          ) : (
             sessions.map((sess) => {
               const tabMatches = tabs
                 .map((tab, index) => ({ tab, index }))
@@ -246,7 +206,7 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
                   </div>
                 </div>
               );
-            })}
+            }))}
         </div>
 
         {/* Modal Footer */}
