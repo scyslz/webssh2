@@ -17,8 +17,7 @@ jobs:
     name: Build Docker Image
     runs-on: ubuntu-latest
 
-    environment:
-      name: PROD
+    environment: PROD
 
     permissions:
       contents: read
