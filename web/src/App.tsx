@@ -4,7 +4,7 @@ import { apiFetch, apiUrl } from './api';
 import { sessionGet, sessionSet, globalGet, globalSet } from './storage';
 import { Header } from './components/Header';
 import { Tabs } from './components/Tabs';
-import { TerminalView } from './components/TerminalView';
+import { TerminalView } from './components/terminal/TerminalView';
 import { SFTPView } from './components/SFTPView';
 import { ConnectionModal } from './components/ConnectionModal';
 import { SavedHostsModal } from './components/SavedHostsModal';
@@ -119,7 +119,7 @@ export default function App() {
         return { ...tab, connected: restorable };
       })
     );
-  };
+  }, []);
 
   useEffect(() => {
     try {
@@ -241,20 +241,25 @@ export default function App() {
   }, [authChecking, authEnabled, authenticated, loadSavedHosts, loadAppConfig, fetchServerSessions, reconcileTabsWithServer]);
 
   useEffect(() => {
-    const viewport = window.visualViewport;
-    if (!viewport) return;
-
-    const syncViewportHeight = () => {
-      setViewportHeight(viewport.height || window.innerHeight);
+    const syncHeight = () => {
+      const vh = window.visualViewport?.height || window.innerHeight;
+      setViewportHeight(vh);
     };
 
-    syncViewportHeight();
-    viewport.addEventListener('resize', syncViewportHeight);
-    viewport.addEventListener('scroll', syncViewportHeight);
+    syncHeight();
+
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', syncHeight);
+      window.visualViewport.addEventListener('scroll', syncHeight);
+    }
+    window.addEventListener('resize', syncHeight);
 
     return () => {
-      viewport.removeEventListener('resize', syncViewportHeight);
-      viewport.removeEventListener('scroll', syncViewportHeight);
+      if (window.visualViewport) {
+        window.visualViewport.removeEventListener('resize', syncHeight);
+        window.visualViewport.removeEventListener('scroll', syncHeight);
+      }
+      window.removeEventListener('resize', syncHeight);
     };
   }, []);
 

@@ -67,6 +67,14 @@ body {
   background-clip: content-box;
 }
 
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
 .xterm-screen {
   background-color: transparent !important;
   touch-action: pan-y;

@@ -48,15 +48,15 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
   }, [isOpen]);
 
   const getRestoreTone = (tabCount: number, attachedClients: number) => {
+    if (attachedClients > tabCount) {
+      return isLight
+        ? 'bg-rose-100 hover:bg-rose-200 text-rose-800 border-rose-300'
+        : 'bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border-rose-500/30';
+    }
     if (tabCount > 0) {
       return isLight
         ? 'bg-amber-100 hover:bg-amber-200 text-amber-800 border-amber-300'
         : 'bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border-amber-500/30';
-    }
-    if (attachedClients > 0) {
-      return isLight
-        ? 'bg-rose-100 hover:bg-rose-200 text-rose-800 border-rose-300'
-        : 'bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border-rose-500/30';
     }
     return isLight
       ? 'bg-emerald-100 hover:bg-emerald-200 text-emerald-800 border-emerald-300'
@@ -64,9 +64,9 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
   };
 
   const getRestoreTitle = (tabCount: number, attachedClients: number) => {
-    if (tabCount > 0) return 'Restore session already opened in this browser';
-    if (attachedClients > 0) return 'Force-free restore may be needed because another client is attached';
-    return 'Restore available session here';
+    if (attachedClients > tabCount) return 'Occupied by another client — use Force to take over';
+    if (tabCount > 0) return 'Already opened in this browser — click to restore';
+    return 'Available — click to restore here';
   };
 
   const formatLastActiveTime = (timestamp: number) =>
@@ -191,14 +191,14 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
                   <div className="flex items-center gap-1.5 shrink-0">
                     <button
                       onClick={() => {
-                        onAttachSession(sess, sess.attachedClients > 0);
+                        onAttachSession(sess, attachedClients > tabMatches.length);
                         onClose();
                       }}
                       className={`flex items-center gap-1 px-2.5 py-1 rounded-md border text-xs font-medium transition cursor-pointer shadow-xs ${restoreTone}`}
                       title={restoreTitle}
                     >
                       <ExternalLink className="w-3 h-3" />
-                      <span>{sess.attachedClients > 0 ? 'Force' : 'Restore'}</span>
+                      <span>{attachedClients > tabMatches.length ? 'Force' : 'Restore'}</span>
                     </button>
 
                     <button

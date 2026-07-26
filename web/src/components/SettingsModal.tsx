@@ -1,5 +1,6 @@
 import React from 'react';
 import { WebSSHConfig } from '../types';
+import { themeOptions, isLightTheme } from '../theme';
 import { X, Settings, Monitor, Type, Clock, LogOut, Lock, Shield } from 'lucide-react';
 
 interface SettingsModalProps {
@@ -19,19 +20,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 }) => {
   if (!isOpen) return null;
 
-  const isLight = config.theme === 'light';
+  const isLight = isLightTheme(config.theme);
   const fieldClass = `w-full border rounded-lg px-3 py-2 text-base sm:text-xs focus:outline-none font-mono ${
     isLight
       ? 'bg-white border-slate-300 text-slate-800 focus:border-slate-500'
       : 'bg-slate-950 border-slate-800 text-slate-200 focus:border-slate-700'
   }`;
-
-  const themes: { id: WebSSHConfig['theme']; label: string; bg: string }[] = [
-    { id: 'dark', label: 'Slate Dark', bg: 'bg-slate-900 border-slate-700 text-slate-200' },
-    { id: 'dracula', label: 'Dracula', bg: 'bg-[#282a36] border-[#44475a] text-slate-200' },
-    { id: 'matrix', label: 'Matrix', bg: 'bg-[#050b07] border-emerald-900 text-emerald-400' },
-    { id: 'light', label: 'Light', bg: 'bg-white border-slate-300 text-slate-800' },
-  ];
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 select-none">
@@ -68,7 +62,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <span>Terminal Theme</span>
             </label>
             <div className="grid grid-cols-2 gap-2">
-              {themes.map((t) => (
+              {themeOptions.map((t) => (
                 <button
                   key={t.id}
                   onClick={() => onChangeConfig({ ...config, theme: t.id })}

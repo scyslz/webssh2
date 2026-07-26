@@ -3,7 +3,7 @@
   "timeout": 1200,
   "fontSize": 12,
   "fontFamily": "Consolas, Monaco, \"Courier New\", monospace",
-  "theme": "dracula",
+  "theme": "light",
   "httpsEnforced": false,
   "originCheckEnabled": false,
   "authEnabled": false,
