@@ -353,7 +353,7 @@ export default function App() {
             apiFetch(apiUrl('/ssh/sessions/kill'), {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ sessionId: releasingSessionId, force: true }),
+              body: JSON.stringify({ sessionIds: [releasingSessionId], force: true }),
             }).catch(() => {});
           }
         })
@@ -387,11 +387,10 @@ export default function App() {
       const tabToClose = prev.find((t) => t.id === id);
       if (tabToClose) {
         const sessId = tabToClose.sessionId || tabToClose.id;
-        const clientId = tabToClose.id;
         apiFetch(apiUrl('/ssh/sessions/kill'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionId: sessId, clientId }),
+          body: JSON.stringify({ sessionIds: [sessId], clientId: tabToClose.id }),
         }).catch(() => {});
       }
 
@@ -403,10 +402,68 @@ export default function App() {
     });
   }, [activeTabId]);
 
+  const handleCloseAllTabs = useCallback(() => {
+    setTabs((prev) => {
+      const ids = prev.map((tab) => tab.sessionId || tab.id);
+      apiFetch(apiUrl('/ssh/sessions/kill'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionIds: ids, clientId: '' }),
+      }).catch(() => {});
+      return [];
+    });
+    setActiveTabId(null);
+  }, []);
+
+  const handleCloseOtherTabs = useCallback((id: string) => {
+    setTabs((prev) => {
+      const others = prev.filter((t) => t.id !== id);
+      const ids = others.map((tab) => tab.sessionId || tab.id);
+      apiFetch(apiUrl('/ssh/sessions/kill'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionIds: ids, clientId: '' }),
+      }).catch(() => {});
+      return prev.filter((t) => t.id === id);
+    });
+    setActiveTabId(id);
+  }, []);
+
+  const handleDuplicateTab = useCallback((id: string) => {
+    const source = tabs.find((t) => t.id === id);
+    if (!source) return;
+    const newId = generateTabId(tabs);
+    const newTab: SSHTab = {
+      id: newId,
+      title: source.title,
+      sshInfo: { ...source.sshInfo },
+      connected: false,
+      activeView: 'terminal',
+      reconnectMode: undefined,
+      error: undefined,
+    };
+    setTabs((prev) => [...prev, newTab]);
+    setActiveTabId(newId);
+  }, [tabs, generateTabId]);
+
   const handleToggleView = useCallback((id: string, view: 'terminal' | 'sftp' | 'split') => {
     setTabs((prev) =>
       prev.map((t) => (t.id === id ? { ...t, activeView: view } : t))
     );
+  }, []);
+
+  const handleRenameTab = useCallback((id: string, title: string) => {
+    setTabs((prev) => {
+      const tab = prev.find((t) => t.id === id);
+      if (tab?.sessionId) {
+        apiFetch(apiUrl('/ssh/sessions/rename'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId: tab.sessionId, title }),
+        }).catch(() => {});
+      }
+      return prev.map((t) => (t.id === id ? { ...t, title } : t));
+    });
   }, []);
 
   const handleConnectionChange = useCallback((id: string, connected: boolean) => {
@@ -417,6 +474,14 @@ export default function App() {
     setTabs((prev) =>
       prev.map((tab) =>
         tab.id === id && tab.sessionId !== sessionId ? { ...tab, sessionId } : tab
+      )
+    );
+  }, []);
+
+  const handleSessionTitle = useCallback((id: string, sessionId: string, title: string) => {
+    setTabs((prev) =>
+      prev.map((tab) =>
+        tab.id === id ? { ...tab, title } : tab
       )
     );
   }, []);
@@ -593,11 +658,15 @@ export default function App() {
         />
 
       {/* Connection Tab Strip */}
-      <Tabs
+       <Tabs
         tabs={tabs}
         activeTabId={activeTabId}
         onSelectTab={setActiveTabId}
         onCloseTab={handleCloseTab}
+        onCloseAllTabs={handleCloseAllTabs}
+        onCloseOtherTabs={handleCloseOtherTabs}
+        onDuplicateTab={handleDuplicateTab}
+        onRenameTab={handleRenameTab}
         onToggleView={handleToggleView}
         theme={config.theme}
       />
@@ -697,6 +766,7 @@ export default function App() {
                      isTabActive={isTabActive && showTerminal}
                      onConnectionChange={(connected) => handleConnectionChange(tab.id, connected)}
                      onSessionInfo={(sessionId) => handleSessionInfo(tab.id, sessionId)}
+                     onSessionTitle={(sessionId, title) => handleSessionTitle(tab.id, sessionId, title)}
                      onRecoverSession={(force) => handleRecoverSession(tab.id, force)}
                      onNewSession={() => handleNewSession(tab.id)}
                      reconnectMode={tab.reconnectMode}

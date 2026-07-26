@@ -29,6 +29,7 @@ interface SSHSession {
   hasAttachedOnce?: boolean;
   shared: boolean;
   ownerClientId?: string;
+  title?: string;
   disconnectTimer?: NodeJS.Timeout;
   sshLatencyMs?: number;
   latencyProbeTimer?: NodeJS.Timeout;
@@ -73,6 +74,7 @@ export interface SessionManager {
     ownerClientId: string;
     shared: boolean;
     credentialId: string;
+    title?: string;
   }>;
   getSessionStatus(sessionId: string): {
     exists: boolean;
@@ -87,9 +89,10 @@ export interface SessionManager {
   createLiveSession(
     sessionId: string,
     sshConfig: ParsedSSHInfo,
-    options: { cols: number; rows: number; ownerClientId?: string; keepAliveMs: number }
+    options: { cols: number; rows: number; ownerClientId?: string; keepAliveMs: number; title?: string }
   ): Promise<unknown>;
-  killSession(args: { sessionId: string; force?: boolean; clientId?: string }): { status: number; body: Record<string, unknown> };
+  killSession(args: { sessionId?: string; sessionIds?: string[]; force?: boolean; clientId?: string }): { status: number; body: Record<string, unknown> };
+  renameSession(sessionId: string, title: string): { status: number; body: Record<string, unknown> };
 }
 
 export function createSessionManager(): SessionManager {
@@ -100,6 +103,14 @@ export function createSessionManager(): SessionManager {
     for (const clientWs of session.attachedSockets) {
       if (clientWs.readyState === WebSocket.OPEN) {
         sendMetaMessage(clientWs, { type: 'shared_state', sessionId: session.id, shared: session.shared });
+      }
+    }
+  }
+
+  function broadcastSessionTitle(session: SSHSession) {
+    for (const clientWs of session.attachedSockets) {
+      if (clientWs.readyState === WebSocket.OPEN) {
+        sendMetaMessage(clientWs, { type: 'session_title', sessionId: session.id, title: session.title });
       }
     }
   }
@@ -223,7 +234,7 @@ export function createSessionManager(): SessionManager {
   async function createLiveSession(
     sessionId: string,
     sshConfig: ParsedSSHInfo,
-    options: { cols: number; rows: number; ownerClientId?: string; keepAliveMs: number }
+    options: { cols: number; rows: number; ownerClientId?: string; keepAliveMs: number; title?: string }
   ) {
     return new Promise<SSHSession>((resolve, reject) => {
       const conn = new SSHClient();
@@ -270,6 +281,7 @@ export function createSessionManager(): SessionManager {
             lastActivity: Date.now(),
             shared: false,
             ownerClientId: options.ownerClientId || undefined,
+            title: options.title,
           };
           sshSessions.set(sessionId, session);
           startSessionLatencyProbe(session);
@@ -472,6 +484,11 @@ export function createSessionManager(): SessionManager {
               sendMetaMessage(ws, { type: 'pong', ts: parsed.ts ?? Date.now(), serverTs: Date.now() });
               return;
             }
+            if (parsed.type === 'rename_session' && typeof parsed.title === 'string') {
+              existingSession.title = parsed.title;
+              broadcastSessionTitle(existingSession);
+              return;
+            }
           } catch {}
         }
         try { existingSession.stream.write(payload); } catch {}
@@ -510,6 +527,7 @@ export function createSessionManager(): SessionManager {
           ownerClientId: session.ownerClientId || '',
           shared: session.shared,
           credentialId: session.sshConfig.id || '',
+          title: session.title,
         }));
     },
     getSessionStatus(sessionId: string) {
@@ -527,28 +545,46 @@ export function createSessionManager(): SessionManager {
       };
     },
     createLiveSession,
-    killSession({ sessionId, force, clientId }) {
-      if (!sessionId) {
-        return { status: 400, body: { error: 'Missing sessionId' } };
+    killSession({ sessionId, sessionIds, force, clientId }) {
+      const ids = sessionIds || (sessionId ? [sessionId] : []);
+      if (ids.length === 0) {
+        return { status: 400, body: { error: 'Missing sessionId or sessionIds' } };
+      }
+      const results: Array<{ sessionId: string; status: string; error?: string }> = [];
+      for (const sid of ids) {
+        const session = sshSessions.get(sid);
+        if (!session) {
+          results.push({ sessionId: sid, status: 'not_found' });
+          continue;
+        }
+        if (!force && clientId && session.ownerClientId && session.ownerClientId !== clientId) {
+          results.push({ sessionId: sid, status: 'conflict', error: 'Owned by another client' });
+          continue;
+        }
+        if (!force && session.attachedSockets.size > 1) {
+          results.push({ sessionId: sid, status: 'conflict', error: 'Attached by other clients' });
+          continue;
+        }
+        closeAttachedSession(session);
+        results.push({ sessionId: sid, status: 'killed' });
+      }
+      const allOk = results.every((r) => r.status === 'killed' || r.status === 'not_found');
+      return {
+        status: allOk ? 200 : 207,
+        body: { results },
+      };
+    },
+    renameSession(sessionId: string, title: string) {
+      if (!sessionId || !title) {
+        return { status: 400, body: { error: 'Missing sessionId or title' } };
       }
       const session = sshSessions.get(sessionId);
       if (!session) {
-        return { status: 200, body: { message: 'Session not found or already closed' } };
+        return { status: 404, body: { error: 'Session not found' } };
       }
-      if (!force && clientId && session.ownerClientId && session.ownerClientId !== clientId) {
-        return {
-          status: 409,
-          body: { error: 'Session is currently owned by another client', ownerClientId: session.ownerClientId },
-        };
-      }
-      if (!force && session.attachedSockets.size > 1) {
-        return {
-          status: 409,
-          body: { error: 'Session is attached by other clients', attachedClients: session.attachedSockets.size },
-        };
-      }
-      closeAttachedSession(session);
-      return { status: 200, body: { message: 'Session killed successfully' } };
+      session.title = title;
+      broadcastSessionTitle(session);
+      return { status: 200, body: { message: 'Session renamed successfully' } };
     },
   };
 }

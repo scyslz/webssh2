@@ -1,9 +1,9 @@
 {
   "savePass": true,
   "timeout": 1200,
-  "fontSize": 12,
+  "fontSize": 14,
   "fontFamily": "Consolas, Monaco, \"Courier New\", monospace",
-  "theme": "dark",
+  "theme": "light",
   "httpsEnforced": false,
   "originCheckEnabled": false,
   "authEnabled": false,

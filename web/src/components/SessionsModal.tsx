@@ -14,6 +14,7 @@ export interface BackendSession {
   shared?: boolean;
   credentialId?: string;
   ownerClientId?: string;
+  title?: string;
 }
 
 interface SessionsModalProps {
@@ -48,6 +49,7 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
   }, [isOpen]);
 
   const tabIds = new Set(tabs.map((t) => t.id));
+  const tabTitles = new Map(tabs.map((t) => [t.id, t.title]));
 
   const getRestoreTone = (sess: BackendSession) => {
     if (tabIds.has(sess.ownerClientId ?? '')) {
@@ -86,7 +88,7 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
       await apiFetch(apiUrl('/ssh/sessions/kill'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId }),
+        body: JSON.stringify({ sessionIds: [sessionId] }),
       });
       setSessions((prev) => prev.filter((s) => s.id !== sessionId));
       onKillSession(sessionId);
@@ -175,8 +177,11 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
                         <span className="font-mono text-xs font-bold truncate">
-                          {sess.username}@{sess.host}:{sess.port}
+                          {tabTitles.get(sess.ownerClientId ?? '') || sess.title || `${sess.username}@${sess.host}:${sess.port}`}
                         </span>
+                        {(tabTitles.has(sess.ownerClientId ?? '') || sess.title) && (
+                          <span className="text-[10px] text-slate-500 font-mono truncate">{sess.username}@{sess.host}:{sess.port}</span>
+                        )}
                       </div>
                       <div className="text-[10px] text-slate-400 font-mono mt-0.5 truncate">
                         <span>{sess.id}</span>

@@ -112,6 +112,7 @@ export function registerSshRoutes(app: express.Express, sessionManager: SessionM
       const timeoutMins = Math.max(1, parseInt(String(req.body?.timeout || '120'), 10) || 120);
       const keepAliveMs = timeoutMins * 60 * 1000;
       const clientId = typeof req.body?.clientId === 'string' ? req.body.clientId : '';
+      const title = typeof req.body?.title === 'string' ? req.body.title : undefined;
 
       let sshConfig;
       if (req.body?.credentialId) {
@@ -138,7 +139,7 @@ export function registerSshRoutes(app: express.Express, sessionManager: SessionM
         rows,
         ...sshSummary(sshConfig),
       });
-      await sessionManager.createLiveSession(sessionId, sshConfig, { cols, rows, ownerClientId: clientId, keepAliveMs });
+      await sessionManager.createLiveSession(sessionId, sshConfig, { cols, rows, ownerClientId: clientId, keepAliveMs, title });
       return res.json({ sessionId, created: true });
     } catch (err: any) {
       sshLog('session create: failed', { error: err.message || String(err) });
@@ -147,7 +148,21 @@ export function registerSshRoutes(app: express.Express, sessionManager: SessionM
   });
 
   app.post('/ssh/sessions/kill', (req, res) => {
-    const result = sessionManager.killSession(req.body || {});
+    const { sessionId, sessionIds, force, clientId } = req.body || {};
+    const ids = sessionIds || (sessionId ? [sessionId] : []);
+    if (ids.length === 0) {
+      return res.status(400).json({ error: 'Missing sessionId or sessionIds' });
+    }
+    const result = sessionManager.killSession({ sessionIds: ids, force, clientId });
+    return res.status(result.status).json(result.body);
+  });
+
+  app.post('/ssh/sessions/rename', (req, res) => {
+    const { sessionId, title } = req.body || {};
+    if (!sessionId || !title) {
+      return res.status(400).json({ error: 'Missing sessionId or title' });
+    }
+    const result = sessionManager.renameSession(sessionId, title);
     return res.status(result.status).json(result.body);
   });
 }
