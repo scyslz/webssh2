@@ -74,14 +74,14 @@ jobs:
         id: meta
         shell: bash
         run: |
-          TAGS="${{ env.IMAGE_NAME }}:latest"
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          TAGS="${{ env.IMAGE_NAME }}:sha-${SHORT_SHA}"
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             VER="${{ github.ref_name }}"
             VER="${VER#v}"
             TAGS="$TAGS,${{ env.IMAGE_NAME }}:${VER}"
           fi
-          SHORT_SHA="${GITHUB_SHA:0:7}"
-          TAGS="$TAGS,${{ env.IMAGE_NAME }}:sha-${SHORT_SHA}"
+          TAGS="$TAGS,${{ env.IMAGE_NAME }}:latest"
           echo "tags=${TAGS}" >> $GITHUB_OUTPUT
           echo "Tags:"
           echo "${TAGS}" | tr ',' '\n'
