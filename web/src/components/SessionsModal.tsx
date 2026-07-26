@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { X, Server, RefreshCw, Trash2, ExternalLink, Activity, Radio } from 'lucide-react';
 import { SSHTab } from '../types';
 import { apiFetch, apiUrl } from '../api';
@@ -19,8 +19,7 @@ export interface BackendSession {
 interface SessionsModalProps {
   isOpen: boolean;
   onClose: () => void;
-  sessions: BackendSession[];
-  onRefresh?: () => void;
+  onRefresh: (forceRefresh: boolean) => Promise<BackendSession[]>;
   onAttachSession: (session: BackendSession, force?: boolean) => void;
   onKillSession: (sessionId: string) => void;
   tabs: SSHTab[];
@@ -30,7 +29,6 @@ interface SessionsModalProps {
 export const SessionsModal: React.FC<SessionsModalProps> = ({
   isOpen,
   onClose,
-  sessions,
   onRefresh,
   onAttachSession,
   onKillSession,
@@ -38,6 +36,16 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
   theme,
 }) => {
   const isLight = theme === 'light';
+  const [sessions, setSessions] = useState<BackendSession[]>([]);
+
+  const loadSessions = async (force = false) => {
+    const list = await onRefresh(force);
+    setSessions(list);
+  };
+
+  useEffect(() => {
+    if (isOpen) loadSessions();
+  }, [isOpen]);
 
   const getRestoreTone = (tabCount: number, attachedClients: number) => {
     if (tabCount > 0) {
@@ -78,6 +86,7 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionId }),
       });
+      setSessions((prev) => prev.filter((s) => s.id !== sessionId));
       onKillSession(sessionId);
     } catch (err) {
       // ignore
@@ -111,7 +120,7 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
 
           <div className="flex items-center gap-1">
             <button
-              onClick={onRefresh}
+              onClick={() => loadSessions(true)}
               className={`p-1.5 rounded-lg border transition cursor-pointer ${
                 isLight
                   ? 'hover:bg-slate-200 border-slate-300 text-slate-600'
@@ -189,7 +198,7 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
                       title={restoreTitle}
                     >
                       <ExternalLink className="w-3 h-3" />
-                      <span>{sess.attachedClients > 0 ? 'Take Over' : 'Restore'}</span>
+                      <span>{sess.attachedClients > 0 ? 'Force' : 'Restore'}</span>
                     </button>
 
                     <button

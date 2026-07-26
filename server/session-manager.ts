@@ -422,7 +422,7 @@ export function createSessionManager(): SessionManager {
       });
 
       if (!existingSession) {
-        const message = 'Missing or expired SSH session';
+        const message = 'Session not found or expired';
         sshLog('websocket closed: missing or expired SSH session', { sessionId });
         if (ws.readyState === WebSocket.OPEN) {
           sendMetaMessage(ws, {

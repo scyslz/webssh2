@@ -111,7 +111,7 @@ function padNumber(value: number, length = 2) {
 
 export function createSessionId() {
   const now = new Date();
-  return `s-${padNumber(now.getMonth() + 1)}${padNumber(now.getDate())}-${padNumber(now.getHours())}${padNumber(now.getMinutes())}${padNumber(now.getSeconds())}-${padNumber(now.getMilliseconds(), 3)}`;
+  return `sid-${padNumber(now.getMonth() + 1)}${padNumber(now.getDate())}-${padNumber(now.getHours())}${padNumber(now.getMinutes())}${padNumber(now.getSeconds())}-${padNumber(now.getMilliseconds(), 3)}`;
 }
 
 export function hashPassword(password: string): string {

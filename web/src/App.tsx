@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { SSHInfo, SSHTab, WebSSHConfig } from './types';
 import { apiFetch, apiUrl } from './api';
+import { sessionGet, sessionSet, globalGet, globalSet } from './storage';
 import { Header } from './components/Header';
 import { Tabs } from './components/Tabs';
 import { TerminalView } from './components/TerminalView';
@@ -12,32 +13,43 @@ import { SessionsModal, BackendSession } from './components/SessionsModal';
 import { LoginPage } from './components/LoginPage';
 import { Terminal, FolderTree, Shield, Plus, Server, Sparkles, Command } from 'lucide-react';
 
+let _sessionsCache: { data: BackendSession[]; expireAt: number } = { data: [], expireAt: 0 };
+
 export default function App() {
-  const activeTabsStorageKey = 'webssh_active_tabs';
-  const activeTabIdStorageKey = 'webssh_active_tab_id';
   const pad = (value: number, length = 2) => value.toString().padStart(length, '0');
-  const createSessionId = () => {
-    const now = new Date();
-    return `s-${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}-${pad(now.getMilliseconds(), 3)}`;
-  };
   const buildTabTitle = (sshInfo: SSHInfo) => sshInfo.name || `${sshInfo.username}@${sshInfo.host}`;
   const redactTab = (tab: SSHTab): SSHTab => ({
     ...tab,
     sshInfo: (({ password, privateKey, passphrase, ...safe }) => safe)(tab.sshInfo),
   });
-  const getTabClientStorageKey = (tab: Pick<SSHTab, 'sessionId' | 'sshInfo'>) =>
-    `webssh_terminal_client:${tab.sessionId || tab.sshInfo.id || `${tab.sshInfo.username}@${tab.sshInfo.host}:${tab.sshInfo.port}`}`;
-  const getStoredClientId = (tab: Pick<SSHTab, 'sessionId' | 'sshInfo'>) => {
+
+  const windowIdRaw = (() => {
     try {
-      return localStorage.getItem(getTabClientStorageKey(tab)) || sessionStorage.getItem(getTabClientStorageKey(tab)) || '';
-    } catch {
-      return '';
-    }
+      const stored = sessionGet('webssh_window_id');
+      if (stored) return stored.replace('wid-', '');
+    } catch {}
+    const d = new Date();
+    const ts = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}`;
+    const rand = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
+    return `${ts}-${rand}`;
+  })();
+  const windowId = `wid-${windowIdRaw}`;
+  sessionSet('webssh_window_id', windowId);
+  const activeTabsStorageKey = `webssh_active_tabs:${windowId}`;
+  const activeTabIdStorageKey = `webssh_active_tab:${windowId}`;
+  const generateTabId = (existingTabs: SSHTab[]): string => {
+    const usedIds = new Set(existingTabs.map((t) => t.id));
+    let id: string;
+    do {
+      const rand = Math.random().toString(36).slice(2, 7);
+      id = `tid-${windowIdRaw}-${rand}`;
+    } while (usedIds.has(id));
+    return id;
   };
 
   const [tabs, setTabs] = useState<SSHTab[]>(() => {
     try {
-      const saved = localStorage.getItem(activeTabsStorageKey);
+      const saved = sessionGet(activeTabsStorageKey);
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed)) {
@@ -52,9 +64,9 @@ export default function App() {
   });
   const [activeTabId, setActiveTabId] = useState<string | null>(() => {
     try {
-      const savedTabId = localStorage.getItem(activeTabIdStorageKey);
+      const savedTabId = sessionGet(activeTabIdStorageKey);
       if (savedTabId) return savedTabId;
-      const savedTabs = localStorage.getItem(activeTabsStorageKey);
+      const savedTabs = sessionGet(activeTabsStorageKey);
       if (savedTabs) {
         const parsed = JSON.parse(savedTabs);
         if (Array.isArray(parsed) && parsed.length > 0) return parsed[parsed.length - 1].id;
@@ -65,8 +77,8 @@ export default function App() {
   const [savedHosts, setSavedHosts] = useState<SSHInfo[]>([]);
   const [editingSavedHostIndex, setEditingSavedHostIndex] = useState<number | null>(null);
   const [connectionModalInitialInfo, setConnectionModalInitialInfo] = useState<Partial<SSHInfo> | undefined>(undefined);
+  const [releasingSessionId, setReleasingSessionId] = useState<string | undefined>(undefined);
   const [activeSessionCount, setActiveSessionCount] = useState<number>(0);
-  const [serverSessions, setServerSessions] = useState<BackendSession[]>([]);
   const [authChecking, setAuthChecking] = useState<boolean>(true);
   const [authEnabled, setAuthEnabled] = useState<boolean>(false);
   const [authenticated, setAuthenticated] = useState<boolean>(false);
@@ -75,21 +87,22 @@ export default function App() {
     return window.visualViewport?.height || window.innerHeight;
   });
 
-  const fetchServerSessions = async () => {
+  const fetchServerSessions = async (forceRefresh = false): Promise<BackendSession[]> => {
+    if (!forceRefresh && Date.now() < _sessionsCache.expireAt) return _sessionsCache.data;
     try {
       const res = await apiFetch(apiUrl('/ssh/sessions'));
       if (res.ok) {
         const list = await res.json();
         if (Array.isArray(list)) {
-          setServerSessions(list);
+          _sessionsCache = { data: list, expireAt: Date.now() + 5000 };
           setActiveSessionCount(list.length);
-          return list as BackendSession[];
+          return list;
         }
       }
     } catch {
       // ignore
     }
-    return [] as BackendSession[];
+    return [];
   };
 
   const reconcileTabsWithServer = (sessions: BackendSession[]) => {
@@ -98,11 +111,10 @@ export default function App() {
         const matchingSession = tab.sessionId ? sessions.find((session) => session.id === tab.sessionId) : undefined;
         if (!matchingSession) return { ...tab, connected: false };
 
-        const storedClientId = getStoredClientId(tab);
         const restorable =
           matchingSession.attachedClients === 0 ||
           !matchingSession.ownerClientId ||
-          matchingSession.ownerClientId === storedClientId;
+          matchingSession.ownerClientId === tab.id;
 
         return { ...tab, connected: restorable };
       })
@@ -111,7 +123,7 @@ export default function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem(activeTabsStorageKey, JSON.stringify(tabs.map(redactTab)));
+      sessionSet(activeTabsStorageKey, JSON.stringify(tabs.map(redactTab)));
     } catch {
       // ignore
     }
@@ -119,8 +131,7 @@ export default function App() {
 
   useEffect(() => {
     try {
-      if (activeTabId) localStorage.setItem(activeTabIdStorageKey, activeTabId);
-      else localStorage.removeItem(activeTabIdStorageKey);
+      sessionSet(activeTabIdStorageKey, activeTabId);
     } catch {
       // ignore
     }
@@ -161,7 +172,7 @@ export default function App() {
 
   const loadAppConfig = async () => {
     try {
-      const local = localStorage.getItem('webssh_config');
+      const local = globalGet('webssh_config');
       if (local) {
         const parsed = JSON.parse(local);
         delete parsed.authPassword;
@@ -172,7 +183,7 @@ export default function App() {
       const data = await res.json();
       if (data && typeof data === 'object' && Object.keys(data).length > 0) {
         setConfig((prev) => ({ ...prev, ...data }));
-        localStorage.setItem('webssh_config', JSON.stringify(data));
+        globalSet('webssh_config', JSON.stringify(data));
       }
     } catch {
       // Ignore
@@ -220,10 +231,10 @@ export default function App() {
 
     loadSavedHosts();
     loadAppConfig();
-    fetchServerSessions().then(reconcileTabsWithServer);
+    fetchServerSessions(true).then(reconcileTabsWithServer);
 
     const interval = setInterval(() => {
-      fetchServerSessions().then(reconcileTabsWithServer);
+      fetchServerSessions(true).then(reconcileTabsWithServer);
     }, 5000);
 
     return () => clearInterval(interval);
@@ -250,7 +261,7 @@ export default function App() {
   const handleSaveConfig = async (newConfig: WebSSHConfig) => {
     setConfig(newConfig);
     try {
-      localStorage.setItem('webssh_config', JSON.stringify({ ...newConfig, authPassword: '' }));
+      globalSet('webssh_config', JSON.stringify({ ...newConfig, authPassword: '' }));
       await apiFetch(apiUrl('/config'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -293,15 +304,35 @@ export default function App() {
   const resetConnectionModalState = () => {
     setConnectionModalInitialInfo(undefined);
     setEditingSavedHostIndex(null);
+    setReleasingSessionId(undefined);
   };
 
-  const handleConnect = (sshInfo: SSHInfo, saveHost: boolean, sessionId?: string) => {
-    const newTabId = `tab_${Date.now()}`;
+  const handleConnect = (sshInfo: SSHInfo, saveHost: boolean, releasingSessionId?: string) => {
+    const newTabId = generateTabId(tabs);
     const title = buildTabTitle(sshInfo);
+
+    // Release old session if idle (async, non-blocking)
+    if (releasingSessionId) {
+      apiFetch(apiUrl(`/ssh/session/${releasingSessionId}/status`))
+        .then((res) => {
+          if (res.ok) return res.json();
+          return null;
+        })
+        .then((status) => {
+          if (status && status.attachedClients === 0) {
+            apiFetch(apiUrl('/ssh/sessions/kill'), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sessionId: releasingSessionId, force: true }),
+            }).catch(() => {});
+          }
+        })
+        .catch(() => {});
+    }
 
     const newTab: SSHTab = {
       id: newTabId,
-      sessionId,
+      sessionId: undefined,
       title,
       sshInfo,
       sftpPath: sshInfo.username && sshInfo.username !== 'root' ? `/home/${sshInfo.username}` : '/root',
@@ -326,7 +357,7 @@ export default function App() {
       const tabToClose = prev.find((t) => t.id === id);
       if (tabToClose) {
         const sessId = tabToClose.sessionId || tabToClose.id;
-        const clientId = getStoredClientId(tabToClose);
+        const clientId = tabToClose.id;
         apiFetch(apiUrl('/ssh/sessions/kill'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -349,7 +380,7 @@ export default function App() {
   };
 
   const handleConnectionChange = (id: string, connected: boolean) => {
-    setTabs((prev) => prev.map((tab) => (tab.id === id ? { ...tab, connected } : tab)));
+    setTabs((prev) => prev.map((tab) => (tab.id === id ? { ...tab, connected, error: connected ? undefined : tab.error } : tab)));
   };
 
   const handleSessionInfo = (id: string, sessionId: string) => {
@@ -370,19 +401,26 @@ export default function App() {
       prev.map((tab) => {
         if (tab.id !== id) return tab;
         const matchingSession = tab.sessionId ? sessions.find((session) => session.id === tab.sessionId) : undefined;
-        const storedClientId = getStoredClientId(tab);
         const restorable =
           matchingSession &&
           (matchingSession.attachedClients === 0 ||
             !matchingSession.ownerClientId ||
-            matchingSession.ownerClientId === storedClientId);
+            matchingSession.ownerClientId === tab.id);
+
+        if (tab.sessionId && !matchingSession) {
+          return {
+            ...tab,
+            connected: false,
+            reconnectToken: (tab.reconnectToken || 0) + 1,
+            error: 'Session not found or expired.',
+          };
+        }
 
         return {
           ...tab,
           connected: true,
           reconnectToken: (tab.reconnectToken || 0) + 1,
           reconnectMode: force ? 'force' : 'restore',
-          // A missing session must go through /ssh/session/create again.
           sessionId: force && tab.sessionId ? tab.sessionId : restorable ? tab.sessionId : undefined,
         };
       })
@@ -397,6 +435,7 @@ export default function App() {
               ...tab,
               // Let TerminalView create a fresh backend session.
               sessionId: undefined,
+              error: undefined,
               connected: true,
               reconnectToken: (tab.reconnectToken || 0) + 1,
               reconnectMode: 'restore',
@@ -414,6 +453,7 @@ export default function App() {
   const handleEditSavedHost = (host: SSHInfo, index: number) => {
     setEditingSavedHostIndex(index);
     setConnectionModalInitialInfo(host);
+    setReleasingSessionId(undefined);
     setConnModalOpen(true);
   };
 
@@ -442,7 +482,7 @@ export default function App() {
       return;
     }
 
-    const newTabId = `tab_${Date.now()}`;
+    const newTabId = generateTabId(tabs);
     const sshInfo: SSHInfo = {
       id: sess.credentialId || undefined,
       host: sess.host || 'unknown',
@@ -475,7 +515,6 @@ export default function App() {
       }
       return next;
     });
-    setServerSessions((prev) => prev.filter((session) => session.id !== sessionId));
     setActiveSessionCount((count) => Math.max(0, count - 1));
   };
 
@@ -506,16 +545,24 @@ export default function App() {
     >
       {/* Top Header */}
       <Header
-        onNewConnection={() => setConnModalOpen(true)}
-        onOpenSessions={() => {
-          setSessionsModalOpen(true);
-        }}
-        onOpenSavedHosts={() => setSavedHostsModalOpen(true)}
-        onOpenSettings={() => setSettingsModalOpen(true)}
-        config={config}
-        savedCount={savedHosts.length}
-        activeSessionCount={activeSessionCount}
-      />
+          onNewConnection={() => {
+            const activeTab = tabs.find((t) => t.id === activeTabId);
+            if (activeTab && activeTab.sessionId && !activeTab.connected) {
+              setReleasingSessionId(activeTab.sessionId);
+            } else {
+              setReleasingSessionId(undefined);
+            }
+            setConnModalOpen(true);
+          }}
+          onOpenSessions={() => {
+            setSessionsModalOpen(true);
+          }}
+          onOpenSavedHosts={() => setSavedHostsModalOpen(true)}
+          onOpenSettings={() => setSettingsModalOpen(true)}
+          config={config}
+          savedCount={savedHosts.length}
+          activeSessionCount={activeSessionCount}
+        />
 
       {/* Connection Tab Strip */}
       <Tabs
@@ -611,8 +658,9 @@ export default function App() {
                       : 'w-full'
                   } h-full ${showTerminal ? 'block' : 'hidden'}`}
                 >
-                  <TerminalView
+                   <TerminalView
                     key={`${tab.id}:${tab.sessionId || 'no-session'}:${tab.reconnectToken || 0}`}
+                    tabId={tab.id}
                     sshInfo={tab.sshInfo}
                     config={config}
                     // Only pass a backend session ID after the server creates one.
@@ -624,6 +672,7 @@ export default function App() {
                     onRecoverSession={(force) => handleRecoverSession(tab.id, force)}
                     onNewSession={() => handleNewSession(tab.id)}
                     reconnectMode={tab.reconnectMode}
+                    initialError={tab.error}
                   />
                 </div>
 
@@ -659,6 +708,7 @@ export default function App() {
         initialInfo={connectionModalInitialInfo}
         mode={editingSavedHostIndex !== null ? 'edit' : 'create'}
         theme={config.theme}
+        releasingSessionId={releasingSessionId}
       />
 
       <SavedHostsModal
@@ -682,8 +732,7 @@ export default function App() {
       <SessionsModal
         isOpen={sessionsModalOpen}
         onClose={() => setSessionsModalOpen(false)}
-        sessions={serverSessions}
-        onRefresh={fetchServerSessions}
+        onRefresh={(force) => fetchServerSessions(force)}
         onAttachSession={handleAttachBackendSession}
         onKillSession={handleSessionKilled}
         tabs={tabs}

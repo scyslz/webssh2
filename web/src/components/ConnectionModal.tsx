@@ -6,11 +6,12 @@ import { X, Server, Key, Lock, CheckCircle2, AlertCircle, RefreshCw, Save } from
 interface ConnectionModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onConnect: (sshInfo: SSHInfo, saveHost: boolean) => void;
+  onConnect: (sshInfo: SSHInfo, saveHost: boolean, releasingSessionId?: string) => void;
   onSaveHost?: (sshInfo: SSHInfo) => void;
   initialInfo?: Partial<SSHInfo>;
   mode?: 'create' | 'edit';
   theme?: string;
+  releasingSessionId?: string;
 }
 
 export const ConnectionModal: React.FC<ConnectionModalProps> = ({
@@ -21,6 +22,7 @@ export const ConnectionModal: React.FC<ConnectionModalProps> = ({
   initialInfo,
   mode = 'create',
   theme,
+  releasingSessionId,
 }) => {
   const isLight = theme === 'light';
   const [name, setName] = useState<string>(initialInfo?.name || '');
@@ -96,7 +98,7 @@ export const ConnectionModal: React.FC<ConnectionModalProps> = ({
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!host.trim()) return;
-    onConnect(getSSHInfoObj(), saveHost);
+    onConnect(getSSHInfoObj(), saveHost, releasingSessionId);
     onClose();
   };
 

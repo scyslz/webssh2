@@ -1,5 +1,6 @@
 import React from 'react';
 import { SSHTab } from '../types';
+import { sessionGet } from '../storage';
 import { Terminal, FolderTree, X, Columns } from 'lucide-react';
 
 interface TabsProps {
@@ -23,6 +24,7 @@ export const Tabs: React.FC<TabsProps> = ({
 
   const isLight = theme === 'light';
   const currentTab = tabs.find((t) => t.id === activeTabId);
+  const offlineHoldEnabled = typeof window !== 'undefined' && sessionGet('webssh_offline_hold') === '1';
 
   return (
     <div
@@ -49,7 +51,11 @@ export const Tabs: React.FC<TabsProps> = ({
             >
               <span
                 className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                  tab.connected ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'
+                  tab.connected
+                    ? 'bg-emerald-500 animate-pulse'
+                    : offlineHoldEnabled
+                    ? 'bg-amber-500'
+                    : 'bg-rose-500'
                 }`}
               />
               <span className="truncate max-w-[68px] sm:max-w-[130px] font-medium">{tab.title}</span>

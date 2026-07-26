@@ -5,6 +5,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 import '@xterm/xterm/css/xterm.css';
 import { SSHInfo, WebSSHConfig } from '../types';
 import { apiFetch, apiUrl, wsUrl } from '../api';
+import { sessionGet, sessionSet, globalGet, globalSet } from '../storage';
 import {
   RefreshCw,
   Trash2,
@@ -29,6 +30,7 @@ import {
 } from 'lucide-react';
 
 interface TerminalViewProps {
+  tabId: string;
   sshInfo: SSHInfo;
   config: WebSSHConfig;
   sessionId?: string;
@@ -38,9 +40,11 @@ interface TerminalViewProps {
   onSessionInfo?: (sessionId: string, reattached: boolean) => void;
   onRecoverSession?: (force?: boolean) => void;
   onNewSession?: () => void;
+  initialError?: string;
 }
 
 export const TerminalView: React.FC<TerminalViewProps> = ({
+  tabId,
   sshInfo,
   config,
   sessionId,
@@ -50,13 +54,13 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   onSessionInfo,
   onRecoverSession,
   onNewSession,
+  initialError,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<XTerminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const decoderRef = useRef<TextDecoder | null>(null);
-  const clientIdRef = useRef<string | null>(null);
   const connectionCleanupRef = useRef<(() => void) | null>(null);
   const connectionAttemptRef = useRef<number>(0);
   const closeReasonRef = useRef<string>('');
@@ -82,25 +86,24 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const [sshLatencyMs, setSshLatencyMs] = useState<number | null>(null);
   const [offlineHoldEnabled, setOfflineHoldEnabled] = useState<boolean>(() => {
     try {
-      return window.localStorage.getItem('webssh_offline_hold') === '1';
+      return sessionGet('webssh_offline_hold') === '1';
     } catch {
       return false;
     }
   });
+  const offlineHoldEnabledRef = useRef<boolean>(offlineHoldEnabled);
+  useEffect(() => { offlineHoldEnabledRef.current = offlineHoldEnabled; }, [offlineHoldEnabled]);
   const [offlineSuspended, setOfflineSuspended] = useState<boolean>(false);
   const [debugEnabled, setDebugEnabled] = useState<boolean>(() => {
     try {
-      return window.localStorage.getItem('webssh_terminal_debug') === '1';
+      return globalGet('webssh_terminal_debug') === '1';
     } catch {
       return false;
     }
   });
   const [debugEvents, setDebugEvents] = useState<string[]>([]);
   const isInvalidSessionError = Boolean(
-    errorMsg && (
-      errorMsg.includes('Missing or expired SSH session') ||
-      errorMsg.includes('SESSION_NOT_FOUND')
-    )
+    errorMsg && errorMsg.includes('Session not found or expired')
   );
   const canForceRestore = Boolean(
     sessionId &&
@@ -150,33 +153,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
     isCoarsePointerRef.current = window.matchMedia('(pointer: coarse)').matches;
   }, []);
-
-  const getTerminalClientId = (): string => {
-    if (clientIdRef.current) return clientIdRef.current;
-
-    const storageKey = `webssh_terminal_client:${sessionId || sshInfo.id || `${sshInfo.username}@${sshInfo.host}:${sshInfo.port}`}`;
-    let clientId = null;
-    try {
-      clientId = window.localStorage.getItem(storageKey) || window.sessionStorage.getItem(storageKey);
-    } catch {
-      clientId = window.sessionStorage.getItem(storageKey);
-    }
-    if (!clientId) {
-      clientId =
-        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-          ? crypto.randomUUID()
-          : `client_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      try {
-        window.localStorage.setItem(storageKey, clientId);
-      } catch {
-        // ignore
-      }
-      window.sessionStorage.setItem(storageKey, clientId);
-    }
-
-    clientIdRef.current = clientId;
-    return clientId;
-  };
 
   const processInputData = (data: string): string => {
     let finalData = data;
@@ -244,7 +220,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const persistDebugEnabled = (enabled: boolean) => {
     setDebugEnabled(enabled);
     try {
-      window.localStorage.setItem('webssh_terminal_debug', enabled ? '1' : '0');
+      globalSet('webssh_terminal_debug', enabled ? '1' : '0');
     } catch {
       // ignore
     }
@@ -253,7 +229,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const persistOfflineHoldEnabled = (enabled: boolean) => {
     setOfflineHoldEnabled(enabled);
     try {
-      window.localStorage.setItem('webssh_offline_hold', enabled ? '1' : '0');
+      sessionSet('webssh_offline_hold', enabled ? '1' : '0');
     } catch {
       // ignore
     }
@@ -386,12 +362,26 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     deferredPayloadsRef.current.push(payload);
   };
 
+  const deferredHasEnter = (): boolean => {
+    return deferredPayloadsRef.current.some((p) => typeof p === 'string' && (p.includes('\r') || p.includes('\n')));
+  };
+
   const flushDeferredPayloads = (ws: WebSocket) => {
     if (ws.readyState !== WebSocket.OPEN || deferredPayloadsRef.current.length === 0) return;
     for (const payload of deferredPayloadsRef.current) {
       ws.send(payload);
     }
     deferredPayloadsRef.current = [];
+  };
+
+  const tryReconnectOnEnter = () => {
+    if (!deferredHasEnter()) return;
+    reconnectModeOverrideRef.current = closeReasonRef.current === 'session_busy' || closeReasonRef.current === 'taken_over' ? 'force' : 'restore';
+    if (!connecting) connectWebSocket(reconnectModeOverrideRef.current || undefined, true);
+  };
+
+  const localEcho = (data: string) => {
+    terminalRef.current?.write(data);
   };
 
   const sendKeyToTerminal = (data: string) => {
@@ -402,11 +392,10 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       terminalRef.current?.focus();
       return;
     }
-    if (offlineHoldEnabled) {
+    if (offlineHoldEnabledRef.current) {
       enqueueDeferredPayload(finalData);
-      reconnectModeOverrideRef.current = closeReasonRef.current === 'session_busy' || closeReasonRef.current === 'taken_over' ? 'force' : 'restore';
-      setOfflineSuspended(false);
-      if (!connecting) connectWebSocket(reconnectModeOverrideRef.current || undefined, true);
+      localEcho(finalData);
+      tryReconnectOnEnter();
       terminalRef.current?.focus();
     }
   };
@@ -420,11 +409,10 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       }
       return;
     }
-    if (offlineHoldEnabled) {
+    if (offlineHoldEnabledRef.current) {
       enqueueDeferredPayload(data);
-      reconnectModeOverrideRef.current = closeReasonRef.current === 'session_busy' || closeReasonRef.current === 'taken_over' ? 'force' : 'restore';
-      setOfflineSuspended(false);
-      if (!connecting) connectWebSocket(reconnectModeOverrideRef.current || undefined, true);
+      localEcho(data);
+      tryReconnectOnEnter();
       if (focusTerminal) {
         terminalRef.current?.focus();
       }
@@ -575,9 +563,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     setConnected(false);
     setErrorMsg(null);
     setIsAttached(false);
-    if (!silentReconnect) {
-      setOfflineSuspended(false);
-    }
+    setOfflineSuspended(false);
     setClientLatencyMs((prev) => prev);
     setSshLatencyMs((prev) => prev);
     silentReconnectRef.current = silentReconnect;
@@ -715,7 +701,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     // Determine WebSocket protocol (ws or wss)
     const cols = term.cols || 120;
     const rows = term.rows || 30;
-    const clientId = getTerminalClientId();
+    const clientId = tabId;
     const timeout = config.timeout || 120;
     const effectiveReconnectMode = modeOverride || reconnectModeOverrideRef.current || reconnectMode;
     reconnectModeOverrideRef.current = null;
@@ -879,7 +865,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       if (!isCurrentConnection()) return;
       pushDebugEvent(`ws error attempt=${attemptId}`);
       closeReasonRef.current = 'websocket_error';
-      if (offlineHoldEnabled) {
+      if (offlineHoldEnabledRef.current) {
         return;
       }
       setConnecting(false);
@@ -914,17 +900,23 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       setConnecting(false);
       setConnected(false);
       onConnectionChange?.(false);
-      if (offlineHoldEnabled) {
+
+      if (offlineHoldEnabledRef.current) {
+        if (closeReasonRef.current === 'ssh_connect_error' || closeReasonRef.current === 'session_busy' || closeReasonRef.current === 'taken_over' || closeReasonRef.current === 'ssh_shell_error') {
+          // Fatal errors: show the error overlay (do NOT set offlineSuspended)
+          return;
+        }
         setOfflineSuspended(true);
         setErrorMsg(null);
+        window.setTimeout(() => terminalRef.current?.focus(), 50);
         return;
       }
-      if (
-        !suppressAutoRecoverRef.current &&
-        isTabActive &&
-        (closeReasonRef.current === '' || closeReasonRef.current === 'heartbeat_timeout')
-      ) {
-        window.setTimeout(() => onRecoverSession?.(false), 600);
+
+      // Normal mode (cloud off disabled): show error overlay with Restore Session button
+      if (closeReasonRef.current === '' || closeReasonRef.current === 'heartbeat_timeout') {
+        if (!errorMsg) {
+          setErrorMsg('Connection lost. Click "Restore Session" to reconnect.');
+        }
       }
     };
 
@@ -937,10 +929,10 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         ws.send(finalData);
         return;
       }
-      if (offlineHoldEnabled) {
+      if (offlineHoldEnabledRef.current) {
         enqueueDeferredPayload(finalData);
-        reconnectModeOverrideRef.current = closeReasonRef.current === 'session_busy' || closeReasonRef.current === 'taken_over' ? 'force' : 'restore';
-        if (!connecting) connectWebSocket(reconnectModeOverrideRef.current || undefined, true);
+        localEcho(finalData);
+        tryReconnectOnEnter();
       }
     });
 
@@ -955,10 +947,9 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         ws.send(bytes.buffer);
         return;
       }
-      if (offlineHoldEnabled) {
+      if (offlineHoldEnabledRef.current) {
         enqueueDeferredPayload(bytes.buffer);
-        reconnectModeOverrideRef.current = closeReasonRef.current === 'session_busy' || closeReasonRef.current === 'taken_over' ? 'force' : 'restore';
-        if (!connecting) connectWebSocket(reconnectModeOverrideRef.current || undefined, true);
+        tryReconnectOnEnter();
       }
     });
 
@@ -1044,11 +1035,18 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   };
 
   useEffect(() => {
+    if (initialError) {
+      setErrorMsg(initialError);
+      setConnecting(false);
+      setConnected(false);
+      onConnectionChange?.(false);
+      return;
+    }
     connectWebSocket();
     return () => {
       cleanupConnection();
     };
-  }, [sshInfo, sessionId, reconnectMode, config.timeout]);
+  }, [sshInfo, sessionId, reconnectMode, config.timeout, initialError]);
 
   useEffect(() => {
     if (isTabActive && fitAddonRef.current && terminalRef.current) {
@@ -1249,7 +1247,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
             <Share2 className="w-3 h-3" />
           </button>
 
-          {(connected || offlineSuspended) && (
+          {connected && (
             <div
               className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono shrink-0 border ${latencyBadgeClass}`}
               title={`Browser to WebSSH: ${formatLatency(clientLatencyMs)} | WebSSH to SSH host: ${formatLatency(sshLatencyMs)}`}
@@ -1346,7 +1344,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       )}
 
       {/* Mobile Streamlined Compact Key Bar (Left-to-Right Row, Matching Top Toolbar Proportion) */}
-      {showKeyBar && connected && (
+      {showKeyBar && (connected || offlineSuspended) && (
         <div
           className={`border-t px-1.5 py-0.5 w-full shadow-lg select-none transition-colors overflow-x-auto scrollbar-none flex items-center gap-1 whitespace-nowrap ${
             isLight ? 'bg-slate-100 border-slate-200 text-slate-800' : 'bg-slate-900 border-slate-800 text-slate-100'
@@ -1564,22 +1562,33 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
               Session is attached elsewhere. Start a new session here or use the session manager to restore it explicitly.
             </p>
           )}
-          <button
-            onClick={() => onNewSession?.()}
-            className="w-40 flex items-center justify-center gap-2 px-4 py-2 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium shadow-md transition cursor-pointer"
-          >
-            <RefreshCw className="w-4 h-4" />
-            <span>New Session</span>
-          </button>
-          {canForceRestore && (
+          <div className="flex flex-col items-center gap-2">
+            {sessionId && !isInvalidSessionError && !canForceRestore && (
+              <button
+                onClick={() => onRecoverSession?.()}
+                className="w-48 flex items-center justify-center gap-2 px-4 py-2 rounded-md bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium shadow-md transition cursor-pointer"
+              >
+                <RefreshCw className="w-4 h-4" />
+                <span>Restore Session</span>
+              </button>
+            )}
+            {canForceRestore && (
+              <button
+                onClick={() => onRecoverSession?.(true)}
+                className="w-48 flex items-center justify-center gap-2 px-4 py-2 rounded-md bg-rose-700 hover:bg-rose-600 text-white text-xs font-medium shadow-md transition cursor-pointer"
+              >
+                <ShieldAlert className="w-4 h-4" />
+                <span>Force Restore</span>
+              </button>
+            )}
             <button
-              onClick={() => onRecoverSession?.(true)}
-              className="w-40 flex items-center justify-center gap-2 px-4 py-2 rounded-md bg-rose-700 hover:bg-rose-600 text-white text-xs font-medium shadow-md transition cursor-pointer"
+              onClick={() => onNewSession?.()}
+              className="w-48 flex items-center justify-center gap-2 px-4 py-2 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium shadow-md transition cursor-pointer"
             >
-              <ShieldAlert className="w-4 h-4" />
-              <span>Force Restore</span>
+              <RefreshCw className="w-4 h-4" />
+              <span>New Session</span>
             </button>
-          )}
+          </div>
         </div>
       )}
     </div>
