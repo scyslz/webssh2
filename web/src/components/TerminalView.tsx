@@ -564,8 +564,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     setErrorMsg(null);
     setIsAttached(false);
     setOfflineSuspended(false);
-    setClientLatencyMs((prev) => prev);
-    setSshLatencyMs((prev) => prev);
     silentReconnectRef.current = silentReconnect;
 
     // Initialize xterm
@@ -1317,31 +1315,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         onClick={() => terminalRef.current?.focus()}
       />
 
-      {false && debugEnabled && (
-        <div
-          className={`border-t px-2 py-1 font-mono text-[10px] max-h-32 overflow-y-auto ${
-            isLight ? 'bg-slate-50 border-slate-200 text-slate-700' : 'bg-slate-950 border-slate-800 text-slate-300'
-          }`}
-        >
-          <div className="flex items-center justify-between gap-2 pb-1">
-            <span>Terminal Debug</span>
-            <button
-              onClick={() => setDebugEvents([])}
-              className={`px-1.5 py-0.5 rounded border ${btnBg}`}
-            >
-              Clear
-            </button>
-          </div>
-          <div className="space-y-0.5">
-            {debugEvents.length === 0 && <div className="opacity-70">No events yet.</div>}
-            {debugEvents.map((line, idx) => (
-              <div key={`${idx}-${line}`} className="break-all">
-                {line}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      {/* Debug panel removed */}
 
       {/* Mobile Streamlined Compact Key Bar (Left-to-Right Row, Matching Top Toolbar Proportion) */}
       {showKeyBar && (connected || offlineSuspended) && (

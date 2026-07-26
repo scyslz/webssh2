@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { SSHInfo, SSHTab, WebSSHConfig } from './types';
 import { apiFetch, apiUrl } from './api';
 import { sessionGet, sessionSet, globalGet, globalSet } from './storage';
@@ -11,13 +11,13 @@ import { SavedHostsModal } from './components/SavedHostsModal';
 import { SettingsModal } from './components/SettingsModal';
 import { SessionsModal, BackendSession } from './components/SessionsModal';
 import { LoginPage } from './components/LoginPage';
-import { Terminal, FolderTree, Shield, Plus, Server, Sparkles, Command } from 'lucide-react';
+import { Terminal, Server } from 'lucide-react';
 
 let _sessionsCache: { data: BackendSession[]; expireAt: number } = { data: [], expireAt: 0 };
 
 export default function App() {
   const pad = (value: number, length = 2) => value.toString().padStart(length, '0');
-  const buildTabTitle = (sshInfo: SSHInfo) => sshInfo.name || `${sshInfo.username}@${sshInfo.host}`;
+  const buildTabTitle = useCallback((sshInfo: SSHInfo) => sshInfo.name || `${sshInfo.username}@${sshInfo.host}`, []);
   const redactTab = (tab: SSHTab): SSHTab => ({
     ...tab,
     sshInfo: (({ password, privateKey, passphrase, ...safe }) => safe)(tab.sshInfo),
@@ -37,7 +37,7 @@ export default function App() {
   sessionSet('webssh_window_id', windowId);
   const activeTabsStorageKey = `webssh_active_tabs:${windowId}`;
   const activeTabIdStorageKey = `webssh_active_tab:${windowId}`;
-  const generateTabId = (existingTabs: SSHTab[]): string => {
+  const generateTabId = useCallback((existingTabs: SSHTab[]): string => {
     const usedIds = new Set(existingTabs.map((t) => t.id));
     let id: string;
     do {
@@ -45,7 +45,7 @@ export default function App() {
       id = `tid-${windowIdRaw}-${rand}`;
     } while (usedIds.has(id));
     return id;
-  };
+  }, []);
 
   const [tabs, setTabs] = useState<SSHTab[]>(() => {
     try {
@@ -87,7 +87,7 @@ export default function App() {
     return window.visualViewport?.height || window.innerHeight;
   });
 
-  const fetchServerSessions = async (forceRefresh = false): Promise<BackendSession[]> => {
+  const fetchServerSessions = useCallback(async (forceRefresh = false): Promise<BackendSession[]> => {
     if (!forceRefresh && Date.now() < _sessionsCache.expireAt) return _sessionsCache.data;
     try {
       const res = await apiFetch(apiUrl('/ssh/sessions'));
@@ -103,9 +103,9 @@ export default function App() {
       // ignore
     }
     return [];
-  };
+  }, []);
 
-  const reconcileTabsWithServer = (sessions: BackendSession[]) => {
+  const reconcileTabsWithServer = useCallback((sessions: BackendSession[]) => {
     setTabs((prev) =>
       prev.map((tab) => {
         const matchingSession = tab.sessionId ? sessions.find((session) => session.id === tab.sessionId) : undefined;
@@ -158,7 +158,7 @@ export default function App() {
   });
 
   // Load saved hosts and config from backend
-  const loadSavedHosts = async () => {
+  const loadSavedHosts = useCallback(async () => {
     try {
       const res = await apiFetch(apiUrl('/ssh/list'));
       const data = await res.json();
@@ -168,9 +168,9 @@ export default function App() {
     } catch {
       // Ignore
     }
-  };
+  }, []);
 
-  const loadAppConfig = async () => {
+  const loadAppConfig = useCallback(async () => {
     try {
       const local = globalGet('webssh_config');
       if (local) {
@@ -188,7 +188,7 @@ export default function App() {
     } catch {
       // Ignore
     }
-  };
+  }, []);
 
   useEffect(() => {
     const handleAuthRequired = () => {
@@ -238,7 +238,7 @@ export default function App() {
     }, 5000);
 
     return () => clearInterval(interval);
-  }, [authChecking, authEnabled, authenticated]);
+  }, [authChecking, authEnabled, authenticated, loadSavedHosts, loadAppConfig, fetchServerSessions, reconcileTabsWithServer]);
 
   useEffect(() => {
     const viewport = window.visualViewport;
@@ -258,7 +258,7 @@ export default function App() {
     };
   }, []);
 
-  const handleSaveConfig = async (newConfig: WebSSHConfig) => {
+  const handleSaveConfig = useCallback(async (newConfig: WebSSHConfig) => {
     setConfig(newConfig);
     try {
       globalSet('webssh_config', JSON.stringify({ ...newConfig, authPassword: '' }));
@@ -270,9 +270,9 @@ export default function App() {
     } catch {
       // Ignore
     }
-  };
+  }, []);
 
-  const saveHostToBackend = async (newHosts: SSHInfo[]) => {
+  const saveHostToBackend = useCallback(async (newHosts: SSHInfo[]) => {
     try {
       const res = await apiFetch(apiUrl('/ssh/save'), {
         method: 'POST',
@@ -284,9 +284,9 @@ export default function App() {
     } catch {
       // Ignore
     }
-  };
+  }, []);
 
-  const upsertSavedHost = (sshInfo: SSHInfo, index?: number | null) => {
+  const upsertSavedHost = useCallback((sshInfo: SSHInfo, index?: number | null) => {
     const nextHosts = [...savedHosts];
     if (typeof index === 'number' && index >= 0 && index < nextHosts.length) {
       nextHosts[index] = sshInfo;
@@ -299,15 +299,15 @@ export default function App() {
       }
     }
     saveHostToBackend(nextHosts);
-  };
+  }, [savedHosts, saveHostToBackend]);
 
-  const resetConnectionModalState = () => {
+  const resetConnectionModalState = useCallback(() => {
     setConnectionModalInitialInfo(undefined);
     setEditingSavedHostIndex(null);
     setReleasingSessionId(undefined);
-  };
+  }, []);
 
-  const handleConnect = (sshInfo: SSHInfo, saveHost: boolean, releasingSessionId?: string) => {
+  const handleConnect = useCallback((sshInfo: SSHInfo, saveHost: boolean, releasingSessionId?: string) => {
     const newTabId = generateTabId(tabs);
     const title = buildTabTitle(sshInfo);
 
@@ -350,9 +350,9 @@ export default function App() {
     }
 
     resetConnectionModalState();
-  };
+  }, [tabs, editingSavedHostIndex, saveHostToBackend, upsertSavedHost, resetConnectionModalState, generateTabId, buildTabTitle]);
 
-  const handleCloseTab = (id: string) => {
+  const handleCloseTab = useCallback((id: string) => {
     setTabs((prev) => {
       const tabToClose = prev.find((t) => t.id === id);
       if (tabToClose) {
@@ -371,31 +371,31 @@ export default function App() {
       }
       return next;
     });
-  };
+  }, [activeTabId]);
 
-  const handleToggleView = (id: string, view: 'terminal' | 'sftp' | 'split') => {
+  const handleToggleView = useCallback((id: string, view: 'terminal' | 'sftp' | 'split') => {
     setTabs((prev) =>
       prev.map((t) => (t.id === id ? { ...t, activeView: view } : t))
     );
-  };
+  }, []);
 
-  const handleConnectionChange = (id: string, connected: boolean) => {
+  const handleConnectionChange = useCallback((id: string, connected: boolean) => {
     setTabs((prev) => prev.map((tab) => (tab.id === id ? { ...tab, connected, error: connected ? undefined : tab.error } : tab)));
-  };
+  }, []);
 
-  const handleSessionInfo = (id: string, sessionId: string) => {
+  const handleSessionInfo = useCallback((id: string, sessionId: string) => {
     setTabs((prev) =>
       prev.map((tab) =>
         tab.id === id && tab.sessionId !== sessionId ? { ...tab, sessionId } : tab
       )
     );
-  };
+  }, []);
 
-  const handleSftpPathChange = (id: string, sftpPath: string) => {
+  const handleSftpPathChange = useCallback((id: string, sftpPath: string) => {
     setTabs((prev) => prev.map((tab) => (tab.id === id ? { ...tab, sftpPath } : tab)));
-  };
+  }, []);
 
-  const handleRecoverSession = async (id: string, force = false) => {
+  const handleRecoverSession = useCallback(async (id: string, force = false) => {
     const sessions = await fetchServerSessions();
     setTabs((prev) =>
       prev.map((tab) => {
@@ -425,9 +425,9 @@ export default function App() {
         };
       })
     );
-  };
+  }, [fetchServerSessions]);
 
-  const handleNewSession = (id: string) => {
+  const handleNewSession = useCallback((id: string) => {
     setTabs((prev) =>
       prev.map((tab) =>
         tab.id === id
@@ -443,26 +443,26 @@ export default function App() {
           : tab
       )
     );
-  };
+  }, []);
 
-  const handleDeleteSavedHost = (index: number) => {
+  const handleDeleteSavedHost = useCallback((index: number) => {
     const updated = savedHosts.filter((_, i) => i !== index);
     saveHostToBackend(updated);
-  };
+  }, [savedHosts, saveHostToBackend]);
 
-  const handleEditSavedHost = (host: SSHInfo, index: number) => {
+  const handleEditSavedHost = useCallback((host: SSHInfo, index: number) => {
     setEditingSavedHostIndex(index);
     setConnectionModalInitialInfo(host);
     setReleasingSessionId(undefined);
     setConnModalOpen(true);
-  };
+  }, []);
 
-  const handleSaveEditedHost = (sshInfo: SSHInfo) => {
+  const handleSaveEditedHost = useCallback((sshInfo: SSHInfo) => {
     upsertSavedHost(sshInfo, editingSavedHostIndex);
     resetConnectionModalState();
-  };
+  }, [editingSavedHostIndex, upsertSavedHost, resetConnectionModalState]);
 
-  const handleLogout = async () => {
+  const handleLogout = useCallback(async () => {
     try {
       await apiFetch(apiUrl('/auth/logout'), { method: 'POST' });
     } catch {
@@ -470,11 +470,11 @@ export default function App() {
     }
     setAuthenticated(false);
     setSettingsModalOpen(false);
-  };
+  }, []);
 
   const activeTab = tabs.find((t) => t.id === activeTabId);
 
-  const handleAttachBackendSession = (sess: BackendSession, force = false) => {
+  const handleAttachBackendSession = useCallback((sess: BackendSession, force = false) => {
     const existing = tabs.find((t) => t.sessionId === sess.id || t.id === sess.id);
     if (existing) {
       setActiveTabId(existing.id);
@@ -505,9 +505,9 @@ export default function App() {
 
     setTabs((prev) => [...prev, newTab]);
     setActiveTabId(newTabId);
-  };
+  }, [tabs, handleRecoverSession, generateTabId]);
 
-  const handleSessionKilled = (sessionId: string) => {
+  const handleSessionKilled = useCallback((sessionId: string) => {
     setTabs((prev) => {
       const next = prev.filter((tab) => tab.sessionId !== sessionId && tab.id !== sessionId);
       if (activeTabId && !next.some((tab) => tab.id === activeTabId)) {
@@ -516,7 +516,7 @@ export default function App() {
       return next;
     });
     setActiveSessionCount((count) => Math.max(0, count - 1));
-  };
+  }, [activeTabId]);
 
   const isLight = config.theme === 'light';
 
