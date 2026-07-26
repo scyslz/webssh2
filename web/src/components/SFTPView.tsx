@@ -515,7 +515,7 @@ export const SFTPView: React.FC<SFTPViewProps> = ({ sshInfo, sessionId, initialP
 
       {/* New Folder Modal */}
       {mkdirModalOpen && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 select-none">
           <div className={`border rounded-lg p-4 w-full max-w-sm shadow-xl ${isLight ? 'bg-white border-slate-200 text-slate-800' : 'bg-slate-900 border-slate-800 text-slate-100'}`}>
             <div className="flex items-center justify-between mb-3">
               <h3 className="font-bold text-sm">Create New Directory</h3>
@@ -558,7 +558,7 @@ export const SFTPView: React.FC<SFTPViewProps> = ({ sshInfo, sessionId, initialP
 
       {/* In-App Text File Editor Modal */}
       {editorModalOpen && (
-        <div className="fixed inset-0 bg-black/70 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 select-none">
           <div className={`border rounded-lg w-full max-w-3xl h-[80vh] flex flex-col shadow-2xl ${
             isLight ? 'bg-white border-slate-200 text-slate-800' : 'bg-slate-900 border-slate-800 text-slate-100'
           }`}>

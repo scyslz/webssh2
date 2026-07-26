@@ -22,6 +22,13 @@ const LOGIN_MAX_FAILURES = 5;
 const LOGIN_BLOCK_MS = 15 * 60 * 1000;
 const loginAttempts = new Map<string, { failures: number; windowStartedAt: number; blockedUntil: number }>();
 
+export interface QuickCommandConfig {
+  id: string;
+  label: string;
+  cmd: string;
+  enabled: boolean;
+}
+
 export interface AppConfig {
   savePass?: boolean;
   timeout?: number;
@@ -34,6 +41,7 @@ export interface AppConfig {
   authUsername?: string;
   authPassword?: string;
   authPasswordHash?: string;
+  quickCommands?: QuickCommandConfig[];
 }
 
 export interface StoredSSHHost {

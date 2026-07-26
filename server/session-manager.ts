@@ -1,4 +1,5 @@
 import http from 'http';
+import net from 'net';
 import { Client as SSHClient } from 'ssh2';
 import { RawData, WebSocket, WebSocketServer } from 'ws';
 import {
@@ -186,47 +187,29 @@ export function createSessionManager(): SessionManager {
   }
 
   function probeSessionLatency(session: SSHSession) {
-    if (session.latencyProbeInFlight || !session.client) return;
+    if (session.latencyProbeInFlight) return;
     session.latencyProbeInFlight = true;
+
+    const host = session.sshConfig.host;
+    const port = session.sshConfig.port || 22;
     const startedAt = Date.now();
+    const socket = new net.Socket();
 
-    session.client.exec('printf "__WEBSSH_LATENCY__\\n"', (err, execStream) => {
-      if (err) {
-        session.latencyProbeInFlight = false;
-        return;
-      }
+    const cleanup = () => {
+      socket.removeAllListeners();
+      socket.destroy();
+      session.latencyProbeInFlight = false;
+    };
 
-      let settled = false;
-      let stdout = '';
-
-      const finalize = () => {
-        if (settled) return;
-        settled = true;
-        session.latencyProbeInFlight = false;
-      };
-
-      execStream.on('data', (chunk: Buffer | string) => {
-        stdout += chunk.toString();
-        if (stdout.includes('__WEBSSH_LATENCY__')) {
-          broadcastSshLatency(session, Date.now() - startedAt);
-          finalize();
-          try { execStream.close(); } catch {}
-        }
-      });
-
-      execStream.on('close', () => {
-        if (!settled && stdout.includes('__WEBSSH_LATENCY__')) {
-          broadcastSshLatency(session, Date.now() - startedAt);
-        }
-        finalize();
-      });
-
-      execStream.on('error', () => {
-        finalize();
-      });
-
-      execStream.stderr?.on('data', () => {});
+    socket.setTimeout(5000);
+    socket.on('connect', () => {
+      const latency = Date.now() - startedAt;
+      broadcastSshLatency(session, latency);
+      cleanup();
     });
+    socket.on('error', cleanup);
+    socket.on('timeout', cleanup);
+    socket.connect(port, host);
   }
 
   function startSessionLatencyProbe(session: SSHSession) {
@@ -234,7 +217,7 @@ export function createSessionManager(): SessionManager {
     probeSessionLatency(session);
     session.latencyProbeTimer = setInterval(() => {
       probeSessionLatency(session);
-    }, 30000);
+    }, 10000);
   }
 
   async function createLiveSession(

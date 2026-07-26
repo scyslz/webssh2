@@ -3,9 +3,59 @@
   "timeout": 1200,
   "fontSize": 12,
   "fontFamily": "Consolas, Monaco, \"Courier New\", monospace",
-  "theme": "light",
+  "theme": "dark",
   "httpsEnforced": false,
   "originCheckEnabled": false,
   "authEnabled": false,
-  "authUsername": ""
+  "authUsername": "",
+  "quickCommands": [
+    {
+      "id": "ls",
+      "label": "ls -la",
+      "cmd": "ls -la\n",
+      "enabled": true
+    },
+    {
+      "id": "top",
+      "label": "top",
+      "cmd": "top\n",
+      "enabled": true
+    },
+    {
+      "id": "htop",
+      "label": "htop",
+      "cmd": "htop\n",
+      "enabled": true
+    },
+    {
+      "id": "df",
+      "label": "df -h",
+      "cmd": "df -h\n",
+      "enabled": true
+    },
+    {
+      "id": "free",
+      "label": "free -m",
+      "cmd": "free -m\n",
+      "enabled": true
+    },
+    {
+      "id": "sigint",
+      "label": "Ctrl+C",
+      "cmd": "\u0003",
+      "enabled": true
+    },
+    {
+      "id": "clear",
+      "label": "Clear",
+      "cmd": "clear\n",
+      "enabled": false
+    },
+    {
+      "id": "qc-1785051762464",
+      "label": "test",
+      "cmd": "sas",
+      "enabled": true
+    }
+  ]
 }

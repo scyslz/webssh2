@@ -42,6 +42,23 @@ export interface SSHTab {
   reconnectMode?: 'restore' | 'force';
 }
 
+export interface QuickCommandItem {
+  id: string;
+  label: string;
+  cmd: string;
+  enabled: boolean;
+}
+
+export const defaultQuickCommands: QuickCommandItem[] = [
+  { id: 'ls', label: 'ls -la', cmd: 'ls -la\n', enabled: true },
+  { id: 'top', label: 'top', cmd: 'top\n', enabled: true },
+  { id: 'htop', label: 'htop', cmd: 'htop\n', enabled: true },
+  { id: 'df', label: 'df -h', cmd: 'df -h\n', enabled: true },
+  { id: 'free', label: 'free -m', cmd: 'free -m\n', enabled: true },
+  { id: 'sigint', label: 'Ctrl+C', cmd: '\x03', enabled: true },
+  { id: 'clear', label: 'Clear', cmd: 'clear\n', enabled: true },
+];
+
 export interface WebSSHConfig {
   savePass: boolean;
   timeout: number;
@@ -53,4 +70,5 @@ export interface WebSSHConfig {
   authEnabled: boolean;
   authUsername: string;
   authPassword: string;
+  quickCommands?: QuickCommandItem[];
 }

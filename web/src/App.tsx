@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { SSHInfo, SSHTab, WebSSHConfig } from './types';
+import { useState, useEffect, useCallback } from 'react';
+import { SSHInfo, SSHTab, WebSSHConfig, defaultQuickCommands } from './types';
 import { apiFetch, apiUrl } from './api';
 import { sessionGet, sessionSet, globalGet, globalSet } from './storage';
 import { Header } from './components/Header';
@@ -24,14 +24,25 @@ export default function App() {
   });
 
   const windowIdRaw = (() => {
-    try {
-      const stored = sessionGet('webssh_window_id');
-      if (stored) return stored.replace('wid-', '');
-    } catch {}
+    const stored = (() => {
+      try { return sessionGet('webssh_window_id'); } catch { return null; }
+    })();
+    if (stored && window.name === stored) {
+      return stored.replace('wid-', '');
+    }
+    // Duplicate tab or first load: clean stale state and generate fresh ID
+    if (stored) {
+      try {
+        sessionStorage.removeItem(`webssh_active_tabs:${stored}`);
+        sessionStorage.removeItem(`webssh_active_tab:${stored}`);
+      } catch {}
+    }
     const d = new Date();
     const ts = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}`;
     const rand = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
-    return `${ts}-${rand}`;
+    const raw = `${ts}-${rand}`;
+    window.name = `wid-${raw}`;
+    return raw;
   })();
   const windowId = `wid-${windowIdRaw}`;
   sessionSet('webssh_window_id', windowId);
@@ -155,6 +166,7 @@ export default function App() {
     authEnabled: false,
     authUsername: '',
     authPassword: '',
+    quickCommands: defaultQuickCommands,
   });
 
   // Load saved hosts and config from backend
@@ -177,13 +189,13 @@ export default function App() {
         const parsed = JSON.parse(local);
         delete parsed.authPassword;
         parsed.authPassword = '';
-        setConfig((prev) => ({ ...prev, ...parsed }));
+        setConfig((prev) => ({ ...prev, ...parsed, quickCommands: parsed.quickCommands || defaultQuickCommands }));
       }
       const res = await apiFetch(apiUrl('/config'));
       const data = await res.json();
       if (data && typeof data === 'object' && Object.keys(data).length > 0) {
-        setConfig((prev) => ({ ...prev, ...data }));
-        globalSet('webssh_config', JSON.stringify(data));
+        setConfig((prev) => ({ ...prev, ...data, quickCommands: data.quickCommands || defaultQuickCommands }));
+        globalSet('webssh_config', JSON.stringify({ ...data, quickCommands: data.quickCommands || defaultQuickCommands, authPassword: '' }));
       }
     } catch {
       // Ignore
@@ -275,6 +287,19 @@ export default function App() {
     } catch {
       // Ignore
     }
+  }, []);
+
+  const handleQuickCommandsChange = useCallback((quickCommands: WebSSHConfig['quickCommands']) => {
+    setConfig((prev) => {
+      const next = { ...prev, quickCommands };
+      globalSet('webssh_config', JSON.stringify({ ...next, authPassword: '' }));
+      apiFetch(apiUrl('/config'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(next),
+      }).catch(() => {});
+      return next;
+    });
   }, []);
 
   const saveHostToBackend = useCallback(async (newHosts: SSHInfo[]) => {
@@ -477,8 +502,6 @@ export default function App() {
     setSettingsModalOpen(false);
   }, []);
 
-  const activeTab = tabs.find((t) => t.id === activeTabId);
-
   const handleAttachBackendSession = useCallback((sess: BackendSession, force = false) => {
     const existing = tabs.find((t) => t.sessionId === sess.id || t.id === sess.id);
     if (existing) {
@@ -663,21 +686,22 @@ export default function App() {
                       : 'w-full'
                   } h-full ${showTerminal ? 'block' : 'hidden'}`}
                 >
-                   <TerminalView
-                    key={`${tab.id}:${tab.sessionId || 'no-session'}:${tab.reconnectToken || 0}`}
-                    tabId={tab.id}
-                    sshInfo={tab.sshInfo}
-                    config={config}
-                    // Only pass a backend session ID after the server creates one.
-                    // The tab ID is a UI identifier and must not skip session creation.
-                    sessionId={tab.sessionId}
-                    isTabActive={isTabActive && showTerminal}
-                    onConnectionChange={(connected) => handleConnectionChange(tab.id, connected)}
-                    onSessionInfo={(sessionId) => handleSessionInfo(tab.id, sessionId)}
-                    onRecoverSession={(force) => handleRecoverSession(tab.id, force)}
-                    onNewSession={() => handleNewSession(tab.id)}
-                    reconnectMode={tab.reconnectMode}
-                    initialError={tab.error}
+                    <TerminalView
+                     key={`${tab.id}:${tab.sessionId || 'no-session'}:${tab.reconnectToken || 0}`}
+                     tabId={tab.id}
+                     sshInfo={tab.sshInfo}
+                     config={config}
+                     // Only pass a backend session ID after the server creates one.
+                     // The tab ID is a UI identifier and must not skip session creation.
+                     sessionId={tab.sessionId}
+                     isTabActive={isTabActive && showTerminal}
+                     onConnectionChange={(connected) => handleConnectionChange(tab.id, connected)}
+                     onSessionInfo={(sessionId) => handleSessionInfo(tab.id, sessionId)}
+                     onRecoverSession={(force) => handleRecoverSession(tab.id, force)}
+                     onNewSession={() => handleNewSession(tab.id)}
+                     reconnectMode={tab.reconnectMode}
+                     initialError={tab.error}
+                     onQuickCommandsChange={handleQuickCommandsChange}
                   />
                 </div>
 

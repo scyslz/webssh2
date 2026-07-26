@@ -47,25 +47,27 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
     if (isOpen) loadSessions();
   }, [isOpen]);
 
-  const getRestoreTone = (tabCount: number, attachedClients: number) => {
-    if (attachedClients > tabCount) {
-      return isLight
-        ? 'bg-rose-100 hover:bg-rose-200 text-rose-800 border-rose-300'
-        : 'bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border-rose-500/30';
-    }
-    if (tabCount > 0) {
+  const tabIds = new Set(tabs.map((t) => t.id));
+
+  const getRestoreTone = (sess: BackendSession) => {
+    if (tabIds.has(sess.ownerClientId ?? '')) {
       return isLight
         ? 'bg-amber-100 hover:bg-amber-200 text-amber-800 border-amber-300'
         : 'bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border-amber-500/30';
+    }
+    if (sess.attachedClients > 0) {
+      return isLight
+        ? 'bg-rose-100 hover:bg-rose-200 text-rose-800 border-rose-300'
+        : 'bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border-rose-500/30';
     }
     return isLight
       ? 'bg-emerald-100 hover:bg-emerald-200 text-emerald-800 border-emerald-300'
       : 'bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border-emerald-500/30';
   };
 
-  const getRestoreTitle = (tabCount: number, attachedClients: number) => {
-    if (attachedClients > tabCount) return 'Occupied by another client — use Force to take over';
-    if (tabCount > 0) return 'Already opened in this browser — click to restore';
+  const getRestoreTitle = (sess: BackendSession) => {
+    if (tabIds.has(sess.ownerClientId ?? '')) return 'Already opened in this browser — click to restore';
+    if (sess.attachedClients > 0) return 'Occupied by another client — use Force to take over';
     return 'Available — click to restore here';
   };
 
@@ -96,7 +98,7 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 bg-black/75 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 z-50 select-none animate-in fade-in duration-150">
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 z-50 select-none animate-in fade-in duration-150">
       <div
         className={`border rounded-xl w-full max-w-xl max-h-[85vh] shadow-2xl flex flex-col overflow-hidden ${
           isLight ? 'bg-white border-slate-200 text-slate-800' : 'bg-slate-900 border-slate-800 text-slate-100'
@@ -153,11 +155,8 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
             </div>
           ) : (
             sessions.map((sess) => {
-              const tabMatches = tabs
-                .map((tab, index) => ({ tab, index }))
-                .filter(({ tab }) => tab.connected && (tab.sessionId === sess.id || tab.id === sess.id));
-              const restoreTone = getRestoreTone(tabMatches.length, sess.attachedClients);
-              const restoreTitle = getRestoreTitle(tabMatches.length, sess.attachedClients);
+              const restoreTone = getRestoreTone(sess);
+              const restoreTitle = getRestoreTitle(sess);
 
               return (
                 <div
@@ -191,14 +190,13 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
                   <div className="flex items-center gap-1.5 shrink-0">
                     <button
                       onClick={() => {
-                        onAttachSession(sess, attachedClients > tabMatches.length);
+                        onAttachSession(sess, sess.attachedClients > 0 && !tabIds.has(sess.ownerClientId ?? ''));
                         onClose();
                       }}
-                      className={`flex items-center gap-1 px-2.5 py-1 rounded-md border text-xs font-medium transition cursor-pointer shadow-xs ${restoreTone}`}
+                      className={`flex items-center gap-1 px-2 py-1 rounded-md border text-xs font-medium transition cursor-pointer shadow-xs ${restoreTone}`}
                       title={restoreTitle}
                     >
-                      <ExternalLink className="w-3 h-3" />
-                      <span>{attachedClients > tabMatches.length ? 'Force' : 'Restore'}</span>
+                      <ExternalLink className="w-3.5 h-3.5" />
                     </button>
 
                     <button
