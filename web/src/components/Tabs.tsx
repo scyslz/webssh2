@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
 import { SSHTab } from '../types';
 import { sessionGet } from '../storage';
-import { Terminal, FolderTree, X, Columns } from 'lucide-react';
+import { Terminal, FolderTree, X, Columns, Pencil, Copy, Trash2 } from 'lucide-react';
 
 interface TabsProps {
   tabs: SSHTab[];
@@ -262,10 +262,10 @@ export const Tabs: React.FC<TabsProps> = ({
         <div
           ref={menuRef}
           onMouseLeave={() => setContextMenu(null)}
-          className={`fixed z-[9999] rounded-lg border py-0.5 text-[10px] sm:text-[11px] font-normal leading-none whitespace-nowrap flex flex-col min-w-[80px] ${
+          className={`fixed z-[9999] rounded-lg border shadow-md py-1 text-xs font-normal whitespace-nowrap flex flex-col ${
             isLight
-              ? 'bg-white/10 backdrop-blur-sm border-slate-200/20 text-slate-500'
-              : 'bg-slate-900/10 backdrop-blur-sm border-slate-700/20 text-slate-400'
+              ? 'bg-white/90 backdrop-blur-md border-slate-200 text-slate-600'
+              : 'bg-slate-900/90 backdrop-blur-md border-slate-700 text-slate-300'
           }`}
         >
           <button
@@ -277,44 +277,49 @@ export const Tabs: React.FC<TabsProps> = ({
               editingValueRef.current = title;
               setContextMenu(null);
             }}
-            className={`text-left px-1.5 py-1 transition cursor-pointer ${
-              isLight ? 'hover:bg-slate-100/70' : 'hover:bg-slate-800/60'
+            className={`flex items-center gap-2 w-full text-left px-2.5 py-1.5 transition cursor-pointer ${
+              isLight ? 'hover:bg-slate-100 text-slate-600' : 'hover:bg-slate-800/60 text-slate-300'
             }`}
           >
-            rename
+            <Pencil className="w-3.5 h-3.5 shrink-0" />
+            <span>rename</span>
           </button>
           <button
             onClick={() => {
               onDuplicateTab?.(contextMenu.tabId);
               setContextMenu(null);
             }}
-            className={`text-left px-1.5 py-1 transition cursor-pointer ${
-              isLight ? 'hover:bg-slate-100/70' : 'hover:bg-slate-800/60'
+            className={`flex items-center gap-2 w-full text-left px-2.5 py-1.5 transition cursor-pointer ${
+              isLight ? 'hover:bg-slate-100 text-slate-600' : 'hover:bg-slate-800/60 text-slate-300'
             }`}
           >
-            copy
+            <Copy className="w-3.5 h-3.5 shrink-0" />
+            <span>copy</span>
           </button>
+          <div className={`mx-2 my-0.5 border-t ${isLight ? 'border-slate-200' : 'border-slate-700'}`} />
           <button
             onClick={() => {
               onCloseOtherTabs?.(contextMenu.tabId);
               setContextMenu(null);
             }}
-            className={`text-left px-1.5 py-1 transition cursor-pointer ${
-              isLight ? 'hover:bg-slate-100/70' : 'hover:bg-slate-800/60'
+            className={`flex items-center gap-2 w-full text-left px-2.5 py-1.5 transition cursor-pointer ${
+              isLight ? 'hover:bg-rose-50 text-rose-600' : 'hover:bg-rose-950/40 text-rose-400'
             }`}
           >
-            close others
+            <X className="w-3.5 h-3.5 shrink-0" />
+            <span>close others</span>
           </button>
           <button
             onClick={() => {
               onCloseAllTabs?.();
               setContextMenu(null);
             }}
-            className={`text-left px-1.5 py-1 transition cursor-pointer ${
-              isLight ? 'hover:bg-slate-100/70' : 'hover:bg-slate-800/60'
+            className={`flex items-center gap-2 w-full text-left px-2.5 py-1.5 transition cursor-pointer ${
+              isLight ? 'hover:bg-rose-50 text-rose-600' : 'hover:bg-rose-950/40 text-rose-400'
             }`}
           >
-            close all
+            <Trash2 className="w-3.5 h-3.5 shrink-0" />
+            <span>close all</span>
           </button>
         </div>
       )}
