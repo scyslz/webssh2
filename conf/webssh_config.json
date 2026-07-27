@@ -50,12 +50,6 @@
       "label": "Clear",
       "cmd": "clear\n",
       "enabled": false
-    },
-    {
-      "id": "qc-1785051762464",
-      "label": "test",
-      "cmd": "sas",
-      "enabled": true
     }
   ]
 }

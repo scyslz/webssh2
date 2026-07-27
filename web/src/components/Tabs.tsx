@@ -42,6 +42,7 @@ export const Tabs: React.FC<TabsProps> = ({
 
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState('');
+  const editingCanceledRef = useRef(false);
   const editingValueRef = useRef('');
   const [contextMenu, setContextMenu] = useState<ContextMenu | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -80,7 +81,7 @@ export const Tabs: React.FC<TabsProps> = ({
   }, [contextMenu]);
 
   const commitRename = () => {
-    if (!editingTabId) return;
+    if (!editingTabId || editingCanceledRef.current) return;
     const val = editingValueRef.current.trim();
     if (val) onRenameTab(editingTabId, val);
     setEditingTabId(null);
@@ -89,13 +90,19 @@ export const Tabs: React.FC<TabsProps> = ({
   const handleContextMenu = (e: React.MouseEvent, tabId: string) => {
     e.preventDefault();
     e.stopPropagation();
-    if (editingTabId) commitRename();
+    if (editingTabId) {
+      editingCanceledRef.current = true;
+      setEditingTabId(null);
+    }
     const rect = e.currentTarget.getBoundingClientRect();
     setContextMenu({ tabId, left: rect.left, top: rect.bottom });
   };
 
   const handleTouchStart = (e: React.TouchEvent, tabId: string) => {
-    if (editingTabId) commitRename();
+    if (editingTabId) {
+      editingCanceledRef.current = true;
+      setEditingTabId(null);
+    }
     const rect = e.currentTarget.getBoundingClientRect();
     longPressTimerRef.current = setTimeout(() => {
       setContextMenu({ tabId, left: rect.left, top: rect.bottom });
@@ -263,6 +270,7 @@ export const Tabs: React.FC<TabsProps> = ({
         >
           <button
             onClick={() => {
+              editingCanceledRef.current = false;
               const title = tabs.find((t) => t.id === contextMenu.tabId)?.title || '';
               setEditingTabId(contextMenu.tabId);
               setEditValue(title);
