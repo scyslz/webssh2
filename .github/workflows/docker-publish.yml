@@ -2,9 +2,6 @@ name: Build and Push Docker Image
 
 
 on:
-  push:
-    branches: [main, master]
-    tags: ["v*"]
   pull_request:
     branches: [main, master]
     types: [opened, synchronize]
@@ -29,15 +26,6 @@ jobs:
       IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/webssh2
 
     steps:
-      - name: Debug (GitHub Context)
-        run: |
-          echo "event_name=${{ github.event_name }}"
-          echo "github.ref=${{ github.ref }}"
-          echo "github.ref_name=${{ github.ref_name }}"
-          echo "github.sha=${{ github.sha }}"
-          echo "workflow input ref=${{ github.event.inputs.ref }}"
-          echo "environment=PROD"
-
       - name: Checkout
         uses: actions/checkout@v4
         with:
