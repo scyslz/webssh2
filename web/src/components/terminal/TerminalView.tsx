@@ -67,7 +67,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const heartbeatTimerRef = useRef<number | null>(null);
   const heartbeatTimeoutRef = useRef<number | null>(null);
   const lastHeartbeatPingAtRef = useRef<number | null>(null);
-  const touchScrollStateRef = useRef<{ startY: number; startScrollTop: number; viewportEl: HTMLElement } | null>(null);
+  const touchScrollStateRef = useRef<{ startY: number; lastY: number; accumulated: number } | null>(null);
+  const momentumRef = useRef<{ velocity: number; animationFrame: number | null } | null>(null);
   const suppressTerminalInputRef = useRef<boolean>(false);
   const isCoarsePointerRef = useRef<boolean>(false);
   const WS_META_PREFIX = '__WEBSSH_META__:';
@@ -861,36 +862,76 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       window.visualViewport.addEventListener('resize', handleVisualViewportResize);
     }
 
+    const SCROLL_SENSITIVITY = 1.5;
+    const SCROLL_LINE_HEIGHT = 18;
+    const MOMENTUM_VELOCITY_THRESHOLD = 0.15;
+    const MOMENTUM_FRICTION = 0.97;
+    const MOMENTUM_MIN_VELOCITY = 0.02;
+    const TAP_THRESHOLD = 8;
+
     const handleTouchStart = (event: TouchEvent) => {
       if (event.touches.length !== 1 || !containerRef.current) return;
-      const viewportEl = containerRef.current.querySelector('.xterm-viewport') as HTMLElement | null;
-      if (!viewportEl) return;
-      terminalRef.current?.clearSelection();
-      setSelectedText('');
+      if (momentumRef.current?.animationFrame != null) {
+        cancelAnimationFrame(momentumRef.current.animationFrame);
+        momentumRef.current = null;
+      }
       touchScrollStateRef.current = {
         startY: event.touches[0].clientY,
-        startScrollTop: viewportEl.scrollTop,
-        viewportEl,
+        lastY: event.touches[0].clientY,
+        accumulated: 0,
       };
     };
     const handleTouchMove = (event: TouchEvent) => {
       if (event.touches.length !== 1 || !touchScrollStateRef.current) return;
-      const { viewportEl, startScrollTop, startY } = touchScrollStateRef.current;
-      viewportEl.scrollTop = startScrollTop - (event.touches[0].clientY - startY);
       event.preventDefault();
+      const state = touchScrollStateRef.current;
+      const dy = event.touches[0].clientY - state.lastY;
+      state.lastY = event.touches[0].clientY;
+      state.accumulated += dy;
+      const lineDelta = Math.round(state.accumulated / SCROLL_LINE_HEIGHT * SCROLL_SENSITIVITY);
+      if (lineDelta !== 0) {
+        terminalRef.current?.scrollLines(-lineDelta);
+        state.accumulated -= lineDelta * SCROLL_LINE_HEIGHT / SCROLL_SENSITIVITY;
+      }
     };
     const handleTouchEnd = () => {
+      const state = touchScrollStateRef.current;
+      if (!state) return;
+      const totalDy = state.lastY - state.startY;
+      if (Math.abs(totalDy) > TAP_THRESHOLD) {
+        const vel = totalDy / 100;
+        if (Math.abs(vel) > MOMENTUM_VELOCITY_THRESHOLD) {
+          const anim = { velocity: vel, animationFrame: null };
+          momentumRef.current = anim;
+          const step = () => {
+            const cur = momentumRef.current;
+            if (!cur) return;
+            cur.velocity *= MOMENTUM_FRICTION;
+            if (Math.abs(cur.velocity) < MOMENTUM_MIN_VELOCITY) {
+              momentumRef.current = null;
+              return;
+            }
+            const lines = Math.round(cur.velocity * SCROLL_SENSITIVITY);
+            if (lines !== 0) terminalRef.current?.scrollLines(-lines);
+            cur.animationFrame = requestAnimationFrame(step);
+          };
+          anim.animationFrame = requestAnimationFrame(step);
+        }
+      }
       touchScrollStateRef.current = null;
     };
 
     if (containerRef.current) {
-      containerRef.current.addEventListener('touchstart', handleTouchStart, { passive: true });
+      containerRef.current.addEventListener('touchstart', handleTouchStart, { passive: false });
       containerRef.current.addEventListener('touchmove', handleTouchMove, { passive: false });
       containerRef.current.addEventListener('touchend', handleTouchEnd, { passive: true });
-      containerRef.current.addEventListener('touchcancel', handleTouchEnd, { passive: true });
+      containerRef.current.addEventListener('touchcancel', () => { touchScrollStateRef.current = null; }, { passive: true });
     }
 
     const cleanupArtifacts = () => {
+      if (momentumRef.current?.animationFrame != null) {
+        cancelAnimationFrame(momentumRef.current.animationFrame);
+      }
       selectionDisposable.dispose();
       ansiRequestModeDisposable.dispose();
       decRequestModeDisposable.dispose();

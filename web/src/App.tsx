@@ -113,6 +113,8 @@ export default function App() {
     } catch {
       // ignore
     }
+    _sessionsCache = { data: [], expireAt: 0 };
+    setActiveSessionCount(0);
     return [];
   }, []);
 

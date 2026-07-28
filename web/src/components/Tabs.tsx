@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
 import { SSHTab } from '../types';
 import { sessionGet } from '../storage';
-import { Terminal, FolderTree, X, Columns, Pencil, Copy, Trash2 } from 'lucide-react';
+import { FolderTree, X, Columns, Pencil, Copy, Trash2 } from 'lucide-react';
 
 interface TabsProps {
   tabs: SSHTab[];
@@ -208,23 +208,10 @@ export const Tabs: React.FC<TabsProps> = ({
             }`}
           >
             <button
-              onClick={() => onToggleView(currentTab.id, 'terminal')}
-              className={`p-1.5 rounded transition cursor-pointer ${
-                currentTab.activeView === 'terminal'
-                  ? isLight
-                    ? 'bg-emerald-100 text-emerald-800 font-semibold border border-emerald-300'
-                    : 'bg-emerald-500/20 text-emerald-300 font-semibold border border-emerald-500/30'
-                  : isLight
-                  ? 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
-              }`}
-              title="Terminal"
-            >
-              <Terminal className="w-3.5 h-3.5" />
-            </button>
-
-            <button
-              onClick={() => onToggleView(currentTab.id, 'sftp')}
+              onClick={() => onToggleView(
+                currentTab.id,
+                currentTab.activeView === 'sftp' ? 'terminal' : 'sftp'
+              )}
               className={`p-1.5 rounded transition cursor-pointer ${
                 currentTab.activeView === 'sftp'
                   ? isLight
@@ -240,7 +227,10 @@ export const Tabs: React.FC<TabsProps> = ({
             </button>
 
             <button
-              onClick={() => onToggleView(currentTab.id, 'split')}
+              onClick={() => onToggleView(
+                currentTab.id,
+                currentTab.activeView === 'split' ? 'terminal' : 'split'
+              )}
               className={`p-1.5 rounded transition cursor-pointer ${
                 currentTab.activeView === 'split'
                   ? isLight
