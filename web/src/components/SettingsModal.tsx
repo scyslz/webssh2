@@ -124,6 +124,29 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </div>
 
           <div className={`pt-2 border-t space-y-3 ${isLight ? 'border-slate-200' : 'border-slate-800'}`}>
+            <div className={`space-y-2 ${isLight ? 'text-slate-700' : 'text-slate-300'}`}>
+              <label className="flex items-center gap-2 text-xs cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={config.showQuickCmds}
+                  onChange={(e) => onChangeConfig({ ...config, showQuickCmds: e.target.checked })}
+                  className="rounded border-slate-400 bg-white text-emerald-600 focus:ring-0"
+                />
+                <span>Show Quick Commands</span>
+              </label>
+              <label className="flex items-center gap-2 text-xs cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={config.showKeyBar}
+                  onChange={(e) => onChangeConfig({ ...config, showKeyBar: e.target.checked })}
+                  className="rounded border-slate-400 bg-white text-emerald-600 focus:ring-0"
+                />
+                <span>Show Quick Keys</span>
+              </label>
+            </div>
+          </div>
+
+          <div className={`pt-2 border-t space-y-3 ${isLight ? 'border-slate-200' : 'border-slate-800'}`}>
             <label className={`block text-xs font-medium mb-1 flex items-center gap-1.5 ${isLight ? 'text-slate-700' : 'text-slate-300'}`}>
               <Shield className="w-3.5 h-3.5 text-sky-500" />
               <span>Transport & Origin Checks</span>

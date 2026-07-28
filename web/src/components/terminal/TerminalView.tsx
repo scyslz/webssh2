@@ -26,6 +26,7 @@ interface TerminalViewProps {
   sessionId?: string;
   reconnectMode?: 'restore' | 'force';
   isTabActive?: boolean;
+  tabConnected?: boolean;
   onConnectionChange?: (connected: boolean) => void;
   onSessionInfo?: (sessionId: string, reattached: boolean) => void;
   onSessionTitle?: (sessionId: string, title: string) => void;
@@ -42,6 +43,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   sessionId,
   reconnectMode = 'restore',
   isTabActive = true,
+  tabConnected,
   onConnectionChange,
   onSessionInfo,
   onSessionTitle,
@@ -115,8 +117,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const [pasteInputText, setPasteInputText] = useState<string>('');
   const [selectionModalOpen, setSelectionModalOpen] = useState<boolean>(false);
   const [selectionBufferText, setSelectionBufferText] = useState<string>('');
-  const [showKeyBar, setShowKeyBar] = useState<boolean>(true);
-  const [showQuickCmds, setShowQuickCmds] = useState<boolean>(true);
+  const [showKeyBar, setShowKeyBar] = useState<boolean>(config.showKeyBar);
+  const [showQuickCmds, setShowQuickCmds] = useState<boolean>(config.showQuickCmds);
 
   // Modifiers
   const [ctrlActive, setCtrlActive] = useState<boolean>(false);
@@ -432,6 +434,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
 
     setConnecting(true);
     setConnected(false);
+    setClientLatencyMs(null);
+    setSshLatencyMs(null);
     setErrorMsg(null);
     setOfflineSuspended(false);
     silentReconnectRef.current = silentReconnect;
@@ -664,6 +668,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
             setErrorMsg('This session is already attached by another browser tab or device.');
             setConnecting(false);
             setConnected(false);
+            setClientLatencyMs(null);
+            setSshLatencyMs(null);
             onConnectionChange?.(false);
             return;
           }
@@ -672,6 +678,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
             setErrorMsg('This session was taken over by another browser tab or device.');
             setConnecting(false);
             setConnected(false);
+            setClientLatencyMs(null);
+            setSshLatencyMs(null);
             onConnectionChange?.(false);
             return;
           }
@@ -682,6 +690,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
             setErrorMsg(`${message}${code}`);
             setConnecting(false);
             setConnected(false);
+            setClientLatencyMs(null);
+            setSshLatencyMs(null);
             onConnectionChange?.(false);
             return;
           }
@@ -739,10 +749,16 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       pushDebugEvent(`ws error attempt=${attemptId}`);
       closeReasonRef.current = 'websocket_error';
       if (offlineHoldEnabledRef.current) {
+        setConnected(false);
+        setClientLatencyMs(null);
+        setSshLatencyMs(null);
+        onConnectionChange?.(false);
         return;
       }
       setConnecting(false);
       setConnected(false);
+      setClientLatencyMs(null);
+      setSshLatencyMs(null);
       setErrorMsg('WebSocket connection failed.');
       onConnectionChange?.(false);
     };
@@ -772,6 +788,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       }
       setConnecting(false);
       setConnected(false);
+      setClientLatencyMs(null);
+      setSshLatencyMs(null);
       onConnectionChange?.(false);
 
       if (offlineHoldEnabledRef.current) {
@@ -900,6 +918,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       setErrorMsg(initialError);
       setConnecting(false);
       setConnected(false);
+      setClientLatencyMs(null);
+      setSshLatencyMs(null);
       onConnectionChange?.(false);
       return;
     }
@@ -978,6 +998,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       <TerminalToolbar
         isLight={isLight}
         connected={connected}
+        tabConnected={tabConnected}
         offlineSuspended={offlineSuspended}
         connecting={connecting}
         selectedText={selectedText}
@@ -1023,7 +1044,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       {/* Terminal Canvas Container */}
       <div
         ref={containerRef}
-        className="flex-1 min-h-0 w-full overflow-hidden transition-colors duration-200"
+        className="flex-1 min-h-0 w-full overflow-hidden pl-[8px] transition-colors duration-200"
         style={{
           backgroundColor: getXTermTheme(config.theme).background || (isLight ? '#ffffff' : '#0a0f1d'),
         }}

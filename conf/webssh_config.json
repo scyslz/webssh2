@@ -8,6 +8,8 @@
   "originCheckEnabled": false,
   "authEnabled": false,
   "authUsername": "",
+  "showQuickCmds": true,
+  "showKeyBar": true,
   "quickCommands": [
     {
       "id": "ls",

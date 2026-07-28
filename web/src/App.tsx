@@ -166,6 +166,8 @@ export default function App() {
     authEnabled: false,
     authUsername: '',
     authPassword: '',
+    showQuickCmds: true,
+    showKeyBar: true,
     quickCommands: defaultQuickCommands,
   });
 
@@ -755,17 +757,16 @@ export default function App() {
                       : 'w-full'
                   } h-full ${showTerminal ? 'block' : 'hidden'}`}
                 >
-                    <TerminalView
-                     key={`${tab.id}:${tab.sessionId || 'no-session'}:${tab.reconnectToken || 0}`}
-                     tabId={tab.id}
-                     sshInfo={tab.sshInfo}
-                     config={config}
-                     // Only pass a backend session ID after the server creates one.
-                     // The tab ID is a UI identifier and must not skip session creation.
-                     sessionId={tab.sessionId}
-                     isTabActive={isTabActive && showTerminal}
-                     onConnectionChange={(connected) => handleConnectionChange(tab.id, connected)}
-                     onSessionInfo={(sessionId) => handleSessionInfo(tab.id, sessionId)}
+                   <TerminalView
+                      key={`${tab.id}:${tab.sessionId || 'no-session'}:${tab.reconnectToken || 0}`}
+                      tabId={tab.id}
+                      sshInfo={tab.sshInfo}
+                      config={config}
+                      sessionId={tab.sessionId}
+                      isTabActive={isTabActive && showTerminal}
+                      tabConnected={tab.connected}
+                      onConnectionChange={(connected) => handleConnectionChange(tab.id, connected)}
+                                            onSessionInfo={(sessionId) => handleSessionInfo(tab.id, sessionId)}
                      onSessionTitle={(sessionId, title) => handleSessionTitle(tab.id, sessionId, title)}
                      onRecoverSession={(force) => handleRecoverSession(tab.id, force)}
                      onNewSession={() => handleNewSession(tab.id)}

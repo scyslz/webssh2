@@ -4,6 +4,7 @@ import { Copy, Clipboard, Keyboard, CloudOff, Share2, ZoomIn, ZoomOut, Trash2, R
 interface TerminalToolbarProps {
   isLight: boolean;
   connected: boolean;
+  tabConnected?: boolean;
   offlineSuspended: boolean;
   connecting: boolean;
   selectedText: string;
@@ -45,6 +46,7 @@ const getLatencyToneClass = (value: number | null, isLight: boolean) => {
 export const TerminalToolbar: React.FC<TerminalToolbarProps> = ({
   isLight,
   connected,
+  tabConnected,
   offlineSuspended,
   connecting,
   selectedText,
@@ -180,16 +182,20 @@ export const TerminalToolbar: React.FC<TerminalToolbarProps> = ({
           <Terminal className="w-3 h-3" />
         </button>
 
-        {connected && (
-          <div
-            className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono shrink-0 border ${latencyBadgeClass}`}
-            title={`Browser to WebSSH: ${formatLatency(clientLatencyMs)} | WebSSH to SSH host: ${formatLatency(sshLatencyMs)}`}
-          >
-            <span className={getLatencyToneClass(clientLatencyMs, isLight)}>{formatLatency(clientLatencyMs)}</span>
-            <span className="opacity-50">|</span>
-            <span className={getLatencyToneClass(sshLatencyMs, isLight)}>{formatLatency(sshLatencyMs)}</span>
-          </div>
-        )}
+        <div
+          className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono shrink-0 border ${latencyBadgeClass}`}
+          title={`Browser to WebSSH: ${formatLatency(clientLatencyMs)} | WebSSH to SSH host: ${formatLatency(sshLatencyMs)}`}
+        >
+          {tabConnected ? (
+            <>
+              <span className={getLatencyToneClass(clientLatencyMs, isLight)}>{formatLatency(clientLatencyMs)}</span>
+              <span className="opacity-50">|</span>
+              <span className={getLatencyToneClass(sshLatencyMs, isLight)}>{formatLatency(sshLatencyMs)}</span>
+            </>
+          ) : (
+            <span className="opacity-50">-|-</span>
+          )}
+        </div>
       </div>
 
       <div className="flex items-center gap-0.5 shrink-0">

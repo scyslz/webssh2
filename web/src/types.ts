@@ -37,6 +37,8 @@ export interface SSHTab {
   sftpPath?: string;
   activeView: 'terminal' | 'sftp' | 'split';
   connected: boolean;
+  clientLatencyMs?: number | null;
+  sshLatencyMs?: number | null;
   error?: string;
   reconnectToken?: number;
   reconnectMode?: 'restore' | 'force';
@@ -70,5 +72,7 @@ export interface WebSSHConfig {
   authEnabled: boolean;
   authUsername: string;
   authPassword: string;
+  showQuickCmds: boolean;
+  showKeyBar: boolean;
   quickCommands?: QuickCommandItem[];
 }
