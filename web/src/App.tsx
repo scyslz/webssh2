@@ -509,9 +509,12 @@ export default function App() {
         if (tab.sessionId && !matchingSession) {
           return {
             ...tab,
-            connected: false,
+            connected: true,
             reconnectToken: (tab.reconnectToken || 0) + 1,
-            error: 'Session not found or expired.',
+            error: undefined,
+            // The old backend session no longer exists (e.g. torn down after a
+            // keepalive timeout). Start a fresh one instead of surfacing an error.
+            sessionId: undefined,
           };
         }
 
