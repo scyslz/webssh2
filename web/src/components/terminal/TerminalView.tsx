@@ -293,6 +293,36 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     sendRawToTerminal(processInputData(data));
   };
 
+  const sendPasteToTerminal = (text: string, focusTerminal = true) => {
+    const bracketedPasteActive = Boolean(terminalRef.current?.modes.bracketedPasteMode);
+    let payload = bracketedPasteActive ? `\x1b[200~${text}\x1b[201~` : text;
+
+    const CHUNK_SIZE = 4096;
+    const CHUNK_DELAY_MS = 20;
+    if (payload.length <= CHUNK_SIZE) {
+      sendRawToTerminal(payload, focusTerminal);
+      return;
+    }
+
+    let offset = 0;
+    const flush = () => {
+      if (offset >= payload.length) {
+        if (focusTerminal) terminalRef.current?.focus();
+        return;
+      }
+      const piece = payload.slice(offset, offset + CHUNK_SIZE);
+      offset += CHUNK_SIZE;
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(piece);
+        window.setTimeout(flush, CHUNK_DELAY_MS);
+      } else {
+        sendRawToTerminal(piece, false);
+      }
+    };
+    flush();
+  };
+
   const toggleSharedSession = () => {
     const nextShared = !sharedSession;
     setSharedSession(nextShared);
@@ -402,7 +432,9 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       try {
         const text = await navigator.clipboard.readText();
         if (text) {
-          sendRawToTerminal(text);
+          sendPasteToTerminal(text);
+          suppressTerminalInputRef.current = false;
+          window.setTimeout(() => terminalRef.current?.focus(), 50);
           return;
         }
       } catch {
@@ -415,7 +447,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
 
   const handleSendPastedText = () => {
     if (pasteInputText) {
-      sendRawToTerminal(pasteInputText, false);
+      sendPasteToTerminal(pasteInputText, false);
       setPasteModalOpen(false);
       setPasteInputText('');
       suppressTerminalInputRef.current = false;

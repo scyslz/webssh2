@@ -39,6 +39,13 @@ interface SSHSession {
 const MAX_HISTORY_BYTES = 2 * 1024 * 1024;
 const WS_META_PREFIX = '__WEBSSH_META__:';
 const SESSION_ATTACH_GRACE_MS = 30000;
+// OpenSSH-style keepalive: send `keepalive@openssh.com` global requests over the
+// real SSH transport. There is no dedicated RFC keepalive message; this is the
+// de-facto standard. If `SSH_KEEPALIVE_COUNT_MAX` consecutive requests go
+// unanswered (dead but TCP-open channel), ssh2 tears the connection down so the
+// wedged session is cleaned up instead of silently swallowing all input.
+const SSH_KEEPALIVE_INTERVAL_MS = 25000;
+const SSH_KEEPALIVE_COUNT_MAX = 3;
 
 function sendTerminalMessage(ws: WebSocket, message: string | Buffer) {
   if (ws.readyState === WebSocket.OPEN) ws.send(message);
@@ -240,6 +247,28 @@ export function createSessionManager(): SessionManager {
       const conn = new SSHClient();
       let settled = false;
       let sshReady = false;
+      let currentSession: SSHSession | null = null;
+
+      function teardownSession(session: SSHSession, message: string) {
+        if (!sshSessions.has(session.id)) return;
+        sshLog('session teardown via keepalive guard', { sessionId: session.id, message });
+        if (session.disconnectTimer) clearTimeout(session.disconnectTimer);
+        session.disconnectTimer = undefined;
+        if (session.latencyProbeTimer) clearInterval(session.latencyProbeTimer);
+        session.latencyProbeTimer = undefined;
+        session.latencyProbeInFlight = false;
+        for (const clientWs of session.attachedSockets) {
+          if (clientWs.readyState === WebSocket.OPEN) {
+            sendTerminalMessage(clientWs, `\r\n\x1b[33m[WebSSH] ${message}. A fresh session will be created automatically.\x1b[0m\r\n`);
+            clientWs.close(1011, message);
+          }
+        }
+        session.attachedSockets.clear();
+        try { session.stream?.end(); } catch {}
+        try { conn.end(); } catch {}
+        sshSessions.delete(session.id);
+      }
+
       const sshWatchdog = setTimeout(() => {
         if (settled) return;
         settled = true;
@@ -283,6 +312,7 @@ export function createSessionManager(): SessionManager {
             ownerClientId: options.ownerClientId || undefined,
             title: options.title,
           };
+          currentSession = session;
           sshSessions.set(sessionId, session);
           startSessionLatencyProbe(session);
           scheduleSessionDisconnect(session, SESSION_ATTACH_GRACE_MS);
@@ -319,6 +349,9 @@ export function createSessionManager(): SessionManager {
           conn.on('close', () => {
             clearTimeout(sshWatchdog);
             sshLog('SSH client closed', { sessionId, sshReady });
+            if (currentSession && sshSessions.has(currentSession.id)) {
+              teardownSession(currentSession, 'SSH connection closed');
+            }
           });
 
           settled = true;
@@ -335,6 +368,13 @@ export function createSessionManager(): SessionManager {
           ...sshSummary(sshConfig),
         });
         console.error(`[webssh-ssh] raw SSH error for session ${sessionId}`, err);
+        // On 'error' ssh2 is already closing the underlying socket; make sure any
+        // established session (e.g. keepalive timeout on a half-dead channel) is
+        // torn down so clients can't keep typing into it.
+        if (currentSession && sshSessions.has(currentSession.id)) {
+          teardownSession(currentSession, 'SSH connection error');
+          return;
+        }
         if (!settled) {
           settled = true;
           reject(err);
@@ -351,6 +391,12 @@ export function createSessionManager(): SessionManager {
         privateKey: sshConfig.privateKey,
         passphrase: sshConfig.passphrase,
         readyTimeout: 15000,
+        // OpenSSH-style keepalive (keepalive@openssh.com). Guard the real SSH
+        // channel: if `SSH_KEEPALIVE_COUNT_MAX` consecutive requests go
+        // unanswered, ssh2 emits 'error' and destroys the socket, which triggers
+        // teardownSession above instead of silently dropping user input.
+        keepaliveInterval: SSH_KEEPALIVE_INTERVAL_MS,
+        keepaliveCountMax: SSH_KEEPALIVE_COUNT_MAX,
       });
     });
   }
