@@ -78,6 +78,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const momentumRef = useRef<{ velocity: number; animationFrame: number | null } | null>(null);
   const suppressTerminalInputRef = useRef<boolean>(false);
   const isCoarsePointerRef = useRef<boolean>(false);
+  const lastTouchTapRef = useRef<{ time: number; x: number; y: number } | null>(null);
+  const suppressNextDblClickRef = useRef<boolean>(false);
   const WS_META_PREFIX = '__WEBSSH_META__:';
   const RECONNECT_COUNTDOWN_SECONDS = 5;
   const MAX_RECONNECT_ATTEMPTS = 3;
@@ -1139,7 +1141,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         state.accumulated -= lineDelta * SCROLL_LINE_HEIGHT / SCROLL_SENSITIVITY;
       }
     };
-    const handleTouchEnd = () => {
+    const handleTouchEnd = (event: TouchEvent) => {
       const state = touchScrollStateRef.current;
       if (!state) return;
       const totalDy = state.lastY - state.startY;
@@ -1161,6 +1163,25 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
             cur.animationFrame = requestAnimationFrame(step);
           };
           anim.animationFrame = requestAnimationFrame(step);
+        }
+      } else {
+        const t = event.changedTouches[0];
+        if (t) {
+          const now = Date.now();
+          const prev = lastTouchTapRef.current;
+          lastTouchTapRef.current = { time: now, x: t.clientX, y: t.clientY };
+          if (
+            prev &&
+            now - prev.time < 350 &&
+            Math.abs(t.clientX - prev.x) < 24 &&
+            Math.abs(t.clientY - prev.y) < 24
+          ) {
+            lastTouchTapRef.current = null;
+            suppressNextDblClickRef.current = true;
+            window.setTimeout(() => { suppressNextDblClickRef.current = false; }, 600);
+            sendRawToTerminal('\t\t');
+            terminalRef.current?.focus();
+          }
         }
       }
       touchScrollStateRef.current = null;
@@ -1335,6 +1356,16 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
           backgroundColor: getXTermTheme(config.theme).background || (isLight ? '#ffffff' : '#0a0f1d'),
         }}
         onClick={() => terminalRef.current?.focus()}
+        onDoubleClickCapture={(e) => {
+          if (suppressNextDblClickRef.current) {
+            suppressNextDblClickRef.current = false;
+            return;
+          }
+          e.preventDefault();
+          e.stopPropagation();
+          sendRawToTerminal('\t\t');
+          terminalRef.current?.focus();
+        }}
       />
 
       {showKeyBar && (connected || offlineSuspended) && (
