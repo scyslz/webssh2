@@ -68,7 +68,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const isReconnectCycleRef = useRef<boolean>(false);
   const reconnectCycleActiveRef = useRef<boolean>(false);
   const retryCountRef = useRef<number>(0);
-  const retriesExhaustedRef = useRef<boolean>(false);
+  const cycleSuppressOutputRef = useRef<boolean>(false);
   const countdownTimerRef = useRef<number | null>(null);
   const silentReconnectRef = useRef<boolean>(false);
   const heartbeatTimerRef = useRef<number | null>(null);
@@ -102,7 +102,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const [offlineSuspended, setOfflineSuspended] = useState<boolean>(false);
   const [reconnectSending, setReconnectSending] = useState<boolean>(false);
   const [countdownLeft, setCountdownLeft] = useState<number | null>(null);
-  const [retriesExhausted, setRetriesExhausted] = useState<boolean>(false);
   const [retryAttempt, setRetryAttempt] = useState<number>(1);
   const [debugEnabled, setDebugEnabled] = useState<boolean>(() => {
     try {
@@ -275,13 +274,9 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     setCountdownLeft(left);
   };
 
-  const setExhausted = (value: boolean) => {
-    retriesExhaustedRef.current = value;
-    setRetriesExhausted(value);
-  };
-
   const performReconnect = () => {
     isReconnectCycleRef.current = true;
+    cycleSuppressOutputRef.current = true;
     reconnectModeOverrideRef.current = closeReasonRef.current === 'session_busy' || closeReasonRef.current === 'taken_over' ? 'force' : 'restore';
     connectWebSocket(reconnectModeOverrideRef.current || undefined, true);
   };
@@ -307,7 +302,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
 
   const beginReconnectCycle = (triggerPayload: string | ArrayBuffer) => {
     pendingTriggerPayloadRef.current = triggerPayload;
-    if (retriesExhaustedRef.current) return;
     if (reconnectCycleActiveRef.current) return;
     startCountdown();
   };
@@ -315,6 +309,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const failReconnectCycle = () => {
     if (!isReconnectCycleRef.current) return;
     isReconnectCycleRef.current = false;
+    cycleSuppressOutputRef.current = false;
     clearCountdownTimer();
     setCountdown(null);
     setOfflineSuspended(true);
@@ -322,8 +317,9 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     retryCountRef.current += 1;
     if (retryCountRef.current >= MAX_RECONNECT_ATTEMPTS) {
       pendingTriggerPayloadRef.current = null;
-      setExhausted(true);
-      setCycleActive(true);
+      retryCountRef.current = 0;
+      setCycleActive(false);
+      window.setTimeout(() => terminalRef.current?.focus(), 50);
     } else {
       startCountdown();
     }
@@ -331,22 +327,22 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
 
   const completeReconnectCycle = () => {
     isReconnectCycleRef.current = false;
+    cycleSuppressOutputRef.current = false;
     pendingTriggerPayloadRef.current = null;
     clearCountdownTimer();
     setCountdown(null);
     setCycleActive(false);
     retryCountRef.current = 0;
-    setExhausted(false);
   };
 
   const cancelReconnectCycle = () => {
     isReconnectCycleRef.current = false;
+    cycleSuppressOutputRef.current = false;
     pendingTriggerPayloadRef.current = null;
     clearCountdownTimer();
     setCountdown(null);
     setCycleActive(false);
     retryCountRef.current = 0;
-    setExhausted(false);
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.CONNECTING) {
       ws.close();
@@ -826,17 +822,9 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       }
       fitAddon?.fit();
       sendHeartbeatPing(ws);
-      flushDeferredPayloads(ws);
-      if (pendingTriggerPayloadRef.current !== null) {
-        const trigger = pendingTriggerPayloadRef.current;
-        pendingTriggerPayloadRef.current = null;
-        try {
-          ws.send(trigger);
-        } catch {
-          // ignore
-        }
+      if (!isReconnectCycleRef.current) {
+        completeReconnectCycle();
       }
-      completeReconnectCycle();
       heartbeatTimerRef.current = window.setInterval(() => {
         sendHeartbeatPing(ws);
       }, 10000);
@@ -852,6 +840,20 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
             if (typeof meta.shared === 'boolean') setSharedSession(meta.shared);
             if (typeof meta.sessionId === 'string') {
               onSessionInfo?.(meta.sessionId, Boolean(meta.reattached));
+            }
+            if (isReconnectCycleRef.current) {
+              cycleSuppressOutputRef.current = false;
+              flushDeferredPayloads(ws);
+              if (pendingTriggerPayloadRef.current !== null) {
+                const trigger = pendingTriggerPayloadRef.current;
+                pendingTriggerPayloadRef.current = null;
+                try {
+                  ws.send(trigger);
+                } catch {
+                  // ignore
+                }
+              }
+              completeReconnectCycle();
             }
             return;
           }
@@ -930,7 +932,9 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
           closeReasonRef.current = 'ssh_shell_error';
           setErrorMsg(event.data.replace(/\x1b\[[0-9;]*m/g, '').replace(/\r?\n/g, ' ').trim());
         }
-        term.write(event.data);
+        if (!cycleSuppressOutputRef.current) {
+          term.write(event.data);
+        }
         return;
       }
 
@@ -940,7 +944,9 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         if (controls.length > 0) {
           pushDebugEvent(`ws binary controls ${controls.join(' | ')}`);
         }
-        term.write(decoded);
+        if (!cycleSuppressOutputRef.current) {
+          term.write(decoded);
+        }
         return;
       }
 
@@ -951,7 +957,9 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
           if (controls.length > 0) {
             pushDebugEvent(`ws blob controls ${controls.join(' | ')}`);
           }
-          term.write(decoded);
+          if (!cycleSuppressOutputRef.current) {
+            term.write(decoded);
+          }
         });
       }
     };
@@ -989,6 +997,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       if (!isCurrentConnection()) return;
       pushDebugEvent(`ws close attempt=${attemptId} code=${event.code} reason=${event.reason || '(none)'} clean=${event.wasClean}`);
       const wasReconnectCycle = isReconnectCycleRef.current;
+      const wasSuppressingOutput = cycleSuppressOutputRef.current;
+      cycleSuppressOutputRef.current = false;
       const closeDetails = `${event.reason || ''}`.toLowerCase();
       const isServerFailure =
         event.code === 1011 ||
@@ -1006,7 +1016,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       heartbeatTimeoutRef.current = null;
       lastHeartbeatPingAtRef.current = null;
       const remaining = decoderRef.current?.decode();
-      if (remaining) {
+      if (remaining && !wasSuppressingOutput) {
         term.write(remaining);
       }
       setConnecting(false);
@@ -1336,71 +1346,58 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         />
       )}
 
-      {/* Reconnect Mask (offline mode: auto retry with countdown + attempt number, closeable) */}
+      {/* Reconnect Modal (offline mode: auto retry with countdown + attempt number, closeable) */}
       {reconnectSending && (
-        <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/60 backdrop-blur-[2px]">
-          <div
-            className={`flex flex-col items-center gap-2.5 px-6 py-4 rounded-xl border shadow-2xl ${
-              isLight ? 'bg-white/95 border-slate-200' : 'bg-slate-900/95 border-slate-700'
-            }`}
-          >
-            {retriesExhausted ? (
-              <>
-                <div className={`text-xs font-mono text-center ${isLight ? 'text-slate-700' : 'text-slate-200'}`}>
-                  Reconnect attempts exhausted ({MAX_RECONNECT_ATTEMPTS}/{MAX_RECONNECT_ATTEMPTS}).
-                  <br />
-                  Enter/Ctrl+C input was discarded; your offline input is still editable.
-                </div>
-                <button
-                  onClick={cancelReconnectCycle}
-                  className={`px-3 py-1 rounded-lg text-xs font-semibold transition cursor-pointer ${
-                    isLight
-                      ? 'bg-slate-200 text-slate-600 hover:bg-slate-300'
-                      : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
-                  }`}
-                >
-                  Close
-                </button>
-              </>
-            ) : countdownLeft !== null && countdownLeft > 0 ? (
-              <>
-                <div className={`text-sm font-mono font-bold ${isLight ? 'text-slate-800' : 'text-slate-100'}`}>
-                  Reconnect attempt {retryAttempt} of {MAX_RECONNECT_ATTEMPTS} in {countdownLeft}s...
-                </div>
-                <div className={`text-xs font-mono text-center ${isLight ? 'text-slate-700' : 'text-slate-200'}`}>
-                  Command will be sent automatically
-                </div>
-                <button
-                  onClick={cancelReconnectCycle}
-                  className={`px-3 py-1 rounded-lg text-xs font-semibold transition cursor-pointer ${
-                    isLight
-                      ? 'bg-slate-200 text-slate-600 hover:bg-slate-300'
-                      : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
-                  }`}
-                >
-                  Close
-                </button>
-              </>
-            ) : (
-              <>
-                <div className="w-6 h-6 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin" />
-                <div className={`text-xs font-mono text-center ${isLight ? 'text-slate-700' : 'text-slate-200'}`}>
-                  Reconnecting... (attempt {retryAttempt} of {MAX_RECONNECT_ATTEMPTS})
-                  <br />
-                  Command will be sent automatically
-                </div>
-                <button
-                  onClick={cancelReconnectCycle}
-                  className={`px-3 py-1 rounded-lg text-xs font-semibold transition cursor-pointer ${
-                    isLight
-                      ? 'bg-slate-200 text-slate-600 hover:bg-slate-300'
-                      : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
-                  }`}
-                >
-                  Close
-                </button>
-              </>
-            )}
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-2 sm:p-4 z-50 select-none">
+          <div className={`rounded-xl w-full max-w-sm p-3 shadow-2xl flex flex-col gap-3 border ${
+            isLight ? 'bg-white border-slate-200' : 'bg-slate-900 border-slate-800'
+          }`}>
+            <div className="flex items-center justify-between shrink-0">
+              <h3 className={`font-bold text-xs sm:text-sm ${isLight ? 'text-slate-800' : 'text-slate-200'}`}>
+                {countdownLeft !== null && countdownLeft > 0
+                  ? `Reconnect attempt ${retryAttempt} of ${MAX_RECONNECT_ATTEMPTS}`
+                  : 'Reconnecting...'}
+              </h3>
+              <button
+                onClick={cancelReconnectCycle}
+                className={`p-1 rounded ${isLight ? 'text-slate-400 hover:text-slate-600' : 'text-slate-400 hover:text-slate-200'}`}
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="flex flex-col items-center gap-2.5 py-2">
+              {countdownLeft !== null && countdownLeft > 0 ? (
+                <>
+                  <div className={`text-3xl font-mono font-bold ${isLight ? 'text-slate-800' : 'text-slate-100'}`}>
+                    {countdownLeft}s
+                  </div>
+                  <div className={`text-xs font-mono text-center ${isLight ? 'text-slate-600' : 'text-slate-300'}`}>
+                    Reconnect in {countdownLeft}s...
+                    <br />
+                    Command will be sent automatically
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="w-6 h-6 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin" />
+                  <div className={`text-xs font-mono text-center ${isLight ? 'text-slate-600' : 'text-slate-300'}`}>
+                    Reconnecting... (attempt {retryAttempt} of {MAX_RECONNECT_ATTEMPTS})
+                    <br />
+                    Command will be sent automatically
+                  </div>
+                </>
+              )}
+            </div>
+
+            <button
+              onClick={cancelReconnectCycle}
+              className={`px-3.5 py-1.5 rounded-lg text-xs font-medium transition cursor-pointer ${
+                isLight ? 'bg-slate-200 text-slate-600 hover:bg-slate-300' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+              }`}
+            >
+              Cancel retry
+            </button>
           </div>
         </div>
       )}
