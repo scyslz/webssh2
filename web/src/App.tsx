@@ -279,6 +279,12 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    const bg = config.theme === 'light' ? '#ffffff' : '#020617';
+    document.documentElement.style.backgroundColor = bg;
+    document.body.style.backgroundColor = bg;
+  }, [config.theme]);
+
   const handleSaveConfig = useCallback(async (newConfig: WebSSHConfig) => {
     setConfig(newConfig);
     try {
@@ -641,7 +647,16 @@ export default function App() {
       className={`fixed inset-0 flex flex-col overflow-hidden font-sans transition-colors ${
         isLight ? 'bg-white text-slate-800' : 'bg-slate-950 text-slate-100'
       }`}
-      style={viewportHeight > 0 ? { height: `${viewportHeight}px`, width: '100vw' } : { width: '100vw' }}
+      style={
+        viewportHeight > 0
+          ? {
+              height: `calc(${viewportHeight}px + env(safe-area-inset-bottom))`,
+              width: '100vw',
+              paddingTop: 'env(safe-area-inset-top)',
+              paddingBottom: 'env(safe-area-inset-bottom)',
+            }
+          : { width: '100vw' }
+      }
     >
       {/* Top Header */}
       <Header

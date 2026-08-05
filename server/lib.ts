@@ -68,7 +68,7 @@ export interface ParsedSSHInfo {
   host: string;
   port: number;
   username: string;
-  password: string;
+  password?: string;
   privateKey?: string;
   passphrase?: string;
   logintype: number;
@@ -302,19 +302,62 @@ export function parseSSHInfo(sshInfoStr: string): ParsedSSHInfo {
       try { decoded = decodeURIComponent(decoded); } catch {}
     }
     const parsed = JSON.parse(decoded);
+    const passphrase = parsed.passphrase || undefined;
     return {
       id: parsed.id || undefined,
       host: parsed.host || 'localhost',
       port: Number(parsed.port) || 22,
       username: parsed.username || 'root',
-      password: parsed.password || '',
-      privateKey: parsed.privateKey || undefined,
-      passphrase: parsed.passphrase || undefined,
+      password: parsed.password && parsed.password.length > 0 ? parsed.password : undefined,
+      privateKey: normalizePrivateKey(parsed.privateKey, passphrase),
+      passphrase,
       logintype: parsed.logintype ?? 0,
     };
   } catch (err: any) {
+    if (err && typeof err.message === 'string' && err.message.includes('private key')) {
+      throw err;
+    }
     throw new Error(`Invalid sshInfo parameter format: ${err.message}`);
   }
+}
+
+// ssh2's key parser does not support PKCS#8 ("-----BEGIN PRIVATE KEY-----" /
+// "-----BEGIN ENCRYPTED PRIVATE KEY-----"), which is the default output of
+// openssl and `ssh-keygen -m PKCS8`. Node's crypto understands PKCS#8, so we
+// re-encode those keys into the traditional PEM/SEC1 formats ssh2 accepts.
+export function normalizePrivateKey(privateKey: string | undefined, passphrase?: string): string | undefined {
+  if (typeof privateKey !== 'string' || privateKey.trim().length === 0) return undefined;
+  const keyText = privateKey.trim();
+
+  // Formats ssh2 parses natively: OpenSSH and traditional PEM.
+  if (/-----BEGIN OPENSSH PRIVATE KEY-----/.test(keyText)) return privateKey;
+  if (/-----BEGIN (RSA|DSA|EC) PRIVATE KEY-----/.test(keyText)) return privateKey;
+
+  // PKCS#8 (plain or encrypted): convert to a format ssh2 accepts.
+  if (/-----BEGIN (ENCRYPTED )?PRIVATE KEY-----/.test(keyText)) {
+    try {
+      const keyObj = crypto.createPrivateKey({
+        key: keyText,
+        passphrase: passphrase || undefined,
+      });
+      const type = keyObj.asymmetricKeyType || '';
+      if (!['rsa', 'rsa-pss', 'dsa', 'ec'].includes(type)) {
+        // e.g. ed25519/ed448: Node can only re-export as PKCS#8, which ssh2
+        // still rejects. Surface a clear, actionable error instead of letting
+        // ssh2 fail later with a cryptic parse error.
+        throw new Error(
+          `Private key type "${type}" in PKCS#8 format is not supported by ssh2. ` +
+          'Please export the key in OpenSSH format instead (ssh-keygen -o).'
+        );
+      }
+      const exportType = type === 'ec' ? 'sec1' : 'pkcs1';
+      return keyObj.export({ type: exportType as 'pkcs1' | 'sec1', format: 'pem' }).toString();
+    } catch (err: any) {
+      throw new Error(`Cannot parse PKCS#8 private key: ${err.message}`);
+    }
+  }
+
+  return privateKey;
 }
 
 export function formatByteSize(bytes: number): string {

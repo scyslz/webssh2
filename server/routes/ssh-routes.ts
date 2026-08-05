@@ -17,7 +17,30 @@ import { connectSSH } from './shared.ts';
 export function registerSshRoutes(app: express.Express, sessionManager: SessionManager) {
   app.post('/check', (req, res) => {
     try {
-      const config = parseSSHInfo(JSON.stringify(req.body?.sshInfo || req.body || {}));
+      const body = req.body?.sshInfo || req.body || {};
+      // Saved hosts returned by /ssh/list have credentials stripped. When the
+      // frontend tests a saved connection it still carries the credential id, so
+      // resolve the stored credential here (merging any freshly typed fields) or
+      // the test would always fail with "All configured authentication methods failed".
+      const credentialId = body.id || body.credentialId;
+      const saved = credentialId ? readSavedHosts().find((host) => host.id === credentialId) : undefined;
+      const merged = {
+        ...(saved || {}),
+        ...body,
+        password:
+          typeof body.password === 'string' && body.password.length > 0
+            ? body.password
+            : saved?.password || '',
+        privateKey:
+          typeof body.privateKey === 'string' && body.privateKey.trim().length > 0
+            ? body.privateKey
+            : saved?.privateKey,
+        passphrase:
+          typeof body.passphrase === 'string' && body.passphrase.length > 0
+            ? body.passphrase
+            : saved?.passphrase,
+      };
+      const config = parseSSHInfo(JSON.stringify(merged));
       const timeoutMs = 10000;
       let handled = false;
       const timer = setTimeout(() => {
