@@ -1389,14 +1389,16 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
               )}
             </div>
 
-            <button
-              onClick={cancelReconnectCycle}
-              className={`px-3.5 py-1 rounded-lg text-xs font-medium transition cursor-pointer ${
-                isLight ? 'bg-slate-200 text-slate-600 hover:bg-slate-300' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
-              }`}
-            >
-              Cancel
-            </button>
+            <div className="flex justify-end">
+              <button
+                onClick={cancelReconnectCycle}
+                className={`px-3.5 py-1 rounded-lg text-xs font-medium transition cursor-pointer ${
+                  isLight ? 'bg-slate-200 text-slate-600 hover:bg-slate-300' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                }`}
+              >
+                Cancel
+              </button>
+            </div>
           </div>
         </div>
       )}
