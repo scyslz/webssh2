@@ -63,6 +63,13 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const suppressAutoRecoverRef = useRef<boolean>(false);
   const reconnectModeOverrideRef = useRef<'restore' | 'force' | null>(null);
   const deferredPayloadsRef = useRef<Array<string | ArrayBuffer>>([]);
+  const localEchoBufferRef = useRef<number[]>([]);
+  const pendingTriggerPayloadRef = useRef<string | ArrayBuffer | null>(null);
+  const isReconnectCycleRef = useRef<boolean>(false);
+  const reconnectCycleActiveRef = useRef<boolean>(false);
+  const retryCountRef = useRef<number>(0);
+  const retriesExhaustedRef = useRef<boolean>(false);
+  const countdownTimerRef = useRef<number | null>(null);
   const silentReconnectRef = useRef<boolean>(false);
   const heartbeatTimerRef = useRef<number | null>(null);
   const heartbeatTimeoutRef = useRef<number | null>(null);
@@ -72,6 +79,9 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const suppressTerminalInputRef = useRef<boolean>(false);
   const isCoarsePointerRef = useRef<boolean>(false);
   const WS_META_PREFIX = '__WEBSSH_META__:';
+  const RECONNECT_COUNTDOWN_SECONDS = 5;
+  const MAX_RECONNECT_ATTEMPTS = 3;
+  const RECONNECT_TRIGGER_RE = /[\r\n\x03]/;
 
   const [connected, setConnected] = useState<boolean>(false);
   const [sharedSession, setSharedSession] = useState<boolean>(false);
@@ -90,6 +100,10 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const offlineHoldEnabledRef = useRef<boolean>(offlineHoldEnabled);
   useEffect(() => { offlineHoldEnabledRef.current = offlineHoldEnabled; }, [offlineHoldEnabled]);
   const [offlineSuspended, setOfflineSuspended] = useState<boolean>(false);
+  const [reconnectSending, setReconnectSending] = useState<boolean>(false);
+  const [countdownLeft, setCountdownLeft] = useState<number | null>(null);
+  const [retriesExhausted, setRetriesExhausted] = useState<boolean>(false);
+  const [offlineBufferCount, setOfflineBufferCount] = useState<number>(0);
   const [debugEnabled, setDebugEnabled] = useState<boolean>(() => {
     try {
       return globalGet('webssh_terminal_debug') === '1';
@@ -231,10 +245,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
 
   const enqueueDeferredPayload = (payload: string | ArrayBuffer) => {
     deferredPayloadsRef.current.push(payload);
-  };
-
-  const deferredHasEnter = (): boolean => {
-    return deferredPayloadsRef.current.some((p) => typeof p === 'string' && (p.includes('\r') || p.includes('\n')));
+    setOfflineBufferCount(deferredPayloadsRef.current.length);
   };
 
   const flushDeferredPayloads = (ws: WebSocket) => {
@@ -243,12 +254,114 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       ws.send(payload);
     }
     deferredPayloadsRef.current = [];
+    setOfflineBufferCount(0);
   };
 
-  const tryReconnectOnEnter = () => {
-    if (!deferredHasEnter()) return;
+  const hasReconnectTrigger = (data: string): boolean => {
+    return RECONNECT_TRIGGER_RE.test(data);
+  };
+
+  const clearCountdownTimer = () => {
+    if (countdownTimerRef.current !== null) {
+      window.clearInterval(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+    }
+  };
+
+  const setCycleActive = (active: boolean) => {
+    reconnectCycleActiveRef.current = active;
+    setReconnectSending(active);
+  };
+
+  const setCountdown = (left: number | null) => {
+    setCountdownLeft(left);
+  };
+
+  const setExhausted = (value: boolean) => {
+    retriesExhaustedRef.current = value;
+    setRetriesExhausted(value);
+  };
+
+  const performReconnect = () => {
+    isReconnectCycleRef.current = true;
     reconnectModeOverrideRef.current = closeReasonRef.current === 'session_busy' || closeReasonRef.current === 'taken_over' ? 'force' : 'restore';
-    if (!connecting) connectWebSocket(reconnectModeOverrideRef.current || undefined, true);
+    connectWebSocket(reconnectModeOverrideRef.current || undefined, true);
+  };
+
+  const beginReconnectCycle = (triggerPayload: string | ArrayBuffer) => {
+    pendingTriggerPayloadRef.current = triggerPayload;
+    if (retriesExhaustedRef.current) return;
+    if (reconnectCycleActiveRef.current) return;
+    setCycleActive(true);
+    let left = RECONNECT_COUNTDOWN_SECONDS;
+    setCountdown(left);
+    clearCountdownTimer();
+    countdownTimerRef.current = window.setInterval(() => {
+      left -= 1;
+      if (left <= 0) {
+        clearCountdownTimer();
+        setCountdown(null);
+        performReconnect();
+        return;
+      }
+      setCountdown(left);
+    }, 1000);
+  };
+
+  const failReconnectCycle = () => {
+    if (!isReconnectCycleRef.current) return;
+    isReconnectCycleRef.current = false;
+    pendingTriggerPayloadRef.current = null;
+    clearCountdownTimer();
+    setCountdown(null);
+    setOfflineSuspended(true);
+    setErrorMsg(null);
+    retryCountRef.current += 1;
+    if (retryCountRef.current >= MAX_RECONNECT_ATTEMPTS) {
+      setExhausted(true);
+      setCycleActive(true);
+    } else {
+      setCycleActive(false);
+      window.setTimeout(() => terminalRef.current?.focus(), 50);
+    }
+  };
+
+  const completeReconnectCycle = () => {
+    isReconnectCycleRef.current = false;
+    pendingTriggerPayloadRef.current = null;
+    clearCountdownTimer();
+    setCountdown(null);
+    setCycleActive(false);
+    retryCountRef.current = 0;
+    setExhausted(false);
+  };
+
+  const cancelReconnectCycle = () => {
+    isReconnectCycleRef.current = false;
+    pendingTriggerPayloadRef.current = null;
+    clearCountdownTimer();
+    setCountdown(null);
+    setCycleActive(false);
+    deferredPayloadsRef.current = [];
+    localEchoBufferRef.current = [];
+    setOfflineBufferCount(0);
+    retryCountRef.current = 0;
+    setExhausted(false);
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.CONNECTING) {
+      ws.close();
+    }
+    window.setTimeout(() => terminalRef.current?.focus(), 50);
+  };
+
+  const sendOfflineInput = (payload: string | ArrayBuffer, echo: boolean) => {
+    if (hasReconnectTrigger(payload as string)) {
+      if (echo) localEcho(payload as string);
+      beginReconnectCycle(payload);
+      return;
+    }
+    enqueueDeferredPayload(payload);
+    if (echo) localEcho(payload as string);
   };
 
   const sendResize = () => {
@@ -270,8 +383,60 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     }
   };
 
+  const cellWidth = (ch: string): number => {
+    const c = ch.codePointAt(0);
+    if (c === undefined) return 1;
+    if (
+      (c >= 0x1100 && c <= 0x115f) ||
+      (c >= 0x2e80 && c <= 0xa4cf) ||
+      (c >= 0xac00 && c <= 0xd7a3) ||
+      (c >= 0xf900 && c <= 0xfaff) ||
+      (c >= 0xfe30 && c <= 0xfe4f) ||
+      (c >= 0xff00 && c <= 0xff60) ||
+      (c >= 0xffe0 && c <= 0xffe6) ||
+      (c >= 0x20000 && c <= 0x3fffd)
+    ) {
+      return 2;
+    }
+    return 1;
+  };
+
   const localEcho = (data: string) => {
-    terminalRef.current?.write(data);
+    const term = terminalRef.current;
+    if (!term) return;
+    let i = 0;
+    while (i < data.length) {
+      const ch = data[i];
+      const code = ch.codePointAt(0)!;
+      if (ch === '\x1b') {
+        // Escape sequence (arrow keys, etc.): pass through raw, do not track.
+        term.write(data.slice(i));
+        break;
+      }
+      if (ch === '\r' || ch === '\n') {
+        term.write(ch);
+        localEchoBufferRef.current = [];
+        i += 1;
+        continue;
+      }
+      if (ch === '\x7f' || ch === '\x08') {
+        const buf = localEchoBufferRef.current;
+        if (buf.length > 0) {
+          const cells = buf.pop()!;
+          term.write(`\x08${' '.repeat(cells)}\x08`);
+        }
+        i += 1;
+        continue;
+      }
+      if (code >= 0x20) {
+        localEchoBufferRef.current.push(cellWidth(ch));
+        term.write(ch);
+        i += ch.length;
+        continue;
+      }
+      term.write(ch);
+      i += 1;
+    }
   };
 
   const sendRawToTerminal = (data: string, focusTerminal = true) => {
@@ -282,9 +447,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       return;
     }
     if (offlineHoldEnabledRef.current) {
-      enqueueDeferredPayload(data);
-      localEcho(data);
-      tryReconnectOnEnter();
+      sendOfflineInput(data, true);
       if (focusTerminal) terminalRef.current?.focus();
     }
   };
@@ -464,6 +627,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     pushDebugEvent(`connect start attempt=${attemptId}`);
     suppressAutoRecoverRef.current = false;
     closeReasonRef.current = '';
+    clearCountdownTimer();
+    setCountdown(null);
 
     setConnecting(true);
     setConnected(false);
@@ -629,6 +794,10 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         pushDebugEvent(`session create ok session=${preparedSessionId}`);
       } catch (err: any) {
         pushDebugEvent(`session create failed error=${err.message || 'unknown'}`);
+        if (isReconnectCycleRef.current) {
+          failReconnectCycle();
+          return;
+        }
         setConnecting(false);
         setErrorMsg(err.message || 'Failed to create SSH session');
         onConnectionChange?.(false);
@@ -658,6 +827,16 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       fitAddon?.fit();
       sendHeartbeatPing(ws);
       flushDeferredPayloads(ws);
+      if (pendingTriggerPayloadRef.current !== null) {
+        const trigger = pendingTriggerPayloadRef.current;
+        pendingTriggerPayloadRef.current = null;
+        try {
+          ws.send(trigger);
+        } catch {
+          // ignore
+        }
+      }
+      completeReconnectCycle();
       heartbeatTimerRef.current = window.setInterval(() => {
         sendHeartbeatPing(ws);
       }, 10000);
@@ -781,6 +960,16 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       if (!isCurrentConnection()) return;
       pushDebugEvent(`ws error attempt=${attemptId}`);
       closeReasonRef.current = 'websocket_error';
+      if (isReconnectCycleRef.current) {
+        // onclose always follows onerror per spec; guard in case it does not fire.
+        window.setTimeout(() => {
+          if (connectionAttemptRef.current === attemptId && isReconnectCycleRef.current) {
+            failReconnectCycle();
+          }
+        }, 3000);
+        return;
+      }
+      setReconnectSending(false);
       if (offlineHoldEnabledRef.current) {
         setConnected(false);
         setClientLatencyMs(null);
@@ -799,6 +988,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     ws.onclose = (event) => {
       if (!isCurrentConnection()) return;
       pushDebugEvent(`ws close attempt=${attemptId} code=${event.code} reason=${event.reason || '(none)'} clean=${event.wasClean}`);
+      const wasReconnectCycle = isReconnectCycleRef.current;
       const closeDetails = `${event.reason || ''}`.toLowerCase();
       const isServerFailure =
         event.code === 1011 ||
@@ -824,6 +1014,13 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       setClientLatencyMs(null);
       setSshLatencyMs(null);
       onConnectionChange?.(false);
+
+      if (wasReconnectCycle) {
+        failReconnectCycle();
+        return;
+      }
+
+      setReconnectSending(false);
 
       if (offlineHoldEnabledRef.current) {
         if (closeReasonRef.current === 'ssh_connect_error' || closeReasonRef.current === 'session_busy' || closeReasonRef.current === 'taken_over' || closeReasonRef.current === 'ssh_shell_error') {
@@ -854,9 +1051,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         return;
       }
       if (offlineHoldEnabledRef.current) {
-        enqueueDeferredPayload(finalData);
-        localEcho(finalData);
-        tryReconnectOnEnter();
+        sendOfflineInput(finalData, true);
       }
     });
 
@@ -872,8 +1067,12 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         return;
       }
       if (offlineHoldEnabledRef.current) {
-        enqueueDeferredPayload(bytes.buffer);
-        tryReconnectOnEnter();
+        const hasTrigger = bytes.some((b) => b === 0x0d || b === 0x0a || b === 0x03);
+        if (hasTrigger) {
+          beginReconnectCycle(bytes.buffer);
+        } else {
+          enqueueDeferredPayload(bytes.buffer);
+        }
       }
     });
 
@@ -1135,6 +1334,85 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
           onShiftToggle={() => setShiftActive(!shiftActive)}
           sendKeyToTerminal={sendKeyToTerminal}
         />
+      )}
+
+      {/* Discard offline buffer (idle offline state) */}
+      {offlineSuspended && !reconnectSending && offlineBufferCount > 0 && (
+        <button
+          onClick={cancelReconnectCycle}
+          className="absolute bottom-3 right-3 z-30 px-3 py-1.5 rounded-full text-xs font-semibold shadow-lg border transition cursor-pointer bg-rose-600 text-white hover:bg-rose-500"
+        >
+          Discard offline input
+        </button>
+      )}
+
+      {/* Reconnect Mask (offline mode: control key triggered retry with countdown, closeable) */}
+      {reconnectSending && (
+        <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/60 backdrop-blur-[2px]">
+          <div
+            className={`flex flex-col items-center gap-2.5 px-6 py-4 rounded-xl border shadow-2xl ${
+              isLight ? 'bg-white/95 border-slate-200' : 'bg-slate-900/95 border-slate-700'
+            }`}
+          >
+            {retriesExhausted ? (
+              <>
+                <div className={`text-xs font-mono text-center ${isLight ? 'text-slate-700' : 'text-slate-200'}`}>
+                  Reconnect attempts exhausted.
+                  <br />
+                  Offline buffer is still editable; close to discard it.
+                </div>
+                <button
+                  onClick={cancelReconnectCycle}
+                  className={`px-3 py-1 rounded-lg text-xs font-semibold transition cursor-pointer ${
+                    isLight
+                      ? 'bg-slate-200 text-slate-600 hover:bg-slate-300'
+                      : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                  }`}
+                >
+                  Close
+                </button>
+              </>
+            ) : countdownLeft !== null && countdownLeft > 0 ? (
+              <>
+                <div className={`text-sm font-mono font-bold ${isLight ? 'text-slate-800' : 'text-slate-100'}`}>
+                  Reconnecting in {countdownLeft}s...
+                </div>
+                <div className={`text-xs font-mono text-center ${isLight ? 'text-slate-700' : 'text-slate-200'}`}>
+                  Command will be sent automatically
+                </div>
+                <button
+                  onClick={cancelReconnectCycle}
+                  className={`px-3 py-1 rounded-lg text-xs font-semibold transition cursor-pointer ${
+                    isLight
+                      ? 'bg-slate-200 text-slate-600 hover:bg-slate-300'
+                      : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                  }`}
+                >
+                  Close
+                </button>
+              </>
+            ) : (
+              <>
+                <div className="w-6 h-6 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin" />
+                <div className={`text-xs font-mono text-center ${isLight ? 'text-slate-700' : 'text-slate-200'}`}>
+                  Reconnecting...
+                  <br />
+                  Command will be sent automatically
+                </div>
+                <button
+                  onClick={cancelReconnectCycle}
+                  className={`px-3 py-1 rounded-lg text-xs font-semibold transition cursor-pointer ${
+                    isLight
+                      ? 'bg-slate-200 text-slate-600 hover:bg-slate-300'
+                      : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                  }`}
+                >
+                  Close
+                </button>
+              </>
+            )}
+          </div>
+        </div>
       )}
 
       {/* Terminal Text Selection Modal (Mobile Friendly) */}
