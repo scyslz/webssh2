@@ -103,7 +103,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const [reconnectSending, setReconnectSending] = useState<boolean>(false);
   const [countdownLeft, setCountdownLeft] = useState<number | null>(null);
   const [retriesExhausted, setRetriesExhausted] = useState<boolean>(false);
-  const [offlineBufferCount, setOfflineBufferCount] = useState<number>(0);
+  const [retryAttempt, setRetryAttempt] = useState<number>(1);
   const [debugEnabled, setDebugEnabled] = useState<boolean>(() => {
     try {
       return globalGet('webssh_terminal_debug') === '1';
@@ -245,7 +245,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
 
   const enqueueDeferredPayload = (payload: string | ArrayBuffer) => {
     deferredPayloadsRef.current.push(payload);
-    setOfflineBufferCount(deferredPayloadsRef.current.length);
   };
 
   const flushDeferredPayloads = (ws: WebSocket) => {
@@ -254,7 +253,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       ws.send(payload);
     }
     deferredPayloadsRef.current = [];
-    setOfflineBufferCount(0);
   };
 
   const hasReconnectTrigger = (data: string): boolean => {
@@ -288,14 +286,13 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     connectWebSocket(reconnectModeOverrideRef.current || undefined, true);
   };
 
-  const beginReconnectCycle = (triggerPayload: string | ArrayBuffer) => {
-    pendingTriggerPayloadRef.current = triggerPayload;
-    if (retriesExhaustedRef.current) return;
-    if (reconnectCycleActiveRef.current) return;
+  const startCountdown = () => {
+    const attempt = retryCountRef.current + 1;
+    setRetryAttempt(attempt);
     setCycleActive(true);
+    clearCountdownTimer();
     let left = RECONNECT_COUNTDOWN_SECONDS;
     setCountdown(left);
-    clearCountdownTimer();
     countdownTimerRef.current = window.setInterval(() => {
       left -= 1;
       if (left <= 0) {
@@ -308,21 +305,27 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     }, 1000);
   };
 
+  const beginReconnectCycle = (triggerPayload: string | ArrayBuffer) => {
+    pendingTriggerPayloadRef.current = triggerPayload;
+    if (retriesExhaustedRef.current) return;
+    if (reconnectCycleActiveRef.current) return;
+    startCountdown();
+  };
+
   const failReconnectCycle = () => {
     if (!isReconnectCycleRef.current) return;
     isReconnectCycleRef.current = false;
-    pendingTriggerPayloadRef.current = null;
     clearCountdownTimer();
     setCountdown(null);
     setOfflineSuspended(true);
     setErrorMsg(null);
     retryCountRef.current += 1;
     if (retryCountRef.current >= MAX_RECONNECT_ATTEMPTS) {
+      pendingTriggerPayloadRef.current = null;
       setExhausted(true);
       setCycleActive(true);
     } else {
-      setCycleActive(false);
-      window.setTimeout(() => terminalRef.current?.focus(), 50);
+      startCountdown();
     }
   };
 
@@ -342,9 +345,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     clearCountdownTimer();
     setCountdown(null);
     setCycleActive(false);
-    deferredPayloadsRef.current = [];
-    localEchoBufferRef.current = [];
-    setOfflineBufferCount(0);
     retryCountRef.current = 0;
     setExhausted(false);
     const ws = wsRef.current;
@@ -1336,17 +1336,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         />
       )}
 
-      {/* Discard offline buffer (idle offline state) */}
-      {offlineSuspended && !reconnectSending && offlineBufferCount > 0 && (
-        <button
-          onClick={cancelReconnectCycle}
-          className="absolute bottom-3 right-3 z-30 px-3 py-1.5 rounded-full text-xs font-semibold shadow-lg border transition cursor-pointer bg-rose-600 text-white hover:bg-rose-500"
-        >
-          Discard offline input
-        </button>
-      )}
-
-      {/* Reconnect Mask (offline mode: control key triggered retry with countdown, closeable) */}
+      {/* Reconnect Mask (offline mode: auto retry with countdown + attempt number, closeable) */}
       {reconnectSending && (
         <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/60 backdrop-blur-[2px]">
           <div
@@ -1357,9 +1347,9 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
             {retriesExhausted ? (
               <>
                 <div className={`text-xs font-mono text-center ${isLight ? 'text-slate-700' : 'text-slate-200'}`}>
-                  Reconnect attempts exhausted.
+                  Reconnect attempts exhausted ({MAX_RECONNECT_ATTEMPTS}/{MAX_RECONNECT_ATTEMPTS}).
                   <br />
-                  Offline buffer is still editable; close to discard it.
+                  Enter/Ctrl+C input was discarded; your offline input is still editable.
                 </div>
                 <button
                   onClick={cancelReconnectCycle}
@@ -1375,7 +1365,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
             ) : countdownLeft !== null && countdownLeft > 0 ? (
               <>
                 <div className={`text-sm font-mono font-bold ${isLight ? 'text-slate-800' : 'text-slate-100'}`}>
-                  Reconnecting in {countdownLeft}s...
+                  Reconnect attempt {retryAttempt} of {MAX_RECONNECT_ATTEMPTS} in {countdownLeft}s...
                 </div>
                 <div className={`text-xs font-mono text-center ${isLight ? 'text-slate-700' : 'text-slate-200'}`}>
                   Command will be sent automatically
@@ -1395,7 +1385,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
               <>
                 <div className="w-6 h-6 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin" />
                 <div className={`text-xs font-mono text-center ${isLight ? 'text-slate-700' : 'text-slate-200'}`}>
-                  Reconnecting...
+                  Reconnecting... (attempt {retryAttempt} of {MAX_RECONNECT_ATTEMPTS})
                   <br />
                   Command will be sent automatically
                 </div>
