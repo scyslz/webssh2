@@ -329,7 +329,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     isReconnectCycleRef.current = false;
     cycleSuppressOutputRef.current = false;
     pendingTriggerPayloadRef.current = null;
-    localEchoBufferRef.current = [];
     clearCountdownTimer();
     setCountdown(null);
     setCycleActive(false);
@@ -844,6 +843,10 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
             }
             if (isReconnectCycleRef.current) {
               cycleSuppressOutputRef.current = false;
+              if (localEchoBufferRef.current.length > 0) {
+                localEchoBufferRef.current = [];
+                terminalRef.current?.write('\x1b[K');
+              }
               flushDeferredPayloads(ws);
               if (pendingTriggerPayloadRef.current !== null) {
                 const trigger = pendingTriggerPayloadRef.current;
