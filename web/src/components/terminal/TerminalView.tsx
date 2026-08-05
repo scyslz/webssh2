@@ -329,6 +329,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     isReconnectCycleRef.current = false;
     cycleSuppressOutputRef.current = false;
     pendingTriggerPayloadRef.current = null;
+    localEchoBufferRef.current = [];
     clearCountdownTimer();
     setCountdown(null);
     setCycleActive(false);
@@ -410,8 +411,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         break;
       }
       if (ch === '\r' || ch === '\n') {
-        term.write(ch);
-        localEchoBufferRef.current = [];
+        // Offline trigger (Enter): do not echo the newline so the cursor
+        // doesn't wrap, and keep the buffer so backspace still works.
         i += 1;
         continue;
       }
@@ -1368,16 +1369,11 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
 
             <div className="flex flex-col items-center gap-2.5 py-2">
               {countdownLeft !== null && countdownLeft > 0 ? (
-                <>
-                  <div className={`text-3xl font-mono font-bold ${isLight ? 'text-slate-800' : 'text-slate-100'}`}>
-                    {countdownLeft}s
-                  </div>
-                  <div className={`text-xs font-mono text-center ${isLight ? 'text-slate-600' : 'text-slate-300'}`}>
-                    Reconnect in {countdownLeft}s...
-                    <br />
-                    Command will be sent automatically
-                  </div>
-                </>
+                <div className={`text-xs font-mono text-center ${isLight ? 'text-slate-600' : 'text-slate-300'}`}>
+                  Reconnecting in {countdownLeft}s...
+                  <br />
+                  Command will be sent automatically
+                </div>
               ) : (
                 <>
                   <div className="w-6 h-6 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin" />
@@ -1392,11 +1388,11 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
 
             <button
               onClick={cancelReconnectCycle}
-              className={`px-3.5 py-1.5 rounded-lg text-xs font-medium transition cursor-pointer ${
+              className={`px-3.5 py-1 rounded-lg text-xs font-medium transition cursor-pointer ${
                 isLight ? 'bg-slate-200 text-slate-600 hover:bg-slate-300' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
               }`}
             >
-              Cancel retry
+              Cancel
             </button>
           </div>
         </div>
