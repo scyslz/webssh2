@@ -56,8 +56,12 @@ export const SFTPView: React.FC<SFTPViewProps> = ({ sshInfo, sessionId, initialP
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
 
   const sftpRef = useRef<SftpWSClient | null>(null);
+  const closeTimerRef = useRef<number | null>(null);
+  const SFTP_CLOSE_DELAY_MS = 30000;
   const ensureSftp = async () => {
     if (!sessionId) throw new Error('No sessionId');
+    // 切回可见时取消延迟关闭
+    if (closeTimerRef.current !== null) { window.clearTimeout(closeTimerRef.current); closeTimerRef.current = null; }
     if (sftpRef.current) {
       try { await sftpRef.current.connect(); return sftpRef.current; } catch {}
     }
@@ -67,11 +71,23 @@ export const SFTPView: React.FC<SFTPViewProps> = ({ sshInfo, sessionId, initialP
     return c;
   };
   useEffect(() => {
-    // sessionId 变化重建，组件卸载主动关闭 WS
-    return () => { sftpRef.current?.close(); sftpRef.current = null; };
+    // sessionId 变化或卸载立即关闭，清理延迟定时器
+    return () => {
+      if (closeTimerRef.current !== null) { window.clearTimeout(closeTimerRef.current); closeTimerRef.current = null; }
+      sftpRef.current?.close(); sftpRef.current = null;
+    };
   }, [sessionId]);
   useEffect(() => {
-    if (!isVisible) { sftpRef.current?.close(); sftpRef.current = null; }
+    if (!isVisible) {
+      // 延迟关闭，避免频繁切换时重建
+      if (closeTimerRef.current !== null) window.clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = window.setTimeout(() => {
+        sftpRef.current?.close(); sftpRef.current = null; closeTimerRef.current = null;
+      }, SFTP_CLOSE_DELAY_MS);
+    } else {
+      if (closeTimerRef.current !== null) { window.clearTimeout(closeTimerRef.current); closeTimerRef.current = null; }
+    }
+    return () => { if (closeTimerRef.current !== null) { window.clearTimeout(closeTimerRef.current); closeTimerRef.current = null; } };
   }, [isVisible]);
 
   const fetchFileList = async (dirPath: string) => {
