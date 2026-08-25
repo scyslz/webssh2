@@ -773,7 +773,7 @@ export default function App() {
                   } h-full ${showTerminal ? 'block' : 'hidden'}`}
                 >
                    <TerminalView
-                      key={`${tab.id}:${tab.sessionId || 'no-session'}:${tab.reconnectToken || 0}`}
+                       key={`${tab.id}:${tab.reconnectToken || 0}`}
                       tabId={tab.id}
                       sshInfo={tab.sshInfo}
                       config={config}

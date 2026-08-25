@@ -614,7 +614,9 @@ export function createSessionManager(): SessionManager {
       const timeoutMins = parseInt(url.searchParams.get('timeout') || '120', 10);
       const keepAliveMs = (timeoutMins > 0 ? timeoutMins : 120) * 60 * 1000;
 
-      const existingSession = sessionId ? sshSessions.get(sessionId) : undefined;
+      let existingSession: SSHSession | undefined = sessionId ? sshSessions.get(sessionId) : undefined;
+      // ws 绑定后新创建的会话需要更新引用，否则 message/close 无法关联
+      const bindSession = (s: SSHSession) => { existingSession = s; };
       sshLog('websocket connected', {
         sessionId: sessionId || '(none)',
         clientId: clientId || '(none)',
@@ -638,6 +640,7 @@ export function createSessionManager(): SessionManager {
           sshLog('session attach rejected', { sessionId: session.id, reason: 'busy-after-create' });
           return;
         }
+        bindSession(session);
         sshLog('session attached', {
           sessionId: session.id,
           clientId: clientId || '(none)',
@@ -697,9 +700,19 @@ export function createSessionManager(): SessionManager {
       }
 
       ws.on('message', (msg: RawData, isBinary: boolean) => {
-        if (!existingSession) return;
         const payload = normalizeIncomingData(msg, isBinary);
         const raw = typeof payload === 'string' ? payload : decodeIncomingMessage(payload);
+        // ping 需在未绑定会话前也可响应，避免心跳超时
+        if (!isBinary && raw.startsWith('{') && raw.endsWith('}')) {
+          try {
+            const parsed = JSON.parse(raw);
+            if (parsed.type === 'ping') {
+              sendMetaMessage(ws, { type: 'pong', ts: parsed.ts ?? Date.now(), serverTs: Date.now() });
+              return;
+            }
+          } catch {}
+        }
+        if (!existingSession) return;
         if (!isBinary && raw.startsWith('{') && raw.endsWith('}')) {
           try {
             const parsed = JSON.parse(raw);
@@ -717,10 +730,6 @@ export function createSessionManager(): SessionManager {
               existingSession.shared = parsed.shared;
               sshLog('session sharing changed', { sessionId: existingSession.id, shared: existingSession.shared, clientId });
               broadcastSessionSharedState(existingSession);
-              return;
-            }
-            if (parsed.type === 'ping') {
-              sendMetaMessage(ws, { type: 'pong', ts: parsed.ts ?? Date.now(), serverTs: Date.now() });
               return;
             }
             if (parsed.type === 'rename_session' && typeof parsed.title === 'string') {

@@ -74,12 +74,20 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const silentReconnectRef = useRef<boolean>(false);
   const sysUnsubscribeRef = useRef<() => void>(null);
   const lastHeartbeatPingAtRef = useRef<number | null>(null);
+  const heartbeatTimeoutRef = useRef<number | null>(null);
+  const heartbeatIntervalRef = useRef<number | null>(null);
   const touchScrollStateRef = useRef<{ startY: number; lastY: number; accumulated: number } | null>(null);
   const momentumRef = useRef<{ velocity: number; animationFrame: number | null } | null>(null);
   const suppressTerminalInputRef = useRef<boolean>(false);
   const isCoarsePointerRef = useRef<boolean>(false);
   const lastTouchTapRef = useRef<{ time: number; x: number; y: number } | null>(null);
   const suppressNextDblClickRef = useRef<boolean>(false);
+  const sshInfoRef = useRef<SSHInfo>(sshInfo);
+  const configRef = useRef<WebSSHConfig>(config);
+  const sessionIdRef = useRef<string | undefined>(sessionId);
+  useEffect(() => { sshInfoRef.current = sshInfo; }, [sshInfo]);
+  useEffect(() => { configRef.current = config; }, [config]);
+  useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
   const WS_META_PREFIX = '__WEBSSH_META__:';
   const RECONNECT_COUNTDOWN_SECONDS = 5;
   const MAX_RECONNECT_ATTEMPTS = 3;
@@ -528,6 +536,14 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     }
     if (sysUnsubscribeRef.current) sysUnsubscribeRef.current();
     lastHeartbeatPingAtRef.current = null;
+    if (heartbeatTimeoutRef.current !== null) {
+      window.clearTimeout(heartbeatTimeoutRef.current);
+      heartbeatTimeoutRef.current = null;
+    }
+    if (heartbeatIntervalRef.current !== null) {
+      window.clearInterval(heartbeatIntervalRef.current);
+      heartbeatIntervalRef.current = null;
+    }
   };
 
   const handleOpenSelectionModal = () => {
@@ -759,18 +775,21 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       return respondToModeQuery(mode, false);
     });
 
+    const curSshInfo = sshInfoRef.current;
+    const curConfig = configRef.current;
+    const curSessionId = sessionIdRef.current;
     if (!silentReconnect) {
-      term.writeln(`\r\n\x1b[32m[WebSSH]\x1b[0m Connecting to \x1b[36m${sshInfo.username}@${sshInfo.host}:${sshInfo.port}\x1b[0m...`);
+      term.writeln(`\r\n\x1b[32m[WebSSH]\x1b[0m Connecting to \x1b[36m${curSshInfo.username}@${curSshInfo.host}:${curSshInfo.port}\x1b[0m...`);
     }
 
     // Determine WebSocket protocol (ws or wss)
     const cols = term.cols || 120;
     const rows = term.rows || 30;
     const clientId = tabId;
-    const timeout = config.timeout || 120;
+    const timeout = curConfig.timeout || 120;
     const effectiveReconnectMode = modeOverride || reconnectModeOverrideRef.current || reconnectMode;
     reconnectModeOverrideRef.current = null;
-    let preparedSessionId = sessionId || '';
+    let preparedSessionId = curSessionId || '';
     // Build WS URL with inline session creation params (no HTTP POST needed)
     const params = new URLSearchParams();
     params.set('clientId', clientId);
@@ -778,15 +797,15 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     params.set('rows', String(rows));
     params.set('timeout', String(timeout));
     params.set('forceAttach', effectiveReconnectMode === 'force' ? '1' : '0');
-    if (sessionId) {
-      params.set('sessionId', sessionId);
+    if (curSessionId) {
+      params.set('sessionId', curSessionId);
     } else {
-      if (sshInfo.id) {
-        params.set('credentialId', sshInfo.id);
+      if (curSshInfo.id) {
+        params.set('credentialId', curSshInfo.id);
       } else {
-        params.set('sshInfo', JSON.stringify(sshInfo));
+        params.set('sshInfo', JSON.stringify(curSshInfo));
       }
-      params.set('title', sshInfo.name || `${sshInfo.username}@${sshInfo.host}`);
+      params.set('title', curSshInfo.name || `${curSshInfo.username}@${curSshInfo.host}`);
     }
     const wsConnectUrl = wsUrl('/term', params.toString());
     pushDebugEvent(`ws url ${wsConnectUrl}`);
@@ -823,6 +842,13 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
               term.writeln('\x1b[32m[WebSSH]\x1b[0m Connection established.\r\n');
             }
             fitAddon?.fit();
+            // 启动 /term 心跳，避免反向代理/空闲超时断开
+            if (heartbeatIntervalRef.current !== null) {
+              window.clearInterval(heartbeatIntervalRef.current);
+            }
+            heartbeatIntervalRef.current = window.setInterval(() => {
+              sendHeartbeatPing(ws);
+            }, 25000);
             // 终端重连成功时，如果 /sys 处于断开状态，也触发重连
             if (isReconnectCycleRef.current && sysClient.getConnectionState() !== 'open') {
               sysClient.reconnect();
@@ -855,6 +881,10 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
             return;
           }
           if (meta.type === 'pong') {
+            if (heartbeatTimeoutRef.current !== null) {
+              window.clearTimeout(heartbeatTimeoutRef.current);
+              heartbeatTimeoutRef.current = null;
+            }
             return;
           }
           if (meta.type === 'session_busy') {
@@ -990,6 +1020,14 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       }
       if (sysUnsubscribeRef.current) sysUnsubscribeRef.current();
       lastHeartbeatPingAtRef.current = null;
+      if (heartbeatTimeoutRef.current !== null) {
+        window.clearTimeout(heartbeatTimeoutRef.current);
+        heartbeatTimeoutRef.current = null;
+      }
+      if (heartbeatIntervalRef.current !== null) {
+        window.clearInterval(heartbeatIntervalRef.current);
+        heartbeatIntervalRef.current = null;
+      }
       const remaining = decoderRef.current?.decode();
       if (remaining && !wasSuppressingOutput) {
         term.write(remaining);
@@ -1203,7 +1241,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     return () => {
       cleanupConnection();
     };
-  }, [sshInfo, sessionId, reconnectMode, config.timeout, initialError]);
+    // 仅在关键重连参数变化时重建，sshInfo/config 通过 ref 读取避免对象引用抖动导致双 /term
+  }, [reconnectMode, initialError]);
 
   // 延迟显示：始终同步更新两个值，保证同时显示/不显示
   useEffect(() => {
