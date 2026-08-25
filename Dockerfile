@@ -16,7 +16,8 @@ ENV NODE_ENV=production
 ENV PORT=3000
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && \
+COPY --from=builder /app/node_modules ./node_modules
+RUN npm prune --omit=dev && \
     npm cache clean --force && \
     rm -rf /usr/local/lib/node_modules/npm /usr/local/share/man /root/.npm /tmp/*
 
