@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { SSHInfo, FileItem } from '../types';
 import { apiFetch, apiUrl } from '../api';
+import { SftpWSClient } from '../sftpClient';
 import {
   Folder,
   File,
@@ -29,9 +30,10 @@ interface SFTPViewProps {
   initialPath?: string;
   onPathChange?: (path: string) => void;
   theme?: string;
+  isVisible?: boolean;
 }
 
-export const SFTPView: React.FC<SFTPViewProps> = ({ sshInfo, sessionId, initialPath, onPathChange, theme }) => {
+export const SFTPView: React.FC<SFTPViewProps> = ({ sshInfo, sessionId, initialPath, onPathChange, theme, isVisible = true }) => {
   const isLight = theme === 'light';
   const defaultHome = sshInfo.username && sshInfo.username !== 'root' ? `/home/${sshInfo.username}` : '/root';
   const [currentPath, setCurrentPath] = useState<string>(initialPath || defaultHome);
@@ -53,23 +55,60 @@ export const SFTPView: React.FC<SFTPViewProps> = ({ sshInfo, sessionId, initialP
   const [uploading, setUploading] = useState<boolean>(false);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
 
+  const sftpRef = useRef<SftpWSClient | null>(null);
+  const ensureSftp = async () => {
+    if (!sessionId) throw new Error('No sessionId');
+    if (sftpRef.current) {
+      try { await sftpRef.current.connect(); return sftpRef.current; } catch {}
+    }
+    const c = new SftpWSClient(sessionId);
+    await c.connect();
+    sftpRef.current = c;
+    return c;
+  };
+  useEffect(() => {
+    // sessionId 变化重建，组件卸载主动关闭 WS
+    return () => { sftpRef.current?.close(); sftpRef.current = null; };
+  }, [sessionId]);
+  useEffect(() => {
+    if (!isVisible) { sftpRef.current?.close(); sftpRef.current = null; }
+  }, [isVisible]);
+
   const fetchFileList = async (dirPath: string) => {
     setLoading(true);
     setError(null);
     try {
-      const res = await apiFetch(apiUrl(`/file/list?sessionId=${encodeURIComponent(sessionId || '')}&path=${encodeURIComponent(dirPath)}`));
-      const json = await res.json();
-
-      if (json.msg === 'success' && json.data) {
-        setCurrentPath(json.data.path);
-        setPathInput(json.data.path);
-        setFileList(json.data.list || []);
-        onPathChange?.(json.data.path);
+      if (sessionId) {
+        const c = await ensureSftp();
+        const data = await c.request('list', { path: dirPath });
+        setCurrentPath(data.path);
+        setPathInput(data.path);
+        setFileList(data.list || []);
+        onPathChange?.(data.path);
       } else {
-        setError(json.msg || 'Failed to fetch directory contents');
+        const res = await apiFetch(apiUrl(`/file/list?sessionId=&path=${encodeURIComponent(dirPath)}`));
+        const json = await res.json();
+        if (json.msg === 'success' && json.data) {
+          setCurrentPath(json.data.path);
+          setPathInput(json.data.path);
+          setFileList(json.data.list || []);
+          onPathChange?.(json.data.path);
+        } else setError(json.msg || 'Failed');
       }
     } catch (err: any) {
       setError(err.message || 'Error connecting to SFTP server');
+      // 失败回退 HTTP
+      try {
+        const res = await apiFetch(apiUrl(`/file/list?sessionId=${encodeURIComponent(sessionId || '')}&path=${encodeURIComponent(dirPath)}`));
+        const json = await res.json();
+        if (json.msg === 'success' && json.data) {
+          setCurrentPath(json.data.path);
+          setPathInput(json.data.path);
+          setFileList(json.data.list || []);
+          onPathChange?.(json.data.path);
+          setError(null);
+        }
+      } catch {}
     } finally {
       setLoading(false);
     }
@@ -105,106 +144,73 @@ export const SFTPView: React.FC<SFTPViewProps> = ({ sshInfo, sessionId, initialP
 
   const handleDelete = async (item: FileItem) => {
     if (!window.confirm(`Are you sure you want to delete "${item.name}"?`)) return;
-
-    const itemPath = currentPath.endsWith('/')
-      ? `${currentPath}${item.name}`
-      : `${currentPath}/${item.name}`;
-
+    const itemPath = currentPath.endsWith('/') ? `${currentPath}${item.name}` : `${currentPath}/${item.name}`;
     try {
-      const res = await apiFetch(apiUrl('/file/delete'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId,
-          path: itemPath,
-          isDir: item.isDir,
-        }),
-      });
-      const json = await res.json();
-      if (json.msg === 'success') {
+      if (sessionId) {
+        const c = await ensureSftp();
+        await c.request('delete', { path: itemPath, isDir: item.isDir });
         fetchFileList(currentPath);
-      } else {
-        alert('Delete failed: ' + json.msg);
-      }
+      } else throw new Error('no session');
     } catch (err: any) {
-      alert('Delete error: ' + err.message);
+      try {
+        const res = await apiFetch(apiUrl('/file/delete'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId, path: itemPath, isDir: item.isDir }) });
+        const json = await res.json();
+        if (json.msg === 'success') fetchFileList(currentPath); else alert('Delete failed: ' + json.msg);
+      } catch (e2: any) { alert('Delete error: ' + (e2.message || err.message)); }
     }
   };
 
   const handleMkdir = async () => {
     if (!newDirName.trim()) return;
-    const dirPath = currentPath.endsWith('/')
-      ? `${currentPath}${newDirName.trim()}`
-      : `${currentPath}/${newDirName.trim()}`;
-
+    const dirPath = currentPath.endsWith('/') ? `${currentPath}${newDirName.trim()}` : `${currentPath}/${newDirName.trim()}`;
     try {
-      const res = await apiFetch(apiUrl('/file/mkdir'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId,
-          path: dirPath,
-        }),
-      });
-      const json = await res.json();
-      if (json.msg === 'success') {
-        setMkdirModalOpen(false);
-        setNewDirName('');
-        fetchFileList(currentPath);
-      } else {
-        alert('Create directory failed: ' + json.msg);
-      }
+      if (sessionId) {
+        const c = await ensureSftp();
+        await c.request('mkdir', { path: dirPath });
+        setMkdirModalOpen(false); setNewDirName(''); fetchFileList(currentPath);
+      } else throw new Error('no session');
     } catch (err: any) {
-      alert('Error creating directory: ' + err.message);
+      try {
+        const res = await apiFetch(apiUrl('/file/mkdir'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId, path: dirPath }) });
+        const json = await res.json();
+        if (json.msg === 'success') { setMkdirModalOpen(false); setNewDirName(''); fetchFileList(currentPath); } else alert('Create directory failed: ' + json.msg);
+      } catch (e2: any) { alert('Error creating directory: ' + (e2.message || err.message)); }
     }
   };
 
   const openEditor = async (fileName: string) => {
-    const filePath = currentPath.endsWith('/')
-      ? `${currentPath}${fileName}`
-      : `${currentPath}/${fileName}`;
-
-    setEditingFilePath(filePath);
-    setEditingContent('Loading file content...');
-    setEditorModalOpen(true);
-
+    const filePath = currentPath.endsWith('/') ? `${currentPath}${fileName}` : `${currentPath}/${fileName}`;
+    setEditingFilePath(filePath); setEditingContent('Loading file content...'); setEditorModalOpen(true);
     try {
-      const res = await apiFetch(apiUrl(`/file/read?sessionId=${encodeURIComponent(sessionId || '')}&path=${encodeURIComponent(filePath)}`));
-      const json = await res.json();
-      if (json.msg === 'success' && json.data) {
-        setEditingContent(json.data.content);
-      } else {
-        setEditingContent(`[Error loading file: ${json.msg}]`);
-      }
+      if (sessionId) {
+        const c = await ensureSftp();
+        const data = await c.request('read', { path: filePath });
+        setEditingContent(data.content);
+      } else throw new Error('no session');
     } catch (err: any) {
-      setEditingContent(`[Error: ${err.message}]`);
+      try {
+        const res = await apiFetch(apiUrl(`/file/read?sessionId=${encodeURIComponent(sessionId || '')}&path=${encodeURIComponent(filePath)}`));
+        const json = await res.json();
+        if (json.msg === 'success' && json.data) setEditingContent(json.data.content); else setEditingContent(`[Error loading file: ${json.msg}]`);
+      } catch (e2: any) { setEditingContent(`[Error: ${e2.message || err.message}]`); }
     }
   };
 
   const handleSaveFileContent = async () => {
     setSavingFile(true);
     try {
-      const res = await apiFetch(apiUrl('/file/write'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId,
-          path: editingFilePath,
-          content: editingContent,
-        }),
-      });
-      const json = await res.json();
-      if (json.msg === 'success') {
-        setEditorModalOpen(false);
-        fetchFileList(currentPath);
-      } else {
-        alert('Save failed: ' + json.msg);
-      }
+      if (sessionId) {
+        const c = await ensureSftp();
+        await c.request('write', { path: editingFilePath, content: editingContent });
+        setEditorModalOpen(false); fetchFileList(currentPath);
+      } else throw new Error('no session');
     } catch (err: any) {
-      alert('Error saving file: ' + err.message);
-    } finally {
-      setSavingFile(false);
-    }
+      try {
+        const res = await apiFetch(apiUrl('/file/write'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId, path: editingFilePath, content: editingContent }) });
+        const json = await res.json();
+        if (json.msg === 'success') { setEditorModalOpen(false); fetchFileList(currentPath); } else alert('Save failed: ' + json.msg);
+      } catch (e2: any) { alert('Error saving file: ' + (e2.message || err.message)); }
+    } finally { setSavingFile(false); }
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {

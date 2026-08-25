@@ -16,6 +16,7 @@ import {
   sshErrorText,
   sshLog,
   sshSummary,
+  formatByteSize,
 } from './lib.ts';
 
 interface SSHSession {
@@ -333,6 +334,129 @@ export function createSessionManager(): SessionManager {
     });
   }
 
+  function handleSftpConnection(ws: WebSocket, url: URL) {
+    (ws as any).isAlive = true;
+    (ws as any).on('pong', () => { (ws as any).isAlive = true; });
+    const sessionId = url.searchParams.get('sessionId') || '';
+    if (!sessionId) {
+      ws.close(1008, 'Missing sessionId');
+      return;
+    }
+    const session = sshSessions.get(sessionId);
+    const client = session?.client || (sessionId ? sshSessions.get(sessionId)?.client : undefined);
+    // Fallback via getSessionClient
+    const sshClient = client || (sessionId ? (() => { try { return (sshSessions.get(sessionId) as any)?.client; } catch { return undefined; } })() : undefined);
+    if (!sshClient) {
+      ws.send(JSON.stringify({ type: 'error', msg: 'Session not found or expired' }));
+      ws.close(1008, 'Session not found');
+      return;
+    }
+    sshLog('sftp ws connected', { sessionId });
+    let sftp: any = null;
+    let sftpReady = false;
+    const pending: any[] = [];
+
+    const send = (obj: any) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); };
+
+    const ensureSftp = (cb: (s: any) => void) => {
+      if (sftpReady && sftp) return cb(sftp);
+      pending.push(cb);
+      if (sftp) return;
+      (sshClient as any).sftp((err: any, handle: any) => {
+        if (err) {
+          pending.splice(0).forEach(() => {});
+          send({ type: 'error', msg: err.message });
+          ws.close(1011, err.message);
+          return;
+        }
+        sftp = handle;
+        sftpReady = true;
+        pending.splice(0).forEach((fn) => fn(sftp));
+      });
+    };
+
+    ws.on('message', (msg: RawData) => {
+      let data: any;
+      try { data = JSON.parse(msg.toString()); } catch { return; }
+      if (data.type === 'ping') {
+        send({ type: 'pong', ts: data.ts });
+        return;
+      }
+      const id = data.id;
+      const reply = (payload: any) => send({ id, ...payload });
+      ensureSftp((h: any) => {
+        try {
+          switch (data.type) {
+            case 'list': {
+              const p = data.path || '.';
+              const doReaddir = (target: string) => {
+                h.readdir(target, (err: any, list: any[]) => {
+                  if (err) return reply({ type: 'error', msg: err.message });
+                  // 同 file-routes 格式化
+                  const fileList = list.map((item: any) => ({
+                    name: item.filename,
+                    isDir: item.attrs.isDirectory(),
+                    size: item.attrs.isDirectory() ? String(item.attrs.size) : formatByteSize(item.attrs.size),
+                    rawSize: item.attrs.size,
+                    modifyTime: new Date(item.attrs.mtime * 1000).toISOString().replace('T', ' ').substring(0, 19),
+                  }));
+                  fileList.sort((a: any, b: any) => {
+                    if (a.isDir && !b.isDir) return -1;
+                    if (!a.isDir && b.isDir) return 1;
+                    return a.name.localeCompare(b.name);
+                  });
+                  // realpath
+                  if (!p || p === '.' || p === '~') {
+                    h.realpath('.', (e2: any, abs: string) => {
+                      reply({ type: 'result', data: { path: (!e2 && abs) ? abs : target, list: fileList } });
+                    });
+                  } else {
+                    reply({ type: 'result', data: { path: target, list: fileList } });
+                  }
+                });
+              };
+              if (!p || p === '.' || p === '~' || p === '') {
+                h.realpath('.', (e: any, abs: string) => doReaddir(!e && abs ? abs : '/root'));
+              } else doReaddir(p);
+              break;
+            }
+            case 'read': {
+              const rs = h.createReadStream(data.path);
+              let content = '';
+              rs.on('data', (c: any) => content += c.toString('utf-8'));
+              rs.on('end', () => reply({ type: 'result', data: { content, path: data.path } }));
+              rs.on('error', (e: any) => reply({ type: 'error', msg: e.message }));
+              break;
+            }
+            case 'write': {
+              const ws2 = h.createWriteStream(data.path);
+              ws2.end(Buffer.from(data.content || '', 'utf-8'), () => reply({ type: 'result' }));
+              ws2.on('error', (e: any) => reply({ type: 'error', msg: e.message }));
+              break;
+            }
+            case 'mkdir': {
+              h.mkdir(data.path, (e: any) => e ? reply({ type: 'error', msg: e.message }) : reply({ type: 'result' }));
+              break;
+            }
+            case 'delete': {
+              if (data.isDir) h.rmdir(data.path, (e: any) => e ? reply({ type: 'error', msg: e.message }) : reply({ type: 'result' }));
+              else h.unlink(data.path, (e: any) => e ? reply({ type: 'error', msg: e.message }) : reply({ type: 'result' }));
+              break;
+            }
+            default:
+              reply({ type: 'error', msg: 'Unknown type' });
+          }
+        } catch (e: any) { reply({ type: 'error', msg: e.message }); }
+      });
+    });
+
+    ws.on('close', () => {
+      sshLog('sftp ws closed', { sessionId });
+      try { sftp?.end?.(); } catch {}
+    });
+    ws.on('error', () => { try { sftp?.end?.(); } catch {} });
+  }
+
   function probeSessionLatency(session: SSHSession) {
     if (session.latencyProbeInFlight) return;
     session.latencyProbeInFlight = true;
@@ -552,6 +676,31 @@ export function createSessionManager(): SessionManager {
         const windowId = url.searchParams.get('windowId') || 'default';
         wss.handleUpgrade(request, socket, head, (ws) => {
           handleSysConnection(ws, windowId);
+        });
+        return;
+      }
+
+      if (url.pathname === '/sftp') {
+        const config = readAppConfig();
+        const httpsEnforced = config.httpsEnforced ?? (process.env.WEBSSH_REQUIRE_HTTPS === 'true');
+        if (httpsEnforced && !isHttpsRequest(request)) {
+          socket.write('HTTP/1.1 426 Upgrade Required\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        if (isAuthConfigured(config) && !isAuthenticated(request, config)) {
+          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        const originCheckEnabled = config.originCheckEnabled ?? true;
+        if (originCheckEnabled && !isAllowedOrigin(request, request.headers.origin)) {
+          socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        wss.handleUpgrade(request, socket, head, (ws) => {
+          handleSftpConnection(ws, url);
         });
         return;
       }

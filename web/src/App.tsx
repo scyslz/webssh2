@@ -803,6 +803,7 @@ export default function App() {
                     theme={config.theme}
                     initialPath={tab.sftpPath}
                     onPathChange={(path) => handleSftpPathChange(tab.id, path)}
+                    isVisible={isTabActive && showSFTP}
                   />
                 </div>
               </div>
