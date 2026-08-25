@@ -150,6 +150,22 @@ export function createSessionManager(): SessionManager {
   const sysClients = new Map<string, SysClient>();
   const startTime = Date.now();
 
+  // 服务端原生 ws ping 心跳，穿透 Nginx/反代的 proxy_read_timeout（常见 60s/240s）
+  const WS_PING_INTERVAL_MS = 30000;
+  const wsPingTimer = setInterval(() => {
+    wss.clients.forEach((c: any) => {
+      if (c.isAlive === false) {
+        sshLog('ws ping timeout terminate', {});
+        try { c.terminate(); } catch {}
+        return;
+      }
+      c.isAlive = false;
+      try { c.ping(); } catch {}
+    });
+  }, WS_PING_INTERVAL_MS);
+  // 避免阻止进程退出
+  if ((wsPingTimer as any).unref) (wsPingTimer as any).unref();
+
   function broadcastSessionSharedState(session: SSHSession) {
     for (const clientWs of session.attachedSockets) {
       if (clientWs.readyState === WebSocket.OPEN) {
@@ -294,6 +310,8 @@ export function createSessionManager(): SessionManager {
   }
 
   function handleSysConnection(ws: WebSocket, windowId: string) {
+    (ws as any).isAlive = true;
+    (ws as any).on('pong', () => { (ws as any).isAlive = true; });
     const sys: SysClient = {
       windowId,
       ws,
@@ -603,6 +621,8 @@ export function createSessionManager(): SessionManager {
     });
 
     wss.on('connection', (ws: WebSocket, _request: http.IncomingMessage, url: URL) => {
+      (ws as any).isAlive = true;
+      (ws as any).on('pong', () => { (ws as any).isAlive = true; });
       const sessionId = url.searchParams.get('sessionId') || url.searchParams.get('id') || '';
       const clientId = url.searchParams.get('clientId') || '';
       const sshInfoParam = url.searchParams.get('sshInfo') || '';

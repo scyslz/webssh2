@@ -842,13 +842,15 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
               term.writeln('\x1b[32m[WebSSH]\x1b[0m Connection established.\r\n');
             }
             fitAddon?.fit();
-            // 启动 /term 心跳，避免反向代理/空闲超时断开
+            // 启动 /term 心跳，避免反向代理/空闲超时断开（240s 常见，需 <60s）
             if (heartbeatIntervalRef.current !== null) {
               window.clearInterval(heartbeatIntervalRef.current);
             }
+            // 立即发一次，随后 20s 间隔
+            sendHeartbeatPing(ws);
             heartbeatIntervalRef.current = window.setInterval(() => {
               sendHeartbeatPing(ws);
-            }, 25000);
+            }, 20000);
             // 终端重连成功时，如果 /sys 处于断开状态，也触发重连
             if (isReconnectCycleRef.current && sysClient.getConnectionState() !== 'open') {
               sysClient.reconnect();
