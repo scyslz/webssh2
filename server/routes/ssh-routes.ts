@@ -1,7 +1,6 @@
 import crypto from 'crypto';
 import express from 'express';
 import {
-  createSessionId,
   parseSSHInfo,
   publicHost,
   readSavedHosts,
@@ -127,48 +126,8 @@ export function registerSshRoutes(app: express.Express, sessionManager: SessionM
     return res.json(status);
   });
 
-  app.post('/ssh/session/create', async (req, res) => {
-    try {
-      const requestedId = typeof req.body?.sessionId === 'string' ? req.body.sessionId : '';
-      const cols = Math.max(20, parseInt(String(req.body?.cols || '120'), 10) || 120);
-      const rows = Math.max(5, parseInt(String(req.body?.rows || '30'), 10) || 30);
-      const timeoutMins = Math.max(1, parseInt(String(req.body?.timeout || '120'), 10) || 120);
-      const keepAliveMs = timeoutMins * 60 * 1000;
-      const clientId = typeof req.body?.clientId === 'string' ? req.body.clientId : '';
-      const title = typeof req.body?.title === 'string' ? req.body.title : undefined;
-
-      let sshConfig;
-      if (req.body?.credentialId) {
-        sshLog('session create: resolving saved credential', {
-          sessionId: requestedId || '(new)',
-          credentialId: req.body.credentialId,
-        });
-        const saved = readSavedHosts().find((host) => host.id === req.body.credentialId);
-        if (!saved) return res.status(404).json({ error: 'Saved credential not found' });
-        sshConfig = parseSSHInfo(JSON.stringify(saved));
-      } else {
-        sshConfig = parseSSHInfo(JSON.stringify(req.body?.sshInfo || req.body || {}));
-      }
-
-      const sessionId = requestedId || createSessionId();
-      if (sessionManager.getSessionConfig(sessionId)) {
-        return res.json({ sessionId, created: false });
-      }
-
-      sshLog('session create: establishing live SSH session', {
-        sessionId,
-        source: req.body?.credentialId ? 'saved-credential' : 'inline',
-        cols,
-        rows,
-        ...sshSummary(sshConfig),
-      });
-      await sessionManager.createLiveSession(sessionId, sshConfig, { cols, rows, ownerClientId: clientId, keepAliveMs, title });
-      return res.json({ sessionId, created: true });
-    } catch (err: any) {
-      sshLog('session create: failed', { error: err.message || String(err) });
-      return res.status(400).json({ error: sshErrorText(err) || err.message || 'Invalid SSH connection parameters' });
-    }
-  });
+  // Session creation is now handled inline by the /term WebSocket handler
+  // via sshInfo or credentialId URL parameters.
 
   app.post('/ssh/sessions/kill', (req, res) => {
     const { sessionId, sessionIds, force, clientId } = req.body || {};

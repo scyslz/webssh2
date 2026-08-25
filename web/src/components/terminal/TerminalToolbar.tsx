@@ -186,7 +186,7 @@ export const TerminalToolbar: React.FC<TerminalToolbarProps> = ({
           className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-mono shrink-0 border ${latencyBadgeClass}`}
           title={`Browser to WebSSH: ${formatLatency(clientLatencyMs)} | WebSSH to SSH host: ${formatLatency(sshLatencyMs)}`}
         >
-          {tabConnected ? (
+          {connected || offlineSuspended ? (
             <>
               <span className={getLatencyToneClass(clientLatencyMs, isLight)}>{formatLatency(clientLatencyMs)}</span>
               <span className="opacity-50">|</span>

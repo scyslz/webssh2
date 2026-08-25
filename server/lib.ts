@@ -113,13 +113,8 @@ export function sshErrorText(err: any) {
   return fields.join(' | ');
 }
 
-function padNumber(value: number, length = 2) {
-  return value.toString().padStart(length, '0');
-}
-
 export function createSessionId() {
-  const now = new Date();
-  return `sid-${padNumber(now.getMonth() + 1)}${padNumber(now.getDate())}-${padNumber(now.getHours())}${padNumber(now.getMinutes())}${padNumber(now.getSeconds())}-${padNumber(now.getMilliseconds(), 3)}`;
+  return `sid-${crypto.randomUUID()}`;
 }
 
 export function hashPassword(password: string): string {

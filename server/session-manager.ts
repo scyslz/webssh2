@@ -7,9 +7,13 @@ import {
   isAuthenticated,
   isAuthConfigured,
   isHttpsRequest,
+  parseSSHInfo,
   ParsedSSHInfo,
   readAppConfig,
+  readSavedHosts,
+  createSessionId,
   sshErrorDetails,
+  sshErrorText,
   sshLog,
   sshSummary,
 } from './lib.ts';
@@ -36,9 +40,46 @@ interface SSHSession {
   latencyProbeInFlight?: boolean;
 }
 
+interface SysClient {
+  windowId: string;
+  ws: WebSocket;
+  lastPingTs: number | null;
+  clientRttMs: number | null;
+  snapshotTimer: NodeJS.Timeout | null;
+}
+
+export interface SessionHealth {
+  sessionId: string;
+  ownerClientId: string;
+  host: string;
+  port: number;
+  username: string;
+  sshLatencyMs: number | null;
+  connectedAt: number;
+  lastActivity: number;
+  attachedClients: number;
+  shared: boolean;
+  title?: string;
+  credentialId?: string;
+}
+
+export interface HealthSnapshot {
+  type: 'health_snapshot';
+  ts: number;
+  clientRttMs: number | null;
+  sessions: SessionHealth[];
+  server: {
+    uptimeSec: number;
+    activeSessions: number;
+    memRssMb: number;
+  };
+}
+
 const MAX_HISTORY_BYTES = 2 * 1024 * 1024;
 const WS_META_PREFIX = '__WEBSSH_META__:';
 const SESSION_ATTACH_GRACE_MS = 30000;
+const SYS_SNAPSHOT_INTERVAL_MS = 5000;
+const SYS_PONG_TIMEOUT_MS = 15000;
 // OpenSSH-style keepalive: send `keepalive@openssh.com` global requests over the
 // real SSH transport. There is no dedicated RFC keepalive message; this is the
 // de-facto standard. If `SSH_KEEPALIVE_COUNT_MAX` consecutive requests go
@@ -70,6 +111,7 @@ function normalizeIncomingData(msg: RawData, isBinary: boolean): Buffer | string
 export interface SessionManager {
   attachServer(server: http.Server): void;
   getSessionConfig(sessionId: string): ParsedSSHInfo | undefined;
+  getSessionClient(sessionId: string): SSHClient | undefined;
   listSessions(): Array<{
     id: string;
     host: string;
@@ -105,6 +147,8 @@ export interface SessionManager {
 export function createSessionManager(): SessionManager {
   const sshSessions = new Map<string, SSHSession>();
   const wss = new WebSocketServer({ noServer: true });
+  const sysClients = new Map<string, SysClient>();
+  const startTime = Date.now();
 
   function broadcastSessionSharedState(session: SSHSession) {
     for (const clientWs of session.attachedSockets) {
@@ -135,6 +179,7 @@ export function createSessionManager(): SessionManager {
     }
     try { session.stream?.end(); session.client?.end(); } catch {}
     sshSessions.delete(session.id);
+    broadcastHealthSnapshots();
   }
 
   function scheduleSessionDisconnect(session: SSHSession, delayMs: number) {
@@ -189,19 +234,108 @@ export function createSessionManager(): SessionManager {
     session.attachedSockets.add(ws);
     session.hasAttachedOnce = true;
     session.lastActivity = Date.now();
-    if (typeof session.sshLatencyMs === 'number' && ws.readyState === WebSocket.OPEN) {
-      sendMetaMessage(ws, { type: 'ssh_latency', latencyMs: session.sshLatencyMs, sessionId: session.id });
-    }
     return true;
   }
 
   function broadcastSshLatency(session: SSHSession, latencyMs: number) {
     session.sshLatencyMs = latencyMs;
-    for (const clientWs of session.attachedSockets) {
-      if (clientWs.readyState === WebSocket.OPEN) {
-        sendMetaMessage(clientWs, { type: 'ssh_latency', latencyMs, sessionId: session.id });
-      }
+    broadcastHealthSnapshots();
+  }
+
+  function buildHealthSnapshot(sys: SysClient): HealthSnapshot {
+    const sessions: SessionHealth[] = [];
+    for (const session of sshSessions.values()) {
+      sessions.push({
+        sessionId: session.id,
+        ownerClientId: session.ownerClientId || '',
+        host: session.sshConfig.host,
+        port: session.sshConfig.port,
+        username: session.sshConfig.username,
+        sshLatencyMs: session.sshLatencyMs ?? null,
+        connectedAt: session.createdAt,
+        lastActivity: session.lastActivity,
+        attachedClients: session.attachedSockets.size,
+        shared: session.shared,
+        title: session.title,
+        credentialId: session.sshConfig.id || undefined,
+      });
     }
+    return {
+      type: 'health_snapshot',
+      ts: Date.now(),
+      clientRttMs: sys.clientRttMs,
+      sessions,
+      server: {
+        uptimeSec: Math.round((Date.now() - startTime) / 1000),
+        activeSessions: sshSessions.size,
+        memRssMb: Math.round((process.memoryUsage().rss || 0) / 1024 / 1024),
+      },
+    };
+  }
+
+  function sendHealthSnapshot(sys: SysClient) {
+    if (sys.ws.readyState !== WebSocket.OPEN) return;
+    const snapshot = buildHealthSnapshot(sys);
+    sys.ws.send(JSON.stringify(snapshot));
+  }
+
+  // Broadcast to all /sys clients immediately (event-driven)
+  function broadcastHealthSnapshots() {
+    for (const sys of sysClients.values()) {
+      sendHealthSnapshot(sys);
+    }
+  }
+
+  function startSysSnapshotTimer(sys: SysClient) {
+    if (sys.snapshotTimer) clearInterval(sys.snapshotTimer);
+    sys.snapshotTimer = setInterval(() => {
+      sendHealthSnapshot(sys);
+    }, SYS_SNAPSHOT_INTERVAL_MS);
+  }
+
+  function handleSysConnection(ws: WebSocket, windowId: string) {
+    const sys: SysClient = {
+      windowId,
+      ws,
+      lastPingTs: null,
+      clientRttMs: null,
+      snapshotTimer: null,
+    };
+    sysClients.set(windowId, sys);
+    sshLog('sys connected', { windowId });
+
+    // Send immediate snapshot on connect
+    sendHealthSnapshot(sys);
+    startSysSnapshotTimer(sys);
+
+    ws.on('message', (msg: RawData) => {
+      try {
+        const data = JSON.parse(msg.toString());
+        if (data.type === 'ping') {
+          sys.lastPingTs = Date.now();
+          const rtt = typeof data.ts === 'number' ? Date.now() - data.ts : null;
+          if (rtt !== null) {
+            sys.clientRttMs = rtt;
+          }
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'pong', ts: data.ts, clientRttMs: sys.clientRttMs }));
+          }
+        }
+      } catch {
+        // ignore
+      }
+    });
+
+    ws.on('close', () => {
+      sshLog('sys disconnected', { windowId });
+      if (sys.snapshotTimer) clearInterval(sys.snapshotTimer);
+      sysClients.delete(windowId);
+    });
+
+    ws.on('error', () => {
+      if (sys.snapshotTimer) clearInterval(sys.snapshotTimer);
+      sysClients.delete(windowId);
+    });
   }
 
   function probeSessionLatency(session: SSHSession) {
@@ -316,6 +450,7 @@ export function createSessionManager(): SessionManager {
           sshSessions.set(sessionId, session);
           startSessionLatencyProbe(session);
           scheduleSessionDisconnect(session, SESSION_ATTACH_GRACE_MS);
+          broadcastHealthSnapshots();
 
           stream.on('data', (data: Buffer) => {
             session.history.push(data);
@@ -404,6 +539,28 @@ export function createSessionManager(): SessionManager {
   function attachServer(server: http.Server) {
     server.on('upgrade', (request, socket, head) => {
       const url = new URL(request.url || '', `http://${request.headers.host}`);
+
+      // Handle /sys WebSocket
+      if (url.pathname === '/sys') {
+        const config = readAppConfig();
+        const httpsEnforced = config.httpsEnforced ?? (process.env.WEBSSH_REQUIRE_HTTPS === 'true');
+        if (httpsEnforced && !isHttpsRequest(request)) {
+          socket.write('HTTP/1.1 426 Upgrade Required\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        if (isAuthConfigured(config) && !isAuthenticated(request, config)) {
+          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        const windowId = url.searchParams.get('windowId') || 'default';
+        wss.handleUpgrade(request, socket, head, (ws) => {
+          handleSysConnection(ws, windowId);
+        });
+        return;
+      }
+
       if (url.pathname !== '/term' && url.pathname !== '/terminal') {
         socket.destroy();
         return;
@@ -448,6 +605,9 @@ export function createSessionManager(): SessionManager {
     wss.on('connection', (ws: WebSocket, _request: http.IncomingMessage, url: URL) => {
       const sessionId = url.searchParams.get('sessionId') || url.searchParams.get('id') || '';
       const clientId = url.searchParams.get('clientId') || '';
+      const sshInfoParam = url.searchParams.get('sshInfo') || '';
+      const credentialId = url.searchParams.get('credentialId') || '';
+      const title = url.searchParams.get('title') || '';
       const forceAttach = url.searchParams.get('forceAttach') === '1';
       const cols = parseInt(url.searchParams.get('cols') || '120', 10);
       const rows = parseInt(url.searchParams.get('rows') || '30', 10);
@@ -458,53 +618,86 @@ export function createSessionManager(): SessionManager {
       sshLog('websocket connected', {
         sessionId: sessionId || '(none)',
         clientId: clientId || '(none)',
+        hasSshInfo: !!sshInfoParam,
+        credentialId: credentialId || '(none)',
         forceAttach,
         existingSession: Boolean(existingSession),
       });
 
-      if (!existingSession) {
-        const message = 'Session not found or expired';
-        sshLog('websocket closed: missing or expired SSH session', { sessionId });
+      const fail = (code: string, message: string) => {
+        sshLog('websocket closed: ' + message, { sessionId });
         if (ws.readyState === WebSocket.OPEN) {
-          sendMetaMessage(ws, {
-            type: 'ssh_connection_error',
-            code: 'SESSION_NOT_FOUND',
-            message,
-            sessionId,
-          });
-          ws.send(`\r\n\x1b[31mError: ${message} (sessionId=${sessionId || '(none)'})\x1b[0m\r\n`);
+          sendMetaMessage(ws, { type: 'ssh_connection_error', code, message, sessionId });
+          ws.send(`\r\n\x1b[31mError: ${message}\x1b[0m\r\n`);
           ws.close(1011, message);
         }
-        return;
-      }
+      };
 
-      if (!attachToSession(existingSession, ws, clientId, forceAttach)) {
-        sshLog('session attach rejected', { sessionId, reason: 'busy-after-create' });
-        return;
-      }
-
-      sshLog('session attached', {
-        sessionId: existingSession.id,
-        clientId: clientId || '(none)',
-        forceAttach,
-        historyBytes: existingSession.historySize,
-      });
-
-      existingSession.cols = cols;
-      existingSession.rows = rows;
-      try { existingSession.stream.setWindow(rows, cols, 0, 0); } catch {}
-
-      if (ws.readyState === WebSocket.OPEN) {
-        sendMetaMessage(ws, {
-          type: 'session_info',
-          sessionId: existingSession.id,
-          reattached: existingSession.history.length > 0,
-          shared: existingSession.shared,
+      const attach = (session: SSHSession) => {
+        if (!attachToSession(session, ws, clientId, forceAttach)) {
+          sshLog('session attach rejected', { sessionId: session.id, reason: 'busy-after-create' });
+          return;
+        }
+        sshLog('session attached', {
+          sessionId: session.id,
+          clientId: clientId || '(none)',
+          forceAttach,
+          historyBytes: session.historySize,
         });
-        for (const chunk of existingSession.history) ws.send(chunk);
+        session.cols = cols;
+        session.rows = rows;
+        try { session.stream.setWindow(rows, cols, 0, 0); } catch {}
+        if (ws.readyState === WebSocket.OPEN) {
+          sendMetaMessage(ws, {
+            type: 'session_info',
+            sessionId: session.id,
+            reattached: session.history.length > 0,
+            shared: session.shared,
+          });
+          for (const chunk of session.history) ws.send(chunk);
+        }
+      };
+
+      const createAndAttach = async () => {
+        try {
+          const resolvedSessionId = sessionId || createSessionId();
+          if (sshSessions.has(resolvedSessionId)) {
+            attach(sshSessions.get(resolvedSessionId)!);
+            return;
+          }
+          let sshConfig: ParsedSSHInfo;
+          if (credentialId) {
+            const saved = readSavedHosts().find((h) => h.id === credentialId);
+            if (!saved) { fail('CREDENTIAL_NOT_FOUND', 'Saved credential not found'); return; }
+            sshConfig = parseSSHInfo(JSON.stringify(saved));
+          } else if (sshInfoParam) {
+            sshLog('parseSSHInfo input', { firstChar: sshInfoParam[0], length: sshInfoParam.length, preview: sshInfoParam.substring(0, 80) });
+            sshConfig = parseSSHInfo(sshInfoParam);
+          } else {
+            fail('SESSION_NOT_FOUND', 'Session not found or expired');
+            return;
+          }
+          const session = await createLiveSession(resolvedSessionId, sshConfig, {
+            cols, rows, ownerClientId: clientId, keepAliveMs,
+            title: title || `${sshConfig.username}@${sshConfig.host}`,
+          });
+          attach(session as SSHSession);
+        } catch (err: any) {
+          fail('SSH_CREATE_ERROR', sshErrorText(err) || err.message || 'Failed to create SSH session');
+        }
+      };
+
+      if (existingSession) {
+        attach(existingSession);
+      } else if (sshInfoParam || credentialId) {
+        createAndAttach();
+      } else {
+        fail('SESSION_NOT_FOUND', 'Session not found or expired');
+        return;
       }
 
       ws.on('message', (msg: RawData, isBinary: boolean) => {
+        if (!existingSession) return;
         const payload = normalizeIncomingData(msg, isBinary);
         const raw = typeof payload === 'string' ? payload : decodeIncomingMessage(payload);
         if (!isBinary && raw.startsWith('{') && raw.endsWith('}')) {
@@ -541,15 +734,22 @@ export function createSessionManager(): SessionManager {
       });
 
       ws.on('close', () => {
+        if (!existingSession) {
+          sshLog('websocket closed: no session attached', { sessionId: sessionId || '(none)' });
+          return;
+        }
         sshLog('websocket closed', { sessionId: existingSession.id, readyState: ws.readyState });
         existingSession.attachedSockets.delete(ws);
         if (existingSession.attachedSockets.size === 0) {
           scheduleSessionDisconnect(existingSession, keepAliveMs);
         }
+        broadcastHealthSnapshots();
       });
 
       ws.on('error', () => {
-        existingSession.attachedSockets.delete(ws);
+        if (existingSession) {
+          existingSession.attachedSockets.delete(ws);
+        }
       });
     });
   }
@@ -558,6 +758,9 @@ export function createSessionManager(): SessionManager {
     attachServer,
     getSessionConfig(sessionId: string) {
       return sshSessions.get(sessionId)?.sshConfig;
+    },
+    getSessionClient(sessionId: string) {
+      return sshSessions.get(sessionId)?.client;
     },
     listSessions() {
       return Array.from(sshSessions.values())

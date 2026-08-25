@@ -1,27 +1,14 @@
-import React, { useState, useEffect } from 'react';
-import { X, Server, RefreshCw, Trash2, ExternalLink, Activity, Radio } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { X, Server, Trash2, ExternalLink, Activity, Radio } from 'lucide-react';
+import { SessionHealth } from '../sysClient';
 import { SSHTab } from '../types';
 import { apiFetch, apiUrl } from '../api';
-
-export interface BackendSession {
-  id: string;
-  host: string;
-  port: number;
-  username: string;
-  createdAt: number;
-  lastActivity: number;
-  attachedClients: number;
-  shared?: boolean;
-  credentialId?: string;
-  ownerClientId?: string;
-  title?: string;
-}
 
 interface SessionsModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onRefresh: (forceRefresh: boolean) => Promise<BackendSession[]>;
-  onAttachSession: (session: BackendSession, force?: boolean) => void;
+  sessions: SessionHealth[];
+  onAttachSession: (session: SessionHealth, force?: boolean) => void;
   onKillSession: (sessionId: string) => void;
   tabs: SSHTab[];
   theme?: string;
@@ -30,28 +17,32 @@ interface SessionsModalProps {
 export const SessionsModal: React.FC<SessionsModalProps> = ({
   isOpen,
   onClose,
-  onRefresh,
+  sessions,
   onAttachSession,
   onKillSession,
   tabs,
   theme,
 }) => {
   const isLight = theme === 'light';
-  const [sessions, setSessions] = useState<BackendSession[]>([]);
+  const [killedIds, setKilledIds] = useState<Set<string>>(new Set());
 
-  const loadSessions = async (force = false) => {
-    const list = await onRefresh(force);
-    setSessions(list.sort((a, b) => b.lastActivity - a.lastActivity));
-  };
-
+  // 清理 killedIds（当 sessions 更新时）
   useEffect(() => {
-    if (isOpen) loadSessions();
-  }, [isOpen]);
+    setKilledIds((prev) => {
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (sessions.some((s) => s.sessionId === id)) next.add(id);
+      }
+      return next;
+    });
+  }, [sessions]);
 
   const tabIds = new Set(tabs.map((t) => t.id));
   const tabTitles = new Map(tabs.map((t) => [t.id, t.title]));
 
-  const getRestoreTone = (sess: BackendSession) => {
+  const visibleSessions = sessions.filter((s) => !killedIds.has(s.sessionId));
+
+  const getRestoreTone = (sess: SessionHealth) => {
     if (tabIds.has(sess.ownerClientId ?? '')) {
       return isLight
         ? 'bg-amber-100 hover:bg-amber-200 text-amber-800 border-amber-300'
@@ -67,7 +58,7 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
       : 'bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border-emerald-500/30';
   };
 
-  const getRestoreTitle = (sess: BackendSession) => {
+  const getRestoreTitle = (sess: SessionHealth) => {
     if (tabIds.has(sess.ownerClientId ?? '')) return 'Already opened in this browser — click to restore';
     if (sess.attachedClients > 0) return 'Occupied by another client — use Force to take over';
     return 'Available — click to restore here';
@@ -95,16 +86,22 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
   };
 
   const handleKillSession = async (sessionId: string) => {
+    // 乐观隐藏
+    setKilledIds((prev) => new Set(prev).add(sessionId));
     try {
       await apiFetch(apiUrl('/ssh/sessions/kill'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionIds: [sessionId] }),
       });
-      setSessions((prev) => prev.filter((s) => s.id !== sessionId));
       onKillSession(sessionId);
     } catch (err) {
-      // ignore
+      // 失败时恢复
+      setKilledIds((prev) => {
+        const next = new Set(prev);
+        next.delete(sessionId);
+        return next;
+      });
     }
   };
 
@@ -134,17 +131,9 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
           </div>
 
           <div className="flex items-center gap-1">
-            <button
-              onClick={() => loadSessions(true)}
-              className={`p-1.5 rounded-lg border transition cursor-pointer ${
-                isLight
-                  ? 'hover:bg-slate-200 border-slate-300 text-slate-600'
-                  : 'hover:bg-slate-800 border-slate-700 text-slate-300'
-              }`}
-              title="Refresh Sessions"
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-            </button>
+            <span className="text-[10px] text-slate-500 hidden sm:inline mr-1">
+              {visibleSessions.length} active
+            </span>
             <button
               onClick={onClose}
               className={`p-1.5 rounded-lg border transition cursor-pointer ${
@@ -160,79 +149,82 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
 
         {/* Sessions List Content */}
         <div className="p-3 sm:p-4 flex-1 overflow-y-auto space-y-2 min-h-[180px] sm:min-h-[220px]">
-          {sessions.length === 0 ? (
+          {visibleSessions.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-12 text-slate-400 gap-2">
               <Radio className="w-8 h-8 text-slate-600 animate-pulse" />
               <p className="text-xs font-medium">No active SSH sessions running on server.</p>
               <p className="text-[11px] text-slate-500">Connect to a server to create persistent sessions.</p>
             </div>
           ) : (
-            sessions.map((sess) => {
-              const restoreTone = getRestoreTone(sess);
-              const restoreTitleText = getRestoreTitle(sess);
-              const hostLabel = `${sess.username}@${sess.host}:${sess.port}`;
-              const tabTitle = tabTitles.get(sess.ownerClientId ?? '') || sess.title;
-              const showHost = tabTitle && tabTitle !== hostLabel;
+            visibleSessions
+              .sort((a, b) => b.lastActivity - a.lastActivity)
+              .map((sess) => {
+                const restoreTone = getRestoreTone(sess);
+                const restoreTitleText = getRestoreTitle(sess);
+                const hostLabel = `${sess.username}@${sess.host}:${sess.port}`;
+                const tabTitle = tabTitles.get(sess.ownerClientId ?? '') || sess.title;
+                const showHost = tabTitle && tabTitle !== hostLabel;
 
-              return (
-                <div
-                  key={sess.id}
-                  className={`p-2 sm:p-3 rounded-lg border transition flex items-center justify-between gap-2 sm:gap-3 ${
-                    isLight
-                      ? 'bg-slate-50 hover:bg-slate-100 border-slate-200'
-                      : 'bg-slate-950/60 hover:bg-slate-950 border-slate-800/80'
-                  }`}
-                >
-                  <div className="flex items-center gap-2 sm:gap-3 overflow-hidden">
-                    <div className="p-1.5 sm:p-2 rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 shrink-0">
-                      <Server className="w-3.5 sm:w-4 sm:h-4" />
-                    </div>
+                return (
+                  <div
+                    key={sess.sessionId}
+                    className={`p-2 sm:p-3 rounded-lg border transition flex items-center justify-between gap-2 sm:gap-3 ${
+                      isLight
+                        ? 'bg-slate-50 hover:bg-slate-100 border-slate-200'
+                        : 'bg-slate-950/60 hover:bg-slate-950 border-slate-800/80'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 sm:gap-3 overflow-hidden">
+                      <div className="p-1.5 sm:p-2 rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 shrink-0">
+                        <Server className="w-3.5 sm:w-4 sm:h-4" />
+                      </div>
 
-                    <div className="min-w-0">
-                      <span className="font-mono text-[11px] sm:text-xs font-bold truncate block">
-                        {tabTitle || hostLabel}
-                      </span>
-                      {showHost && (
-                        <span className="text-[10px] text-slate-500 font-mono truncate block mt-0.5">
-                          {hostLabel}
+                      <div className="min-w-0">
+                        <span className="font-mono text-[11px] sm:text-xs font-bold truncate block">
+                          {tabTitle || hostLabel}
                         </span>
-                      )}
-                      <span className="text-[10px] text-slate-500 font-mono mt-0.5 block">
-                        Created {formatAbs(sess.createdAt)}
-                        {sess.attachedClients === 0 && (
-                        <span className="text-slate-400"> &middot; {formatRecent(sess.lastActivity)}</span>
+                        {showHost && (
+                          <span className="text-[10px] text-slate-500 font-mono truncate block mt-0.5">
+                            {hostLabel}
+                          </span>
                         )}
-                      </span>
+                        <span className="text-[10px] text-slate-500 font-mono mt-0.5 block">
+                          Created {formatAbs(sess.connectedAt)}
+                          {sess.attachedClients === 0 && (
+                          <span className="text-slate-400"> &middot; {formatRecent(sess.lastActivity)}</span>
+                          )}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        onClick={() => {
+                          onAttachSession(sess, sess.attachedClients > 0 && !tabIds.has(sess.ownerClientId ?? ''));
+                          onClose();
+                        }}
+                        className={`flex items-center gap-1 p-1.5 sm:px-2 sm:py-1 rounded-md border text-xs font-medium transition cursor-pointer shadow-xs ${restoreTone}`}
+                        title={restoreTitleText}
+                      >
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </button>
+
+                      <button
+                        onClick={() => handleKillSession(sess.sessionId)}
+                        className={`p-1.5 rounded-md border transition cursor-pointer ${
+                          isLight
+                            ? 'hover:bg-rose-100 hover:border-rose-300 text-rose-600 border-slate-300'
+                            : 'hover:bg-rose-950/60 hover:border-rose-800 text-rose-400 border-slate-800'
+                        }`}
+                        title="Terminate Session"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
                     </div>
                   </div>
-
-                  <div className="flex items-center gap-1 shrink-0">
-                    <button
-                      onClick={() => {
-                        onAttachSession(sess, sess.attachedClients > 0 && !tabIds.has(sess.ownerClientId ?? ''));
-                        onClose();
-                      }}
-                      className={`flex items-center gap-1 p-1.5 sm:px-2 sm:py-1 rounded-md border text-xs font-medium transition cursor-pointer shadow-xs ${restoreTone}`}
-                      title={restoreTitleText}
-                    >
-                      <ExternalLink className="w-3.5 h-3.5" />
-                    </button>
-
-                    <button
-                      onClick={() => handleKillSession(sess.id)}
-                      className={`p-1.5 rounded-md border transition cursor-pointer ${
-                        isLight
-                          ? 'hover:bg-rose-100 hover:border-rose-300 text-rose-600 border-slate-300'
-                          : 'hover:bg-rose-950/60 hover:border-rose-800 text-rose-400 border-slate-800'
-                      }`}
-                      title="Terminate Session"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                </div>
-              );
-            }))}
+                );
+              })
+          )}
         </div>
 
         {/* Modal Footer */}
@@ -241,7 +233,7 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
             isLight ? 'bg-slate-50 border-slate-200' : 'bg-slate-950/60 border-slate-800'
           }`}
         >
-          <span className="text-slate-400">Active sessions persist in backend container memory</span>
+          <span className="text-slate-400">Active sessions persist in backend container memory &middot; Auto-refreshed via /sys</span>
         </div>
       </div>
     </div>

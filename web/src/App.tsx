@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { SSHInfo, SSHTab, WebSSHConfig, defaultQuickCommands } from './types';
 import { apiFetch, apiUrl } from './api';
 import { sessionGet, sessionSet, globalGet, globalSet } from './storage';
+import { sysClient } from './sysClient';
 import { Header } from './components/Header';
 import { Tabs } from './components/Tabs';
 import { TerminalView } from './components/terminal/TerminalView';
@@ -9,11 +10,10 @@ import { SFTPView } from './components/SFTPView';
 import { ConnectionModal } from './components/ConnectionModal';
 import { SavedHostsModal } from './components/SavedHostsModal';
 import { SettingsModal } from './components/SettingsModal';
-import { SessionsModal, BackendSession } from './components/SessionsModal';
+import { SessionsModal } from './components/SessionsModal';
+import { SessionHealth } from './sysClient';
 import { LoginPage } from './components/LoginPage';
 import { Terminal, Server } from 'lucide-react';
-
-let _sessionsCache: { data: BackendSession[]; expireAt: number } = { data: [], expireAt: 0 };
 
 export default function App() {
   const pad = (value: number, length = 2) => value.toString().padStart(length, '0');
@@ -98,30 +98,28 @@ export default function App() {
     return window.visualViewport?.height || window.innerHeight;
   });
 
-  const fetchServerSessions = useCallback(async (forceRefresh = false): Promise<BackendSession[]> => {
-    if (!forceRefresh && Date.now() < _sessionsCache.expireAt) return _sessionsCache.data;
-    try {
-      const res = await apiFetch(apiUrl('/ssh/sessions'));
-      if (res.ok) {
-        const list = await res.json();
-        if (Array.isArray(list)) {
-          _sessionsCache = { data: list, expireAt: Date.now() + 5000 };
-          setActiveSessionCount(list.length);
-          return list;
-        }
-      }
-    } catch {
-      // ignore
-    }
-    _sessionsCache = { data: [], expireAt: 0 };
-    setActiveSessionCount(0);
-    return [];
+  // Start/stop /sys WebSocket for health monitoring
+  useEffect(() => {
+    if (authChecking || (authEnabled && !authenticated)) return;
+    sysClient.start(windowId);
+    return () => sysClient.stop();
+  }, [authChecking, authEnabled, authenticated, windowId]);
+
+  const [sessions, setSessions] = useState<SessionHealth[]>([]);
+
+  // Subscribe to /sys for session health data
+  useEffect(() => {
+    const unsubscribe = sysClient.subscribe((snapshot) => {
+      setSessions(snapshot.sessions);
+      setActiveSessionCount(snapshot.sessions.length);
+    });
+    return unsubscribe;
   }, []);
 
-  const reconcileTabsWithServer = useCallback((sessions: BackendSession[]) => {
+  const reconcileTabsWithServer = useCallback((sessionList: SessionHealth[]) => {
     setTabs((prev) =>
       prev.map((tab) => {
-        const matchingSession = tab.sessionId ? sessions.find((session) => session.id === tab.sessionId) : undefined;
+        const matchingSession = tab.sessionId ? sessionList.find((s) => s.sessionId === tab.sessionId) : undefined;
         if (!matchingSession) return { ...tab, connected: false };
 
         const restorable =
@@ -247,14 +245,14 @@ export default function App() {
 
     loadSavedHosts();
     loadAppConfig();
-    fetchServerSessions(true).then(reconcileTabsWithServer);
+  }, [authChecking, authEnabled, authenticated, loadSavedHosts, loadAppConfig]);
 
-    const interval = setInterval(() => {
-      fetchServerSessions(true).then(reconcileTabsWithServer);
-    }, 5000);
-
-    return () => clearInterval(interval);
-  }, [authChecking, authEnabled, authenticated, loadSavedHosts, loadAppConfig, fetchServerSessions, reconcileTabsWithServer]);
+  // Reconcile tabs when sessions update from /sys
+  useEffect(() => {
+    if (sessions.length > 0 || tabs.length > 0) {
+      reconcileTabsWithServer(sessions);
+    }
+  }, [sessions, tabs.length, reconcileTabsWithServer]);
 
   useEffect(() => {
     const syncHeight = () => {
@@ -500,12 +498,11 @@ export default function App() {
     setTabs((prev) => prev.map((tab) => (tab.id === id ? { ...tab, sftpPath } : tab)));
   }, []);
 
-  const handleRecoverSession = useCallback(async (id: string, force = false) => {
-    const sessions = await fetchServerSessions();
+  const handleRecoverSession = useCallback((id: string, force = false) => {
     setTabs((prev) =>
       prev.map((tab) => {
         if (tab.id !== id) return tab;
-        const matchingSession = tab.sessionId ? sessions.find((session) => session.id === tab.sessionId) : undefined;
+        const matchingSession = tab.sessionId ? sessions.find((s) => s.sessionId === tab.sessionId) : undefined;
         const restorable =
           matchingSession &&
           (matchingSession.attachedClients === 0 ||
@@ -518,8 +515,6 @@ export default function App() {
             connected: true,
             reconnectToken: (tab.reconnectToken || 0) + 1,
             error: undefined,
-            // The old backend session no longer exists (e.g. torn down after a
-            // keepalive timeout). Start a fresh one instead of surfacing an error.
             sessionId: undefined,
           };
         }
@@ -533,7 +528,7 @@ export default function App() {
         };
       })
     );
-  }, [fetchServerSessions]);
+  }, [sessions]);
 
   const handleNewSession = useCallback((id: string) => {
     setTabs((prev) =>
@@ -580,8 +575,8 @@ export default function App() {
     setSettingsModalOpen(false);
   }, []);
 
-  const handleAttachBackendSession = useCallback((sess: BackendSession, force = false) => {
-    const existing = tabs.find((t) => t.sessionId === sess.id || t.id === sess.id);
+  const handleAttachBackendSession = useCallback((sess: SessionHealth, force = false) => {
+    const existing = tabs.find((t) => t.sessionId === sess.sessionId || t.id === sess.sessionId);
     if (existing) {
       setActiveTabId(existing.id);
       if (force) handleRecoverSession(existing.id, true);
@@ -599,7 +594,7 @@ export default function App() {
 
     const newTab: SSHTab = {
       id: newTabId,
-      sessionId: sess.id,
+      sessionId: sess.sessionId,
       title: `${sess.username}@${sess.host}`,
       sshInfo,
       sftpPath: sshInfo.username && sshInfo.username !== 'root' ? `/home/${sshInfo.username}` : '/root',
@@ -852,7 +847,7 @@ export default function App() {
       <SessionsModal
         isOpen={sessionsModalOpen}
         onClose={() => setSessionsModalOpen(false)}
-        onRefresh={(force) => fetchServerSessions(force)}
+        sessions={sessions}
         onAttachSession={handleAttachBackendSession}
         onKillSession={handleSessionKilled}
         tabs={tabs}

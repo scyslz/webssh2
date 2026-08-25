@@ -11,6 +11,12 @@ export function resolveSSHInfo(sessionManager: SessionManager, sessionId: string
   return parseSSHInfo(encodedInfo);
 }
 
+export function isSessionReusable(sessionManager: SessionManager, sessionId: string | undefined): boolean {
+  if (!sessionId) return false;
+  const client = sessionManager.getSessionClient(sessionId);
+  return !!client && client.readyForAuth !== false;
+}
+
 export function connectSSH(
   config: ParsedSSHInfo,
   ready: (conn: SSHClient) => void,

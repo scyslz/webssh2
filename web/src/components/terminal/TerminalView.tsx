@@ -4,7 +4,8 @@ import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import '@xterm/xterm/css/xterm.css';
 import { SSHInfo, WebSSHConfig } from '../../types';
-import { apiFetch, apiUrl, wsUrl } from '../../api';
+import { wsUrl } from '../../api';
+import { sysClient, SessionHealth } from '../../sysClient';
 import { sessionGet, sessionSet, globalGet, globalSet } from '../../storage';
 import {
   Copy,
@@ -71,8 +72,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const cycleSuppressOutputRef = useRef<boolean>(false);
   const countdownTimerRef = useRef<number | null>(null);
   const silentReconnectRef = useRef<boolean>(false);
-  const heartbeatTimerRef = useRef<number | null>(null);
-  const heartbeatTimeoutRef = useRef<number | null>(null);
+  const sysUnsubscribeRef = useRef<() => void>(null);
   const lastHeartbeatPingAtRef = useRef<number | null>(null);
   const touchScrollStateRef = useRef<{ startY: number; lastY: number; accumulated: number } | null>(null);
   const momentumRef = useRef<{ velocity: number; animationFrame: number | null } | null>(null);
@@ -526,10 +526,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         ws.close();
       }
     }
-    if (heartbeatTimerRef.current !== null) window.clearInterval(heartbeatTimerRef.current);
-    if (heartbeatTimeoutRef.current !== null) window.clearTimeout(heartbeatTimeoutRef.current);
-    heartbeatTimerRef.current = null;
-    heartbeatTimeoutRef.current = null;
+    if (sysUnsubscribeRef.current) sysUnsubscribeRef.current();
     lastHeartbeatPingAtRef.current = null;
   };
 
@@ -774,37 +771,24 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     const effectiveReconnectMode = modeOverride || reconnectModeOverrideRef.current || reconnectMode;
     reconnectModeOverrideRef.current = null;
     let preparedSessionId = sessionId || '';
-    if (!sessionId) {
-      try {
-        pushDebugEvent(`session create start credential=${sshInfo.id ? 'saved' : 'inline'} cols=${cols} rows=${rows}`);
-        const sessionRes = await apiFetch(apiUrl('/ssh/session/create'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(
-            sshInfo.id
-              ? { credentialId: sshInfo.id, cols, rows, timeout, clientId, title: sshInfo.name || `${sshInfo.username}@${sshInfo.host}` }
-              : { sshInfo, cols, rows, timeout, clientId, title: sshInfo.name || `${sshInfo.username}@${sshInfo.host}` }
-          ),
-        });
-        const sessionData = await sessionRes.json();
-        if (!sessionRes.ok) throw new Error(sessionData.error || 'Failed to create SSH session');
-        preparedSessionId = sessionData.sessionId;
-        pushDebugEvent(`session create ok session=${preparedSessionId}`);
-      } catch (err: any) {
-        pushDebugEvent(`session create failed error=${err.message || 'unknown'}`);
-        if (isReconnectCycleRef.current) {
-          failReconnectCycle();
-          return;
-        }
-        setConnecting(false);
-        setErrorMsg(err.message || 'Failed to create SSH session');
-        onConnectionChange?.(false);
-        return;
+    // Build WS URL with inline session creation params (no HTTP POST needed)
+    const params = new URLSearchParams();
+    params.set('clientId', clientId);
+    params.set('cols', String(cols));
+    params.set('rows', String(rows));
+    params.set('timeout', String(timeout));
+    params.set('forceAttach', effectiveReconnectMode === 'force' ? '1' : '0');
+    if (sessionId) {
+      params.set('sessionId', sessionId);
+    } else {
+      if (sshInfo.id) {
+        params.set('credentialId', sshInfo.id);
+      } else {
+        params.set('sshInfo', JSON.stringify(sshInfo));
       }
+      params.set('title', sshInfo.name || `${sshInfo.username}@${sshInfo.host}`);
     }
-    const wsConnectUrl = wsUrl('/term',
-      `sessionId=${encodeURIComponent(preparedSessionId)}&clientId=${encodeURIComponent(clientId)}&cols=${cols}&rows=${rows}&timeout=${timeout}&forceAttach=${effectiveReconnectMode === 'force' ? '1' : '0'}`
-    );
+    const wsConnectUrl = wsUrl('/term', params.toString());
     pushDebugEvent(`ws url ${wsConnectUrl}`);
 
     const ws = new WebSocket(wsConnectUrl);
@@ -815,21 +799,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     ws.onopen = () => {
       if (!isCurrentConnection()) return;
       pushDebugEvent(`ws open attempt=${attemptId} cols=${cols} rows=${rows}`);
-      setConnecting(false);
-      setConnected(true);
-      setOfflineSuspended(false);
-      onConnectionChange?.(true);
-      if (!silentReconnectRef.current) {
-        term.writeln('\x1b[32m[WebSSH]\x1b[0m Connection established.\r\n');
-      }
+      // 不在这里显示 "Connection established"，等收到 session_info 后再显示
       fitAddon?.fit();
-      sendHeartbeatPing(ws);
-      if (!isReconnectCycleRef.current) {
-        completeReconnectCycle();
-      }
-      heartbeatTimerRef.current = window.setInterval(() => {
-        sendHeartbeatPing(ws);
-      }, 10000);
     };
 
     ws.onmessage = (event) => {
@@ -842,6 +813,22 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
             if (typeof meta.shared === 'boolean') setSharedSession(meta.shared);
             if (typeof meta.sessionId === 'string') {
               onSessionInfo?.(meta.sessionId, Boolean(meta.reattached));
+            }
+            // SSH 会话真正就绪后显示连接成功
+            setConnecting(false);
+            setConnected(true);
+            setOfflineSuspended(false);
+            onConnectionChange?.(true);
+            if (!silentReconnectRef.current) {
+              term.writeln('\x1b[32m[WebSSH]\x1b[0m Connection established.\r\n');
+            }
+            fitAddon?.fit();
+            // 终端重连成功时，如果 /sys 处于断开状态，也触发重连
+            if (isReconnectCycleRef.current && sysClient.getConnectionState() !== 'open') {
+              sysClient.reconnect();
+            }
+            if (!isReconnectCycleRef.current) {
+              completeReconnectCycle();
             }
             if (isReconnectCycleRef.current) {
               cycleSuppressOutputRef.current = false;
@@ -868,19 +855,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
             return;
           }
           if (meta.type === 'pong') {
-            if (heartbeatTimeoutRef.current !== null) window.clearTimeout(heartbeatTimeoutRef.current);
-            heartbeatTimeoutRef.current = null;
-            const echoedTs = typeof meta.ts === 'number' ? meta.ts : lastHeartbeatPingAtRef.current;
-            if (typeof echoedTs === 'number') {
-              setClientLatencyMs(Math.max(0, Date.now() - echoedTs));
-            }
-            lastHeartbeatPingAtRef.current = null;
-            return;
-          }
-          if (meta.type === 'ssh_latency') {
-            if (typeof meta.latencyMs === 'number') {
-              setSshLatencyMs(Math.max(0, Math.round(meta.latencyMs)));
-            }
             return;
           }
           if (meta.type === 'session_busy') {
@@ -986,8 +960,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       setReconnectSending(false);
       if (offlineHoldEnabledRef.current) {
         setConnected(false);
-        setClientLatencyMs(null);
-        setSshLatencyMs(null);
         onConnectionChange?.(false);
         return;
       }
@@ -1016,10 +988,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         closeReasonRef.current = event.code === 1008 ? 'session_busy' : 'ssh_connect_error';
         if (event.reason) setErrorMsg(event.reason);
       }
-      if (heartbeatTimerRef.current !== null) window.clearInterval(heartbeatTimerRef.current);
-      if (heartbeatTimeoutRef.current !== null) window.clearTimeout(heartbeatTimeoutRef.current);
-      heartbeatTimerRef.current = null;
-      heartbeatTimeoutRef.current = null;
+      if (sysUnsubscribeRef.current) sysUnsubscribeRef.current();
       lastHeartbeatPingAtRef.current = null;
       const remaining = decoderRef.current?.decode();
       if (remaining && !wasSuppressingOutput) {
@@ -1235,6 +1204,31 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       cleanupConnection();
     };
   }, [sshInfo, sessionId, reconnectMode, config.timeout, initialError]);
+
+  // 延迟显示：始终同步更新两个值，保证同时显示/不显示
+  useEffect(() => {
+    const unsub = sysClient.subscribe((snapshot) => {
+      if (snapshot.clientRttMs !== null && snapshot.clientRttMs !== undefined) {
+        let sshLatency: number | null = null;
+        if (sessionId) {
+          const session = snapshot.sessions.find((s) => s.sessionId === sessionId);
+          if (session) sshLatency = session.sshLatencyMs;
+        }
+        setSshLatencyMs(sshLatency);
+        setClientLatencyMs(snapshot.clientRttMs);
+      }
+    });
+    const unsubState = sysClient.subscribeState((state) => {
+      if (state !== 'open') {
+        setClientLatencyMs(null);
+        setSshLatencyMs(null);
+      }
+    });
+    return () => {
+      unsub();
+      unsubState();
+    };
+  }, [sessionId]);
 
   useEffect(() => {
     if (isTabActive && fitAddonRef.current && terminalRef.current) {
