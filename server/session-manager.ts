@@ -287,13 +287,6 @@ export function createSessionManager(): SessionManager {
     };
   }
 
-  function sendHealthSnapshot(sys: SysClient) {
-    if (sys.ws.readyState !== WebSocket.OPEN) return;
-    const snapshot = buildHealthSnapshot(sys);
-    sys.ws.send(JSON.stringify(snapshot));
-  }
-
-  // 已改为 ping/pong 按需返回，不再主动广播；保留空实现兼容旧调用
   function broadcastHealthSnapshots() {}
 
   function handleSysConnection(ws: WebSocket, windowId: string) {
@@ -308,9 +301,6 @@ export function createSessionManager(): SessionManager {
     };
     sysClients.set(windowId, sys);
     sshLog('sys connected', { windowId });
-
-    // 不再主动推，首包也由客户端 ping 触发；兼容旧客户端立即推一次后即停止定时推送
-    sendHealthSnapshot(sys);
 
     ws.on('message', (msg: RawData) => {
       try {
