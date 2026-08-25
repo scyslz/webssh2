@@ -78,8 +78,6 @@ export interface HealthSnapshot {
 const MAX_HISTORY_BYTES = 2 * 1024 * 1024;
 const WS_META_PREFIX = '__WEBSSH_META__:';
 const SESSION_ATTACH_GRACE_MS = 30000;
-const SYS_SNAPSHOT_INTERVAL_MS = 5000;
-const SYS_PONG_TIMEOUT_MS = 15000;
 // OpenSSH-style keepalive: send `keepalive@openssh.com` global requests over the
 // real SSH transport. There is no dedicated RFC keepalive message; this is the
 // de-facto standard. If `SSH_KEEPALIVE_COUNT_MAX` consecutive requests go
@@ -295,19 +293,8 @@ export function createSessionManager(): SessionManager {
     sys.ws.send(JSON.stringify(snapshot));
   }
 
-  // Broadcast to all /sys clients immediately (event-driven)
-  function broadcastHealthSnapshots() {
-    for (const sys of sysClients.values()) {
-      sendHealthSnapshot(sys);
-    }
-  }
-
-  function startSysSnapshotTimer(sys: SysClient) {
-    if (sys.snapshotTimer) clearInterval(sys.snapshotTimer);
-    sys.snapshotTimer = setInterval(() => {
-      sendHealthSnapshot(sys);
-    }, SYS_SNAPSHOT_INTERVAL_MS);
-  }
+  // 已改为 ping/pong 按需返回，不再主动广播；保留空实现兼容旧调用
+  function broadcastHealthSnapshots() {}
 
   function handleSysConnection(ws: WebSocket, windowId: string) {
     (ws as any).isAlive = true;
@@ -322,9 +309,8 @@ export function createSessionManager(): SessionManager {
     sysClients.set(windowId, sys);
     sshLog('sys connected', { windowId });
 
-    // Send immediate snapshot on connect
+    // 不再主动推，首包也由客户端 ping 触发；兼容旧客户端立即推一次后即停止定时推送
     sendHealthSnapshot(sys);
-    startSysSnapshotTimer(sys);
 
     ws.on('message', (msg: RawData) => {
       try {
@@ -336,7 +322,8 @@ export function createSessionManager(): SessionManager {
             sys.clientRttMs = rtt;
           }
           if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'pong', ts: data.ts, clientRttMs: sys.clientRttMs }));
+            const snapshot = buildHealthSnapshot(sys);
+            ws.send(JSON.stringify({ type: 'pong', ts: data.ts, clientRttMs: sys.clientRttMs, snapshot }));
           }
         }
       } catch {

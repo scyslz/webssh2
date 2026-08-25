@@ -107,8 +107,19 @@ function createSysClient() {
     socket.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
+        // 兼容旧 health_snapshot 与新 pong+snapshot
         if (data.type === 'health_snapshot') {
           lastSnapshot = data as HealthSnapshot;
+          listeners.forEach((l) => l(lastSnapshot!));
+        } else if (data.type === 'pong' && data.snapshot) {
+          const snap = data.snapshot as HealthSnapshot;
+          // 用 pong 携带的 clientRttMs / ts 更新
+          if (typeof data.clientRttMs === 'number') snap.clientRttMs = data.clientRttMs;
+          lastSnapshot = snap;
+          listeners.forEach((l) => l(lastSnapshot!));
+        } else if (data.type === 'pong' && Array.isArray(data.sessions)) {
+          // 兼容 pong 直接带 sessions 的情况
+          lastSnapshot = data as unknown as HealthSnapshot;
           listeners.forEach((l) => l(lastSnapshot!));
         }
       } catch {
