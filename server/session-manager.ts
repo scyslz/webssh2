@@ -194,7 +194,6 @@ export function createSessionManager(): SessionManager {
     }
     try { session.stream?.end(); session.client?.end(); } catch {}
     sshSessions.delete(session.id);
-    broadcastHealthSnapshots();
   }
 
   function scheduleSessionDisconnect(session: SSHSession, delayMs: number) {
@@ -254,7 +253,6 @@ export function createSessionManager(): SessionManager {
 
   function broadcastSshLatency(session: SSHSession, latencyMs: number) {
     session.sshLatencyMs = latencyMs;
-    broadcastHealthSnapshots();
   }
 
   function buildHealthSnapshot(sys: SysClient): HealthSnapshot {
@@ -287,8 +285,6 @@ export function createSessionManager(): SessionManager {
       },
     };
   }
-
-  function broadcastHealthSnapshots() {}
 
   function handleSysConnection(ws: WebSocket, windowId: string) {
     (ws as any).isAlive = true;
@@ -569,7 +565,6 @@ export function createSessionManager(): SessionManager {
           sshSessions.set(sessionId, session);
           startSessionLatencyProbe(session);
           scheduleSessionDisconnect(session, SESSION_ATTACH_GRACE_MS);
-          broadcastHealthSnapshots();
 
           stream.on('data', (data: Buffer) => {
             session.history.push(data);
@@ -898,7 +893,6 @@ export function createSessionManager(): SessionManager {
         if (existingSession.attachedSockets.size === 0) {
           scheduleSessionDisconnect(existingSession, keepAliveMs);
         }
-        broadcastHealthSnapshots();
       });
 
       ws.on('error', () => {
