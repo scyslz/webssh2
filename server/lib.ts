@@ -263,8 +263,8 @@ export function verifyAuthToken(token: string | undefined, config: AppConfig) {
   const [payload, sig] = token.split('.');
   if (!payload || !sig) return false;
   const expected = crypto.createHmac('sha256', AUTH_TOKEN_SECRET).update(payload).digest('base64url');
-  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return false;
   try {
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return false;
     const decoded = JSON.parse(Buffer.from(payload, 'base64url').toString('utf-8'));
     if (decoded.exp < Date.now()) return false;
     return decoded.u === config.authUsername && decoded.p === config.authPasswordHash;
