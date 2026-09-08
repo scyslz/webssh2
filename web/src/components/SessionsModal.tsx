@@ -3,6 +3,7 @@ import { X, Server, Trash2, ExternalLink, Activity, Radio } from 'lucide-react';
 import { SessionHealth } from '../sysClient';
 import { SSHTab } from '../types';
 import { apiFetch, apiUrl } from '../api';
+import { ConfirmDialog } from './ConfirmDialog';
 
 interface SessionsModalProps {
   isOpen: boolean;
@@ -25,8 +26,8 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
 }) => {
   const isLight = theme === 'light';
   const [killedIds, setKilledIds] = useState<Set<string>>(new Set());
+  const [pendingKill, setPendingKill] = useState<SessionHealth | null>(null);
 
-  // 清理 killedIds（当 sessions 更新时）
   useEffect(() => {
     setKilledIds((prev) => {
       const next = new Set<string>();
@@ -36,6 +37,10 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
       return next;
     });
   }, [sessions]);
+
+  useEffect(() => {
+    if (!isOpen) setPendingKill(null);
+  }, [isOpen]);
 
   const tabIds = new Set(tabs.map((t) => t.id));
   const tabTitles = new Map(tabs.map((t) => [t.id, t.title]));
@@ -86,7 +91,6 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
   };
 
   const handleKillSession = async (sessionId: string) => {
-    // 乐观隐藏
     setKilledIds((prev) => new Set(prev).add(sessionId));
     try {
       await apiFetch(apiUrl('/ssh/sessions/kill'), {
@@ -96,13 +100,23 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
       });
       onKillSession(sessionId);
     } catch (err) {
-      // 失败时恢复
       setKilledIds((prev) => {
         const next = new Set(prev);
         next.delete(sessionId);
         return next;
       });
     }
+  };
+
+  const requestKillSession = (sess: SessionHealth) => {
+    setPendingKill(sess);
+  };
+
+  const confirmKillSession = () => {
+    if (!pendingKill) return;
+    const sessionId = pendingKill.sessionId;
+    setPendingKill(null);
+    handleKillSession(sessionId);
   };
 
   if (!isOpen) return null;
@@ -210,7 +224,7 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
                       </button>
 
                       <button
-                        onClick={() => handleKillSession(sess.sessionId)}
+                        onClick={() => requestKillSession(sess)}
                         className={`p-1.5 rounded-md border transition cursor-pointer ${
                           isLight
                             ? 'hover:bg-rose-100 hover:border-rose-300 text-rose-600 border-slate-300'
@@ -236,6 +250,24 @@ export const SessionsModal: React.FC<SessionsModalProps> = ({
           <span className="text-slate-400">Active sessions persist in backend container memory &middot; Auto-refreshed via /sys</span>
         </div>
       </div>
+
+      <ConfirmDialog
+        isOpen={!!pendingKill}
+        title="Terminate session"
+        message={
+          <>
+            Terminate SSH session{' '}
+            <span className="font-mono font-bold">
+              {pendingKill?.title || `${pendingKill?.username}@${pendingKill?.host}:${pendingKill?.port}`}
+            </span>
+            ? The remote connection will be closed.
+          </>
+        }
+        confirmLabel="Terminate"
+        theme={theme}
+        onConfirm={confirmKillSession}
+        onCancel={() => setPendingKill(null)}
+      />
     </div>
   );
 };

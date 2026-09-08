@@ -1,5 +1,6 @@
 import React from 'react';
 import { CornerDownLeft } from 'lucide-react';
+import { KeepFocusButton } from './KeepFocusButton';
 
 interface QuickKeyBarProps {
   isLight: boolean;
@@ -25,6 +26,7 @@ export const QuickKeyBar: React.FC<QuickKeyBarProps> = ({
   const btnBg = isLight
     ? 'bg-white hover:bg-slate-200 text-slate-700 border-slate-300'
     : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700';
+  const keyClass = `px-1.5 py-0.5 h-5.5 rounded text-[10px] font-mono font-semibold border transition cursor-pointer flex items-center justify-center shrink-0 ${btnBg}`;
 
   return (
     <div
@@ -33,93 +35,65 @@ export const QuickKeyBar: React.FC<QuickKeyBarProps> = ({
       }`}
       style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
     >
-      <button
-        onClick={() => sendKeyToTerminal('\x1b')}
-        className={`px-1.5 py-0.5 h-5.5 rounded text-[10px] font-mono font-semibold border transition cursor-pointer flex items-center justify-center shrink-0 ${btnBg}`}
-      >
+      <KeepFocusButton onPress={() => sendKeyToTerminal('\x1b')} className={keyClass}>
         Esc
-      </button>
-      <button
-        onClick={() => sendKeyToTerminal('\t')}
-        className={`px-1.5 py-0.5 h-5.5 rounded text-[10px] font-mono font-semibold border transition cursor-pointer flex items-center justify-center shrink-0 ${btnBg}`}
-      >
+      </KeepFocusButton>
+      <KeepFocusButton onPress={() => sendKeyToTerminal('\t')} className={keyClass}>
         Tab
-      </button>
+      </KeepFocusButton>
 
       <div className={`h-2.5 w-[1px] shrink-0 my-auto ${isLight ? 'bg-slate-300' : 'bg-slate-800'}`} />
 
-      <button
-        onClick={onCtrlToggle}
+      <KeepFocusButton
+        onPress={onCtrlToggle}
         className={`px-1.5 py-0.5 h-5.5 rounded text-[10px] font-bold font-mono border transition cursor-pointer flex items-center justify-center shrink-0 ${
           ctrlActive ? 'bg-rose-600 text-white border-rose-500 shadow-xs' : btnBg
         }`}
       >
         Ctrl
-      </button>
+      </KeepFocusButton>
 
-      <button
-        onClick={onAltToggle}
+      <KeepFocusButton
+        onPress={onAltToggle}
         className={`px-1.5 py-0.5 h-5.5 rounded text-[10px] font-bold font-mono border transition cursor-pointer flex items-center justify-center shrink-0 ${
           altActive ? 'bg-amber-600 text-white border-amber-500 shadow-xs' : btnBg
         }`}
       >
         Alt
-      </button>
+      </KeepFocusButton>
 
-      <button
-        onClick={onShiftToggle}
+      <KeepFocusButton
+        onPress={onShiftToggle}
         className={`px-1.5 py-0.5 h-5.5 rounded text-[10px] font-bold font-mono border transition cursor-pointer flex items-center justify-center shrink-0 ${
           shiftActive ? 'bg-purple-600 text-white border-purple-500 shadow-xs' : btnBg
         }`}
       >
         Shift
-      </button>
+      </KeepFocusButton>
 
       <div className={`h-2.5 w-[1px] shrink-0 my-auto ${isLight ? 'bg-slate-300' : 'bg-slate-800'}`} />
 
-      <button
-        onClick={() => sendKeyToTerminal('\x1b[A')}
-        className={`px-1.5 py-0.5 h-5.5 rounded text-[10px] font-semibold border transition cursor-pointer flex items-center justify-center shrink-0 ${btnBg}`}
-        title="Arrow Up"
-      >
+      <KeepFocusButton onPress={() => sendKeyToTerminal('\x1b[A')} className={keyClass} title="Arrow Up">
         ▲
-      </button>
-      <button
-        onClick={() => sendKeyToTerminal('\x1b[B')}
-        className={`px-1.5 py-0.5 h-5.5 rounded text-[10px] font-semibold border transition cursor-pointer flex items-center justify-center shrink-0 ${btnBg}`}
-        title="Arrow Down"
-      >
+      </KeepFocusButton>
+      <KeepFocusButton onPress={() => sendKeyToTerminal('\x1b[B')} className={keyClass} title="Arrow Down">
         ▼
-      </button>
-      <button
-        onClick={() => sendKeyToTerminal('\x1b[D')}
-        className={`px-1.5 py-0.5 h-5.5 rounded text-[10px] font-semibold border transition cursor-pointer flex items-center justify-center shrink-0 ${btnBg}`}
-        title="Arrow Left"
-      >
+      </KeepFocusButton>
+      <KeepFocusButton onPress={() => sendKeyToTerminal('\x1b[D')} className={keyClass} title="Arrow Left">
         ◀
-      </button>
-      <button
-        onClick={() => sendKeyToTerminal('\x1b[C')}
-        className={`px-1.5 py-0.5 h-5.5 rounded text-[10px] font-semibold border transition cursor-pointer flex items-center justify-center shrink-0 ${btnBg}`}
-        title="Arrow Right"
-      >
+      </KeepFocusButton>
+      <KeepFocusButton onPress={() => sendKeyToTerminal('\x1b[C')} className={keyClass} title="Arrow Right">
         ▶
-      </button>
+      </KeepFocusButton>
 
       <div className={`h-2.5 w-[1px] shrink-0 my-auto ${isLight ? 'bg-slate-300' : 'bg-slate-800'}`} />
 
-      <button
-        onClick={() => sendKeyToTerminal('\x7f')}
-        className={`px-1.5 py-0.5 h-5.5 rounded text-[10px] font-mono font-semibold border transition cursor-pointer flex items-center justify-center shrink-0 ${btnBg}`}
-      >
+      <KeepFocusButton onPress={() => sendKeyToTerminal('\x7f')} className={keyClass}>
         Del
-      </button>
-      <button
-        onClick={() => sendKeyToTerminal('\r')}
-        className={`px-1.5 py-0.5 h-5.5 rounded text-[10px] font-mono font-semibold border transition cursor-pointer flex items-center justify-center shrink-0 ${btnBg}`}
-      >
+      </KeepFocusButton>
+      <KeepFocusButton onPress={() => sendKeyToTerminal('\r')} className={keyClass}>
         <CornerDownLeft className="w-3 h-3" />
-      </button>
+      </KeepFocusButton>
     </div>
   );
 };

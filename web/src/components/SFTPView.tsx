@@ -23,6 +23,7 @@ import {
   AlertCircle,
   FileUp,
 } from 'lucide-react';
+import { ConfirmDialog } from './ConfirmDialog';
 
 interface SFTPViewProps {
   sshInfo: SSHInfo;
@@ -54,6 +55,7 @@ export const SFTPView: React.FC<SFTPViewProps> = ({ sshInfo, sessionId, initialP
 
   const [uploading, setUploading] = useState<boolean>(false);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  const [pendingDeleteItem, setPendingDeleteItem] = useState<FileItem | null>(null);
 
   const sftpRef = useRef<SftpWSClient | null>(null);
   const closeTimerRef = useRef<number | null>(null);
@@ -158,8 +160,7 @@ export const SFTPView: React.FC<SFTPViewProps> = ({ sshInfo, sessionId, initialP
     window.open(downloadUrl, '_blank');
   };
 
-  const handleDelete = async (item: FileItem) => {
-    if (!window.confirm(`Are you sure you want to delete "${item.name}"?`)) return;
+  const executeDelete = async (item: FileItem) => {
     const itemPath = currentPath.endsWith('/') ? `${currentPath}${item.name}` : `${currentPath}/${item.name}`;
     try {
       if (sessionId) {
@@ -172,8 +173,19 @@ export const SFTPView: React.FC<SFTPViewProps> = ({ sshInfo, sessionId, initialP
         const res = await apiFetch(apiUrl('/file/delete'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId, path: itemPath, isDir: item.isDir }) });
         const json = await res.json();
         if (json.msg === 'success') fetchFileList(currentPath); else alert('Delete failed: ' + json.msg);
-      } catch (e2: any) { alert('Delete error: ' + (e2.message || err.message)); }
+        } catch (e2: any) { alert('Delete error: ' + (e2.message || err.message)); }
     }
+  };
+
+  const handleDelete = (item: FileItem) => {
+    setPendingDeleteItem(item);
+  };
+
+  const confirmDelete = () => {
+    if (!pendingDeleteItem) return;
+    const item = pendingDeleteItem;
+    setPendingDeleteItem(null);
+    executeDelete(item);
   };
 
   const handleMkdir = async () => {
@@ -638,6 +650,20 @@ export const SFTPView: React.FC<SFTPViewProps> = ({ sshInfo, sessionId, initialP
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        isOpen={!!pendingDeleteItem}
+        title="Delete file"
+        message={
+          <>
+            Delete <span className="font-mono font-bold">{pendingDeleteItem?.name}</span>
+            {pendingDeleteItem?.isDir ? ' and its contents' : ''}? This cannot be undone.
+          </>
+        }
+        theme={theme}
+        onConfirm={confirmDelete}
+        onCancel={() => setPendingDeleteItem(null)}
+      />
     </div>
   );
 };

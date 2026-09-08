@@ -459,7 +459,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   };
 
   const sendKeyToTerminal = (data: string) => {
-    sendRawToTerminal(processInputData(data));
+    sendRawToTerminal(processInputData(data), false);
   };
 
   const sendPasteToTerminal = (text: string, focusTerminal = true) => {

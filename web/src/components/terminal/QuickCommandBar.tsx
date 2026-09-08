@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Pencil } from 'lucide-react';
 import { QuickCommandItem, defaultQuickCommands } from '../../types';
 import { QuickCommandEditor } from './QuickCommandEditor';
+import { KeepFocusButton } from './KeepFocusButton';
 
 interface QuickCommandBarProps {
   isLight: boolean;
@@ -50,14 +51,14 @@ export const QuickCommandBar: React.FC<QuickCommandBarProps> = ({
         }`}
       >
         {visibleCommands.map((cmd) => (
-          <button
+          <KeepFocusButton
             key={cmd.id}
-            onClick={() => sendKeyToTerminal(parseCommand(cmd.cmd))}
+            onPress={() => sendKeyToTerminal(parseCommand(cmd.cmd))}
             disabled={!(connected || offlineSuspended)}
             className={`px-2 py-0.5 rounded text-[10px] font-mono border transition cursor-pointer shrink-0 whitespace-nowrap disabled:opacity-40 ${btnBg}`}
           >
             {cmd.label}
-          </button>
+          </KeepFocusButton>
         ))}
 
         <button

@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect, useLayoutEffect } from 'react';
 import { SSHTab } from '../types';
 import { sessionGet } from '../storage';
 import { FolderTree, X, Columns, Pencil, Copy, Trash2 } from 'lucide-react';
+import { ConfirmDialog } from './ConfirmDialog';
 
 interface TabsProps {
   tabs: SSHTab[];
@@ -34,8 +35,6 @@ export const Tabs: React.FC<TabsProps> = ({
   onToggleView,
   theme,
 }) => {
-  if (tabs.length === 0) return null;
-
   const isLight = theme === 'light';
   const currentTab = tabs.find((t) => t.id === activeTabId);
   const offlineHoldEnabled = typeof window !== 'undefined' && sessionGet('webssh_offline_hold') === '1';
@@ -45,6 +44,7 @@ export const Tabs: React.FC<TabsProps> = ({
   const editingCanceledRef = useRef(false);
   const editingValueRef = useRef('');
   const [contextMenu, setContextMenu] = useState<ContextMenu | null>(null);
+  const [pendingClose, setPendingClose] = useState<{ type: 'one' | 'others' | 'all'; tabId?: string } | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -116,12 +116,30 @@ export const Tabs: React.FC<TabsProps> = ({
     }
   };
 
+  const confirmPendingClose = () => {
+    if (!pendingClose) return;
+    if (pendingClose.type === 'one' && pendingClose.tabId) onCloseTab(pendingClose.tabId);
+    else if (pendingClose.type === 'others' && pendingClose.tabId) onCloseOtherTabs?.(pendingClose.tabId);
+    else if (pendingClose.type === 'all') onCloseAllTabs?.();
+    setPendingClose(null);
+  };
+
+  const pendingCloseTitle = pendingClose?.tabId ? tabs.find((t) => t.id === pendingClose.tabId)?.title : '';
+  const pendingCloseCopy =
+    pendingClose?.type === 'one'
+      ? { title: 'Close tab', message: <>Close tab <span className="font-mono font-bold">{pendingCloseTitle}</span>? The SSH session will be terminated.</>, confirmLabel: 'Close' }
+      : pendingClose?.type === 'others'
+      ? { title: 'Close other tabs', message: 'Close all other tabs? Their SSH sessions will be terminated.', confirmLabel: 'Close others' }
+      : { title: 'Close all tabs', message: 'Close all tabs? All SSH sessions will be terminated.', confirmLabel: 'Close all' };
+
   const handleTouchMove = () => {
     if (longPressTimerRef.current) {
       clearTimeout(longPressTimerRef.current);
       longPressTimerRef.current = null;
     }
   };
+
+  if (tabs.length === 0) return null;
 
   return (
     <>
@@ -186,7 +204,7 @@ export const Tabs: React.FC<TabsProps> = ({
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
-                    onCloseTab(tab.id);
+                    setPendingClose({ type: 'one', tabId: tab.id });
                   }}
                   className={`opacity-100 md:opacity-0 md:group-hover:opacity-100 rounded p-0.5 transition shrink-0 ${
                     isLight
@@ -289,7 +307,7 @@ export const Tabs: React.FC<TabsProps> = ({
           <div className={`mx-2 my-0.5 border-t ${isLight ? 'border-slate-200' : 'border-slate-700'}`} />
           <button
             onClick={() => {
-              onCloseOtherTabs?.(contextMenu.tabId);
+              setPendingClose({ type: 'others', tabId: contextMenu.tabId });
               setContextMenu(null);
             }}
             className={`flex items-center gap-2 w-full text-left px-2.5 py-1.5 transition cursor-pointer ${
@@ -301,7 +319,7 @@ export const Tabs: React.FC<TabsProps> = ({
           </button>
           <button
             onClick={() => {
-              onCloseAllTabs?.();
+              setPendingClose({ type: 'all' });
               setContextMenu(null);
             }}
             className={`flex items-center gap-2 w-full text-left px-2.5 py-1.5 transition cursor-pointer ${
@@ -313,6 +331,16 @@ export const Tabs: React.FC<TabsProps> = ({
           </button>
         </div>
       )}
+
+      <ConfirmDialog
+        isOpen={!!pendingClose}
+        title={pendingCloseCopy.title}
+        message={pendingCloseCopy.message}
+        confirmLabel={pendingCloseCopy.confirmLabel}
+        theme={theme}
+        onConfirm={confirmPendingClose}
+        onCancel={() => setPendingClose(null)}
+      />
     </>
   );
 };

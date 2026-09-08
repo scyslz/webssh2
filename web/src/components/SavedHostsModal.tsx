@@ -1,6 +1,7 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { SSHInfo } from '../types';
 import { X, Server, Trash2, Play, Lock, Key, Pencil } from 'lucide-react';
+import { ConfirmDialog } from './ConfirmDialog';
 
 interface SavedHostsModalProps {
   isOpen: boolean;
@@ -21,9 +22,33 @@ export const SavedHostsModal: React.FC<SavedHostsModalProps> = ({
   onEditHost,
   theme,
 }) => {
+  const [pendingDeleteIndex, setPendingDeleteIndex] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!isOpen) setPendingDeleteIndex(null);
+  }, [isOpen]);
+
   if (!isOpen) return null;
 
   const isLight = theme === 'light';
+  const pendingHost = pendingDeleteIndex !== null ? savedHosts[pendingDeleteIndex] : undefined;
+  const pendingLabel = pendingHost
+    ? pendingHost.name || `${pendingHost.username}@${pendingHost.host}:${pendingHost.port || 22}`
+    : '';
+
+  const requestDelete = (index: number) => {
+    setPendingDeleteIndex(index);
+  };
+
+  const cancelDelete = () => {
+    setPendingDeleteIndex(null);
+  };
+
+  const confirmDelete = () => {
+    if (pendingDeleteIndex === null) return;
+    onDeleteHost(pendingDeleteIndex);
+    setPendingDeleteIndex(null);
+  };
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-2 sm:p-4 z-50 select-none">
@@ -116,7 +141,7 @@ export const SavedHostsModal: React.FC<SavedHostsModalProps> = ({
                     <span className="hidden sm:inline">Connect</span>
                   </button>
                   <button
-                    onClick={() => onDeleteHost(idx)}
+                    onClick={() => requestDelete(idx)}
                     className={`p-1.5 rounded transition ${
                       isLight ? 'hover:bg-slate-200 text-slate-400 hover:text-rose-600' : 'hover:bg-slate-800 text-slate-500 hover:text-rose-400'
                     }`}
@@ -135,6 +160,19 @@ export const SavedHostsModal: React.FC<SavedHostsModalProps> = ({
           <span className="text-[11px] text-slate-400">Saved connection profiles</span>
         </div>
       </div>
+
+      <ConfirmDialog
+        isOpen={!!pendingHost}
+        title="Delete saved SSH"
+        message={
+          <>
+            Delete saved connection <span className="font-mono font-bold">{pendingLabel}</span>? This cannot be undone.
+          </>
+        }
+        theme={theme}
+        onConfirm={confirmDelete}
+        onCancel={cancelDelete}
+      />
     </div>
   );
 };
