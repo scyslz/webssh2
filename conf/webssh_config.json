@@ -10,6 +10,8 @@
   "authUsername": "",
   "showQuickCmds": true,
   "showKeyBar": true,
+  "keyBarSize": 24,
+  "hapticFeedback": true,
   "quickCommands": [
     {
       "id": "ls",

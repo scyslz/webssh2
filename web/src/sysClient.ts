@@ -41,6 +41,8 @@ function createSysClient() {
   let started = false;
   let reconnectAttempts = 0;
   let connectionState: ConnectionState = 'closed';
+  let pingSentAt = 0;
+  let smoothedRtt: number | null = null;
 
   function setState(state: ConnectionState) {
     if (connectionState === state) return;
@@ -67,15 +69,19 @@ function createSysClient() {
       }
       ws = null;
     }
+    pingSentAt = 0;
+  }
+
+  function sendPing() {
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    pingSentAt = performance.now();
+    ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
   }
 
   function startPing() {
     if (pingTimer !== null) clearInterval(pingTimer);
-    pingTimer = window.setInterval(() => {
-      if (ws?.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }));
-      }
-    }, 5000);
+    sendPing();
+    pingTimer = window.setInterval(sendPing, 5000);
   }
 
   function scheduleReconnect() {
@@ -100,6 +106,7 @@ function createSysClient() {
 
     socket.onopen = () => {
       reconnectAttempts = 0;
+      pingSentAt = 0;
       setState('open');
       startPing();
     };
@@ -109,7 +116,16 @@ function createSysClient() {
         const data = JSON.parse(event.data);
         if (data.type === 'pong' && data.snapshot) {
           const snap = data.snapshot as HealthSnapshot;
-          if (typeof data.clientRttMs === 'number') snap.clientRttMs = data.clientRttMs;
+          if (pingSentAt > 0) {
+            const sample = Math.max(0, performance.now() - pingSentAt);
+            pingSentAt = 0;
+            smoothedRtt = smoothedRtt === null ? sample : smoothedRtt * 0.7 + sample * 0.3;
+            snap.clientRttMs = Math.round(smoothedRtt);
+          } else if (smoothedRtt !== null) {
+            snap.clientRttMs = Math.round(smoothedRtt);
+          } else {
+            snap.clientRttMs = null;
+          }
           lastSnapshot = snap;
           listeners.forEach((l) => l(lastSnapshot!));
         }

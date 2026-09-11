@@ -74,5 +74,7 @@ export interface WebSSHConfig {
   authPassword: string;
   showQuickCmds: boolean;
   showKeyBar: boolean;
+  keyBarSize: number;
+  hapticFeedback: boolean;
   quickCommands?: QuickCommandItem[];
 }

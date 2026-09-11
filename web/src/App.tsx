@@ -168,6 +168,8 @@ export default function App() {
     authPassword: '',
     showQuickCmds: true,
     showKeyBar: true,
+    keyBarSize: 24,
+    hapticFeedback: true,
     quickCommands: defaultQuickCommands,
   });
 

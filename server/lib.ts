@@ -41,6 +41,10 @@ export interface AppConfig {
   authUsername?: string;
   authPassword?: string;
   authPasswordHash?: string;
+  showQuickCmds?: boolean;
+  showKeyBar?: boolean;
+  keyBarSize?: number;
+  hapticFeedback?: boolean;
   quickCommands?: QuickCommandConfig[];
 }
 

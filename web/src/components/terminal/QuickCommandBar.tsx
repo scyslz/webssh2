@@ -3,6 +3,7 @@ import { Pencil } from 'lucide-react';
 import { QuickCommandItem, defaultQuickCommands } from '../../types';
 import { QuickCommandEditor } from './QuickCommandEditor';
 import { KeepFocusButton } from './KeepFocusButton';
+import { keyBarMetrics } from '../../keyBar';
 
 interface QuickCommandBarProps {
   isLight: boolean;
@@ -11,6 +12,8 @@ interface QuickCommandBarProps {
   sendKeyToTerminal: (key: string) => void;
   commands?: QuickCommandItem[];
   onSave?: (cmds: QuickCommandItem[]) => void;
+  buttonSize?: number;
+  haptic?: boolean;
 }
 
 const parseCommand = (raw: string): string => {
@@ -34,8 +37,11 @@ export const QuickCommandBar: React.FC<QuickCommandBarProps> = ({
   sendKeyToTerminal,
   commands = defaultQuickCommands,
   onSave,
+  buttonSize,
+  haptic,
 }) => {
   const [editorOpen, setEditorOpen] = useState(false);
+  const m = keyBarMetrics(buttonSize);
 
   const visibleCommands = commands.filter((c) => c.enabled);
 
@@ -46,16 +52,31 @@ export const QuickCommandBar: React.FC<QuickCommandBarProps> = ({
   return (
     <>
       <div
-        className={`border-b px-2 py-1 flex items-center gap-1 overflow-x-auto no-scrollbar transition-colors ${
+        className={`keybar-scroll border-b flex items-center overflow-x-auto no-scrollbar transition-colors ${
           isLight ? 'bg-slate-50 border-slate-200' : 'bg-slate-900/80 border-slate-800'
         }`}
+        style={{
+          gap: m.gap,
+          paddingLeft: m.barPadX,
+          paddingRight: m.barPadX,
+          paddingTop: m.barPadY,
+          paddingBottom: m.barPadY,
+        }}
       >
         {visibleCommands.map((cmd) => (
           <KeepFocusButton
             key={cmd.id}
+            haptic={haptic}
             onPress={() => sendKeyToTerminal(parseCommand(cmd.cmd))}
             disabled={!(connected || offlineSuspended)}
-            className={`px-2 py-0.5 rounded text-[10px] font-mono border transition cursor-pointer shrink-0 whitespace-nowrap disabled:opacity-40 ${btnBg}`}
+            className={`rounded font-mono border transition cursor-pointer shrink-0 whitespace-nowrap disabled:opacity-40 flex items-center justify-center ${btnBg}`}
+            style={{
+              height: m.height,
+              paddingLeft: m.padX,
+              paddingRight: m.padX,
+              fontSize: m.fontSize,
+              lineHeight: 1,
+            }}
           >
             {cmd.label}
           </KeepFocusButton>
@@ -63,12 +84,13 @@ export const QuickCommandBar: React.FC<QuickCommandBarProps> = ({
 
         <button
           onClick={() => setEditorOpen(true)}
-          className={`ml-auto p-1 rounded transition cursor-pointer shrink-0 ${
+          className={`ml-auto rounded transition cursor-pointer shrink-0 flex items-center justify-center ${
             isLight ? 'text-slate-400 hover:text-slate-600 hover:bg-slate-200' : 'text-slate-500 hover:text-slate-300 hover:bg-slate-800'
           }`}
+          style={{ width: m.height, height: m.height }}
           title="Edit Quick Commands"
         >
-          <Pencil className="w-3.5 h-3.5" />
+          <Pencil style={{ width: m.icon, height: m.icon }} />
         </button>
       </div>
 

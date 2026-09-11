@@ -75,6 +75,18 @@ body {
   }
 }
 
+.keybar-scroll {
+  touch-action: pan-x;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+}
+
+.keybar-scroll button {
+  touch-action: pan-x;
+}
+
 .no-scrollbar {
   scrollbar-width: none;
   -ms-overflow-style: none;

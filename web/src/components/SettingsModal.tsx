@@ -1,7 +1,8 @@
 import React from 'react';
 import { WebSSHConfig } from '../types';
 import { themeOptions, isLightTheme } from '../theme';
-import { X, Settings, Monitor, Type, Clock, LogOut, Lock, Shield } from 'lucide-react';
+import { X, Settings, Monitor, Type, Clock, LogOut, Lock, Shield, Smartphone, Vibrate } from 'lucide-react';
+import { KEY_BAR_SIZE_MAX, KEY_BAR_SIZE_MIN, clampKeyBarSize } from '../keyBar';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -144,6 +145,30 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <span>Show Quick Keys</span>
               </label>
             </div>
+            <div>
+              <label className={`block text-xs font-medium mb-1 flex items-center gap-1.5 ${isLight ? 'text-slate-700' : 'text-slate-300'}`}>
+                <Smartphone className="w-3.5 h-3.5 text-sky-500" />
+                <span>Key Bar Size ({clampKeyBarSize(config.keyBarSize)}px)</span>
+              </label>
+              <input
+                type="range"
+                min={KEY_BAR_SIZE_MIN}
+                max={KEY_BAR_SIZE_MAX}
+                value={clampKeyBarSize(config.keyBarSize)}
+                onChange={(e) => onChangeConfig({ ...config, keyBarSize: Number(e.target.value) })}
+                className="w-full accent-emerald-500 cursor-pointer"
+              />
+            </div>
+            <label className={`flex items-center gap-2 text-xs cursor-pointer ${isLight ? 'text-slate-700' : 'text-slate-300'}`}>
+              <input
+                type="checkbox"
+                checked={config.hapticFeedback !== false}
+                onChange={(e) => onChangeConfig({ ...config, hapticFeedback: e.target.checked })}
+                className="rounded border-slate-400 bg-white text-emerald-600 focus:ring-0"
+              />
+              <Vibrate className="w-3.5 h-3.5 text-rose-500" />
+              <span>Haptic feedback on mobile tap</span>
+            </label>
           </div>
 
           <div className={`pt-2 border-t space-y-3 ${isLight ? 'border-slate-200' : 'border-slate-800'}`}>

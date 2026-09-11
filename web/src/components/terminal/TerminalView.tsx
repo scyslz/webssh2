@@ -1255,8 +1255,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
           const session = snapshot.sessions.find((s) => s.sessionId === sessionId);
           if (session) sshLatency = session.sshLatencyMs;
         }
-        setSshLatencyMs(sshLatency);
-        setClientLatencyMs(snapshot.clientRttMs);
+        setSshLatencyMs(typeof sshLatency === 'number' && sshLatency >= 0 ? sshLatency : null);
+        setClientLatencyMs(snapshot.clientRttMs >= 0 ? snapshot.clientRttMs : null);
       }
     });
     const unsubState = sysClient.subscribeState((state) => {
@@ -1323,7 +1323,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       cancelAnimationFrame(raf);
       clearTimeout(timer);
     };
-  }, [showKeyBar, connected]);
+  }, [showKeyBar, showQuickCmds, connected, config.keyBarSize]);
 
   const handleClearTerminal = () => {
     terminalRef.current?.clear();
@@ -1372,6 +1372,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         sendKeyToTerminal={sendKeyToTerminal}
         commands={config.quickCommands}
         onSave={onQuickCommandsChange}
+        buttonSize={config.keyBarSize}
+        haptic={config.hapticFeedback !== false}
       />
       )}
 
@@ -1413,6 +1415,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
           onAltToggle={() => setAltActive(!altActive)}
           onShiftToggle={() => setShiftActive(!shiftActive)}
           sendKeyToTerminal={sendKeyToTerminal}
+          buttonSize={config.keyBarSize}
+          haptic={config.hapticFeedback !== false}
         />
       )}
 

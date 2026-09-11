@@ -28,7 +28,8 @@ interface TerminalToolbarProps {
   onRecoverSession: () => void;
 }
 
-const formatLatency = (value: number | null) => (typeof value === 'number' ? `${Math.round(value)}` : '--');
+const formatLatency = (value: number | null) =>
+  typeof value === 'number' && Number.isFinite(value) && value >= 0 ? `${Math.round(value)}` : '--';
 
 const getLatencyToneClass = (value: number | null, isLight: boolean) => {
   if (typeof value !== 'number') {

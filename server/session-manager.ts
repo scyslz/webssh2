@@ -304,13 +304,9 @@ export function createSessionManager(): SessionManager {
         const data = JSON.parse(msg.toString());
         if (data.type === 'ping') {
           sys.lastPingTs = Date.now();
-          const rtt = typeof data.ts === 'number' ? Date.now() - data.ts : null;
-          if (rtt !== null) {
-            sys.clientRttMs = rtt;
-          }
           if (ws.readyState === WebSocket.OPEN) {
             const snapshot = buildHealthSnapshot(sys);
-            ws.send(JSON.stringify({ type: 'pong', ts: data.ts, clientRttMs: sys.clientRttMs, snapshot }));
+            ws.send(JSON.stringify({ type: 'pong', ts: data.ts, snapshot }));
           }
         }
       } catch {
