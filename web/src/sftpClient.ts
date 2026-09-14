@@ -1,6 +1,6 @@
 import { wsUrl } from './api';
 
-type SftpRequest = { id: string; type: 'list'|'read'|'write'|'mkdir'|'delete'|'ping'; path?: string; content?: string; isDir?: boolean; ts?: number };
+type SftpRequest = { id: string; type: 'list'|'read'|'write'|'mkdir'|'delete'|'rename'|'move'|'copy'|'ping'; path?: string; to?: string; content?: string; isDir?: boolean; ts?: number };
 type SftpResponse = { id?: string; type: string; data?: any; msg?: string; ts?: number };
 
 export class SftpWSClient {

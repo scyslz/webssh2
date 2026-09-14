@@ -18,6 +18,8 @@ import {
   sshSummary,
   formatByteSize,
 } from './lib.ts';
+import { copyEntry, moveEntry, removeEntry, type OpContext } from './sftp-ops.ts';
+import { createExecRunner } from './remote-exec.ts';
 
 interface SSHSession {
   id: string;
@@ -350,6 +352,9 @@ export function createSessionManager(): SessionManager {
 
     const send = (obj: any) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); };
 
+    // 复制 / 跨盘移动 / 递归删除优先走 shell（数据不出远端），探测不到 shell 时自动回退 SFTP
+    const exec = createExecRunner(sshClient);
+
     const ensureSftp = (cb: (s: any) => void) => {
       if (sftpReady && sftp) return cb(sftp);
       pending.push(cb);
@@ -377,6 +382,7 @@ export function createSessionManager(): SessionManager {
       const id = data.id;
       const reply = (payload: any) => send({ id, ...payload });
       ensureSftp((h: any) => {
+        const ctx: OpContext = { sftp: h, exec };
         try {
           switch (data.type) {
             case 'list': {
@@ -390,6 +396,9 @@ export function createSessionManager(): SessionManager {
                     isDir: item.attrs.isDirectory(),
                     size: item.attrs.isDirectory() ? String(item.attrs.size) : formatByteSize(item.attrs.size),
                     rawSize: item.attrs.size,
+                    // mtimeSec 是 epoch 秒，前端用它按**浏览器本地时区**格式化；
+                    // modifyTime 保留为兼容用的 UTC 字符串（旧客户端/旧缓存可能还在读）
+                    mtimeSec: item.attrs.mtime,
                     modifyTime: new Date(item.attrs.mtime * 1000).toISOString().replace('T', ' ').substring(0, 19),
                   }));
                   fileList.sort((a: any, b: any) => {
@@ -431,8 +440,25 @@ export function createSessionManager(): SessionManager {
               break;
             }
             case 'delete': {
-              if (data.isDir) h.rmdir(data.path, (e: any) => e ? reply({ type: 'error', msg: e.message }) : reply({ type: 'result' }));
-              else h.unlink(data.path, (e: any) => e ? reply({ type: 'error', msg: e.message }) : reply({ type: 'result' }));
+              removeEntry(ctx, data.path, !!data.isDir, (e) => e ? reply({ type: 'error', msg: e.message }) : reply({ type: 'result' }));
+              break;
+            }
+            case 'rename': {
+              if (!data.path || !data.to) return reply({ type: 'error', msg: 'Missing path or to' });
+              if (data.path === data.to) return reply({ type: 'result' });
+              h.rename(data.path, data.to, (e: any) => e ? reply({ type: 'error', msg: e.message }) : reply({ type: 'result' }));
+              break;
+            }
+            case 'move': {
+              if (!data.path || !data.to) return reply({ type: 'error', msg: 'Missing path or to' });
+              moveEntry(ctx, data.path, data.to, !!data.isDir, (e?: Error) =>
+                e ? reply({ type: 'error', msg: e.message }) : reply({ type: 'result' }));
+              break;
+            }
+            case 'copy': {
+              if (!data.path || !data.to) return reply({ type: 'error', msg: 'Missing path or to' });
+              copyEntry(ctx, data.path, data.to, !!data.isDir, (e?: Error) =>
+                e ? reply({ type: 'error', msg: e.message }) : reply({ type: 'result' }));
               break;
             }
             default:

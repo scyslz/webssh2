@@ -8,4 +8,5 @@ coverage/
 !.env.example
 .webssh_master_key
 ssh_secrets.json
+.workbuddy/
 

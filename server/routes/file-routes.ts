@@ -1,8 +1,21 @@
 import express from 'express';
 import path from 'path';
-import { ParsedSSHInfo, formatByteSize, safeJson, safeSend, upload } from '../lib.ts';
+import { ParsedSSHInfo, safeJson, safeSend, upload } from '../lib.ts';
 import { SessionManager } from '../session-manager.ts';
 import { connectSSH, resolveSSHInfo } from './shared.ts';
+
+/**
+ * 这里是 SFTP 的 HTTP 通道，只保留二进制传输（下载 / 上传）。
+ *
+ * 文本类操作（list / read / write / mkdir / delete）已经全部走 WebSocket `/sftp`，
+ * 见 `server/session-manager.ts` 的 handleSftpConnection。那部分不再提供 HTTP 版本，
+ * 以免维护两条协议实现。
+ *
+ * 这两个端点不迁移到 WS 的原因：
+ * - 下载依赖 `res.pipe()` 做流式传输，不占 WS 连接，也保留浏览器 `window.open` 的原生下载体验；
+ * - WS 协议现有的 `write` 只接受 UTF-8 字符串，承载二进制需要新增控制帧 + 二进制分片帧，
+ *   且纯 WS 化后大文件必须全量驻留前端内存，移动端反而更差。
+ */
 
 function withSftp<T>(
   sessionManager: SessionManager,
@@ -52,48 +65,6 @@ function endSftp(sftp: any) {
 }
 
 export function registerFileRoutes(app: express.Express, sessionManager: SessionManager) {
-  app.get('/file/list', async (req, res) => {
-    const sshInfoStr = (req.query.sshInfo as string) || '';
-    const sessionId = (req.query.sessionId as string) || '';
-    const requestedPath = (req.query.path as string) || '';
-    try {
-      const config = resolveSSHInfo(sessionManager, sessionId, sshInfoStr);
-      await withSftp(sessionManager, sessionId, config, (sftp, reuse) => {
-        const resolveTarget = (cb: (targetPath: string) => void) => {
-          if (!requestedPath || requestedPath === '.' || requestedPath === '~') {
-            sftp.realpath('.', (realpathErr, absPath) => {
-              if (!realpathErr && absPath) cb(absPath);
-              else cb(config.username === 'root' ? '/root' : `/home/${config.username}`);
-            });
-          } else {
-            cb(requestedPath);
-          }
-        };
-        resolveTarget((dirPath) => {
-          sftp.readdir(dirPath, (readErr, list) => {
-            if (!reuse) endSftp(sftp);
-            if (readErr) return safeJson(res, { msg: readErr.message });
-            const fileList = list.map((item) => ({
-              name: item.filename,
-              isDir: item.attrs.isDirectory(),
-              size: item.attrs.isDirectory() ? String(item.attrs.size) : formatByteSize(item.attrs.size),
-              rawSize: item.attrs.size,
-              modifyTime: new Date(item.attrs.mtime * 1000).toISOString().replace('T', ' ').substring(0, 19),
-            }));
-            fileList.sort((a, b) => {
-              if (a.isDir && !b.isDir) return -1;
-              if (!a.isDir && b.isDir) return 1;
-              return a.name.localeCompare(b.name);
-            });
-            safeJson(res, { msg: 'success', duration: '0ms', data: { path: dirPath, list: fileList } });
-          });
-        });
-      });
-    } catch (err: any) {
-      safeJson(res, { msg: err.message });
-    }
-  });
-
   app.get('/file/download', async (req, res) => {
     const sshInfoStr = (req.query.sshInfo as string) || '';
     const sessionId = (req.query.sessionId as string) || '';
@@ -121,52 +92,6 @@ export function registerFileRoutes(app: express.Express, sessionManager: Session
     }
   });
 
-  app.get('/file/read', async (req, res) => {
-    const sshInfoStr = (req.query.sshInfo as string) || '';
-    const sessionId = (req.query.sessionId as string) || '';
-    const filePath = (req.query.path as string) || '';
-    try {
-      const config = resolveSSHInfo(sessionManager, sessionId, sshInfoStr);
-      await withSftp(sessionManager, sessionId, config, (sftp, reuse) => {
-        const readStream = sftp.createReadStream(filePath);
-        let content = '';
-        readStream.on('data', (chunk) => {
-          content += chunk.toString('utf-8');
-        });
-        readStream.on('end', () => {
-          if (!reuse) endSftp(sftp);
-          safeJson(res, { msg: 'success', data: { content, path: filePath } });
-        });
-        readStream.on('error', (streamErr) => {
-          if (!reuse) endSftp(sftp);
-          safeJson(res, { msg: streamErr.message });
-        });
-      });
-    } catch (err: any) {
-      safeJson(res, { msg: err.message });
-    }
-  });
-
-  app.post('/file/write', async (req, res) => {
-    const { sshInfo: sshInfoStr, sessionId, path: filePath, content } = req.body;
-    try {
-      const config = resolveSSHInfo(sessionManager, sessionId, sshInfoStr);
-      await withSftp(sessionManager, sessionId, config, (sftp, reuse) => {
-        const writeStream = sftp.createWriteStream(filePath);
-        writeStream.end(Buffer.from(content || '', 'utf-8'), () => {
-          if (!reuse) endSftp(sftp);
-          safeJson(res, { msg: 'success' });
-        });
-        writeStream.on('error', (streamErr) => {
-          if (!reuse) endSftp(sftp);
-          safeJson(res, { msg: streamErr.message });
-        });
-      });
-    } catch (err: any) {
-      safeJson(res, { msg: err.message });
-    }
-  });
-
   app.post('/file/upload', upload.single('file'), async (req, res) => {
     const sshInfoStr = (req.body.sshInfo as string) || '';
     const sessionId = (req.body.sessionId as string) || '';
@@ -187,46 +112,6 @@ export function registerFileRoutes(app: express.Express, sessionManager: Session
         writeStream.on('error', (streamErr) => {
           if (!reuse) endSftp(sftp);
           safeJson(res, { msg: streamErr.message });
-        });
-      });
-    } catch (err: any) {
-      safeJson(res, { msg: err.message });
-    }
-  });
-
-  app.post('/file/delete', async (req, res) => {
-    const { sshInfo: sshInfoStr, sessionId, path: itemPath, isDir } = req.body;
-    try {
-      const config = resolveSSHInfo(sessionManager, sessionId, sshInfoStr);
-      await withSftp(sessionManager, sessionId, config, (sftp, reuse) => {
-        if (isDir) {
-          sftp.rmdir(itemPath, (removeErr) => {
-            if (!reuse) endSftp(sftp);
-            if (removeErr) return safeJson(res, { msg: removeErr.message });
-            safeJson(res, { msg: 'success' });
-          });
-        } else {
-          sftp.unlink(itemPath, (unlinkErr) => {
-            if (!reuse) endSftp(sftp);
-            if (unlinkErr) return safeJson(res, { msg: unlinkErr.message });
-            safeJson(res, { msg: 'success' });
-          });
-        }
-      });
-    } catch (err: any) {
-      safeJson(res, { msg: err.message });
-    }
-  });
-
-  app.post('/file/mkdir', async (req, res) => {
-    const { sshInfo: sshInfoStr, sessionId, path: dirPath } = req.body;
-    try {
-      const config = resolveSSHInfo(sessionManager, sessionId, sshInfoStr);
-      await withSftp(sessionManager, sessionId, config, (sftp, reuse) => {
-        sftp.mkdir(dirPath, (mkdirErr) => {
-          if (!reuse) endSftp(sftp);
-          if (mkdirErr) return safeJson(res, { msg: mkdirErr.message });
-          safeJson(res, { msg: 'success' });
         });
       });
     } catch (err: any) {

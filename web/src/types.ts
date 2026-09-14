@@ -15,6 +15,8 @@ export interface FileItem {
   size: string;
   rawSize?: number;
   modifyTime: string;
+  /** mtime 的 epoch 秒；有它时优先按浏览器本地时区格式化（modifyTime 是服务端 UTC 字符串） */
+  mtimeSec?: number;
   isDir: boolean;
 }
 
