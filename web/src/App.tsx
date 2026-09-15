@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { SSHInfo, SSHTab, WebSSHConfig, defaultQuickCommands } from './types';
 import { apiFetch, apiUrl } from './api';
 import { sessionGet, sessionSet, globalGet, globalSet } from './storage';
@@ -56,6 +56,18 @@ export default function App() {
   // 而诊断请求可能带着几十 KB 的终端文本，不该进存储。
   const [aiTabId, setAiTabId] = useState<string | null>(null);
   const [aiRequest, setAiRequest] = useState<AiDiagnoseRequest | null>(null);
+
+  // 命令下发通道：tabId → 「把命令写进该 tab 终端输入行」的函数。
+  // 用 ref 而不是 state：它只在事件回调里被读，进 state 会让整棵树白重渲染；
+  // 「能不能执行」由 tab.connected 单独驱动 UI。
+  const commandSinksRef = useRef<Map<string, (command: string, submit: boolean) => boolean>>(new Map());
+  const registerCommandSink = useCallback(
+    (tabId: string) => (sink: ((command: string, submit: boolean) => boolean) | null) => {
+      if (sink) commandSinksRef.current.set(tabId, sink);
+      else commandSinksRef.current.delete(tabId);
+    },
+    [],
+  );
   const generateTabId = useCallback((existingTabs: SSHTab[]): string => {
     const usedIds = new Set(existingTabs.map((t) => t.id));
     let id: string;
@@ -807,6 +819,7 @@ export default function App() {
                        });
                        setAiTabId(tab.id);
                      }}
+                     onRegisterCommandSink={registerCommandSink(tab.id)}
                   />
                 </div>
 
@@ -832,6 +845,9 @@ export default function App() {
                   <AiPanel
                     theme={config.theme}
                     request={aiRequest}
+                    terminalConnected={Boolean(tab.connected)}
+                    onRunCommand={(command, submit) =>
+                      commandSinksRef.current.get(tab.id)?.(command, submit) ?? false}
                     onClose={() => {
                       setAiTabId(null);
                       setAiRequest(null);

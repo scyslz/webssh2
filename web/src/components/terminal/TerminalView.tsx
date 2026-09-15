@@ -40,6 +40,11 @@ interface TerminalViewProps {
   onQuickCommandsChange?: (cmds: WebSSHConfig['quickCommands']) => void;
   /** 请求 AI 诊断：带上要分析的文本与来源（选区 / 末尾若干行） */
   onAskAi?: (payload: { text: string; source: 'selection' | 'tail' }) => void;
+  /**
+   * 把「向终端写命令」的能力交给上层（AI 面板用）。
+   * 连接就绪时注册，断开或卸载时用 null 注销；`submit` 为 false 时只填不回车。
+   */
+  onRegisterCommandSink?: (sink: ((command: string, submit: boolean) => boolean) | null) => void;
 }
 
 export const TerminalView: React.FC<TerminalViewProps> = ({
@@ -58,11 +63,14 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   initialError,
   onQuickCommandsChange,
   onAskAi,
+  onRegisterCommandSink,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<XTerminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  /** 每渲染刷新一次的命令下发实现，供稳定的注册函数间接调用 */
+  const commandSinkRef = useRef<((command: string, submit: boolean) => boolean) | null>(null);
   const decoderRef = useRef<TextDecoder | null>(null);
   const connectionCleanupRef = useRef<(() => void) | null>(null);
   const connectionAttemptRef = useRef<number>(0);
@@ -595,10 +603,40 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     onAskAi({ text: lines.join('\n'), source: 'tail' });
   };
 
+  /**
+   * 命令下发通道（AI 面板 → 终端输入行）。
+   *
+   * 分两步设计：先写进输入行（submit=false），用户自己按回车；
+   * 只有用户显式点了「执行」才补一个 `\r`。
+   *
+   * 这里刻意用 sendRawToTerminal 而不是 sendPasteToTerminal：
+   * 后者在 bracketedPasteMode 下会把换行当字面量插进去，readline 不执行，
+   * 而「执行」的语义就是要跑起来。
+   */
+  useEffect(() => {
+    commandSinkRef.current = (command: string, submit: boolean) => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      sendRawToTerminal(submit ? `${command}\r` : command, true);
+      return true;
+    };
+  });
+
+  useEffect(() => {
+    if (!onRegisterCommandSink) return;
+    if (!connected) {
+      onRegisterCommandSink(null);
+      return;
+    }
+    // 注册一个稳定引用，内部再取最新的实现，避免每次 render 都重注册
+    const stable = (command: string, submit: boolean) => commandSinkRef.current?.(command, submit) ?? false;
+    onRegisterCommandSink(stable);
+    return () => onRegisterCommandSink(null);
+  }, [connected, onRegisterCommandSink]);
+
   const handleCopySelection = () => {
     const selection = terminalRef.current?.getSelection() || selectedText;
     if (!selection) return;
-
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(selection).then(() => {
         setCopiedNotification(true);

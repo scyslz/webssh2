@@ -17,6 +17,44 @@ export interface AiConfigView {
   maxInputTokens: number;
   maxOutputTokens: number;
   redactPrivateIp: boolean;
+  commandWhitelist: string[];
+}
+
+export type AiRiskLevel = 'safe' | 'caution' | 'dangerous';
+
+export interface AiGradeHit {
+  rule: string;
+  label: string;
+  level: AiRiskLevel;
+}
+
+export interface AiGradeSegment {
+  raw: string;
+  binary: string | null;
+  level: AiRiskLevel;
+  elevated: boolean;
+  whitelisted: boolean;
+  hits: string[];
+}
+
+/** 服务端判分结果。等级以这里为准，模型自评只作参考。 */
+export interface AiGradeResult {
+  level: AiRiskLevel;
+  hits: AiGradeHit[];
+  reasons: string[];
+  allWhitelisted: boolean;
+  rootSession: boolean;
+  autoRunnable: boolean;
+  segments: AiGradeSegment[];
+}
+
+export interface AiDraft {
+  command: string;
+  explain: string;
+  /** 模型自评，仅作提示 */
+  selfRisk: AiRiskLevel | null;
+  prerequisites: string[];
+  grade: AiGradeResult;
 }
 
 export interface AiContextStats {
@@ -54,7 +92,13 @@ export interface AiHandlers {
   onPrepared?: (payload: { text: string; env: string; question: string; stats: AiContextStats }) => void;
   onDelta?: (text: string) => void;
   onDone?: (meta: AiDoneMeta) => void;
-  onError?: (msg: string, aborted: boolean) => void;
+  /**
+   * fallback === 'readonly' 表示服务端没能把模型输出解析成结构化命令，
+   * 已降级为只读展示：调用方应把已收到的 delta 当普通回答渲染，
+   * **不提供任何执行入口**。
+   */
+  onError?: (msg: string, aborted: boolean, info?: { fallback?: 'readonly' }) => void;
+  onDraft?: (draft: AiDraft, meta: AiDoneMeta) => void;
   onStatus?: (status: 'connecting' | 'open' | 'closed') => void;
 }
 
@@ -163,9 +207,39 @@ export class AiWSClient {
           chars: message.chars,
         });
         return;
+      case 'draft':
+        this.currentId = null;
+        this.handlers.onDraft?.(
+          {
+            command: message.command || '',
+            explain: message.explain || '',
+            selfRisk: message.selfRisk ?? null,
+            prerequisites: Array.isArray(message.prerequisites) ? message.prerequisites : [],
+            grade: {
+              level: message.grade?.level || 'caution',
+              hits: message.grade?.hits || [],
+              reasons: message.grade?.reasons || [],
+              allWhitelisted: Boolean(message.grade?.allWhitelisted),
+              rootSession: Boolean(message.grade?.rootSession),
+              autoRunnable: Boolean(message.grade?.autoRunnable),
+              segments: message.grade?.segments || [],
+            },
+          },
+          {
+            model: message.model,
+            usage: message.usage,
+            finishReason: message.finishReason,
+            firstTokenMs: message.firstTokenMs,
+            ms: message.ms,
+            chars: message.chars,
+          },
+        );
+        return;
       case 'error':
         this.currentId = null;
-        this.handlers.onError?.(message.msg || '调用失败', Boolean(message.aborted));
+        this.handlers.onError?.(message.msg || '调用失败', Boolean(message.aborted), {
+          fallback: message.fallback === 'readonly' ? 'readonly' : undefined,
+        });
         return;
       default:
         return;
@@ -192,13 +266,29 @@ export class AiWSClient {
 
   /** 返回本次请求 id；调用方可用它做「这批 delta 属于谁」的判断 */
   async diagnose(request: AiDiagnoseRequest, handlers: AiHandlers): Promise<string> {
+    return this.send('diagnose', request, handlers);
+  }
+
+  /**
+   * 生成命令草稿。delta 里流的是模型的原始输出（可能是 JSON），
+   * 结构化结果在 `onDraft` 里给；解析失败时走 `onError` 且 fallback='readonly'。
+   */
+  async draft(request: AiDiagnoseRequest, handlers: AiHandlers): Promise<string> {
+    return this.send('draft', request, handlers);
+  }
+
+  private async send(
+    type: 'diagnose' | 'draft',
+    request: AiDiagnoseRequest,
+    handlers: AiHandlers,
+  ): Promise<string> {
     await this.connect();
     if (this.ws?.readyState !== WebSocket.OPEN) throw new Error('AI 通道未连接');
 
     const id = `${Date.now()}-${++this.seq}`;
     this.handlers = handlers;
     this.currentId = id;
-    this.ws.send(JSON.stringify({ id, type: 'diagnose', context: request }));
+    this.ws.send(JSON.stringify({ id, type, context: request }));
     return id;
   }
 
@@ -228,7 +318,7 @@ export async function fetchAiConfig(): Promise<AiConfigView> {
 }
 
 export async function saveAiConfig(
-  patch: Partial<Pick<AiConfigView, 'enabled' | 'baseUrl' | 'model' | 'redactPrivateIp' | 'maxInputTokens' | 'maxOutputTokens'>>,
+  patch: Partial<Pick<AiConfigView, 'enabled' | 'baseUrl' | 'model' | 'redactPrivateIp' | 'maxInputTokens' | 'maxOutputTokens' | 'commandWhitelist'>>,
   apiKey?: string | null,
 ): Promise<AiConfigView> {
   const body: Record<string, unknown> = { ...patch };

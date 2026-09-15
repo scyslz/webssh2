@@ -5,11 +5,15 @@ import {
   ChevronDown,
   ChevronRight,
   Copy,
+  CornerDownLeft,
   Loader2,
+  Play,
   RefreshCw,
   Settings2,
+  ShieldAlert,
   Sparkles,
   Square,
+  Wand2,
   X,
 } from 'lucide-react';
 import {
@@ -21,16 +25,23 @@ import {
   type AiContextStats,
   type AiDiagnoseRequest,
   type AiDoneMeta,
+  type AiDraft,
+  type AiRiskLevel,
 } from '../aiClient';
+import { ConfirmDialog } from './ConfirmDialog';
 import { isLightTheme } from '../theme';
 
 /**
- * AI 面板（P0：只读诊断）。
+ * AI 面板（P0 只读诊断 + P1 命令草稿）。
  *
  * 三条刻意做出来的规矩：
- * 1. 面板里没有「执行」按钮 —— P0 不产生任何可执行物，AI 只解释不操作。
- * 2. 「实际发送内容」默认展开：用户得能看见到底把什么发出去了，才谈得上信任。
- * 3. 未配置时面板自己承担配置表单，不把 AI 设置塞进全局设置里（自托管场景
+ * 1. 诊断模式里没有「执行」按钮 —— 只解释不操作。
+ * 2. 命令草稿的风险等级**以服务端判分显示**，模型自评只在旁边做对照；
+ *    两者不一致时，界面显示的是判分结果。
+ * 3. 「执行」在界面上永远排在「仅填入」后面，且高风险命令必须再过一次确认框。
+ *    底层不变量没变：命令是写进终端输入行，回车永远是用户按的（除了他显式点执行）。
+ * 4. 「实际发送内容」默认展开：用户得能看见到底把什么发出去了，才谈得上信任。
+ * 5. 未配置时面板自己承担配置表单，不把 AI 设置塞进全局设置里（自托管场景
  *    大多数人是靠环境变量喂 key 的，UI 只是兜底）。
  */
 
@@ -38,7 +49,24 @@ interface AiPanelProps {
   request: AiDiagnoseRequest | null;
   onClose: () => void;
   theme?: string;
+  /** 目标终端的 SSH 连接是否就绪；没连上就不能执行命令 */
+  terminalConnected?: boolean;
+  /** 把命令写进终端输入行。submit=false 只填入不回车。返回是否发送成功 */
+  onRunCommand?: (command: string, submit: boolean) => boolean;
 }
+
+/** 风险色带：判分结果是唯一的着色依据 */
+const RISK_STYLE: Record<AiRiskLevel, { badge: string; border: string; text: string }> = {
+  safe: { badge: 'bg-emerald-100 text-emerald-700', border: 'border-emerald-300', text: 'text-emerald-600' },
+  caution: { badge: 'bg-amber-100 text-amber-700', border: 'border-amber-300', text: 'text-amber-600' },
+  dangerous: { badge: 'bg-rose-100 text-rose-700', border: 'border-rose-300', text: 'text-rose-600' },
+};
+const RISK_STYLE_DARK: Record<AiRiskLevel, { badge: string; border: string; text: string }> = {
+  safe: { badge: 'bg-emerald-950 text-emerald-300', border: 'border-emerald-800', text: 'text-emerald-400' },
+  caution: { badge: 'bg-amber-950 text-amber-300', border: 'border-amber-800', text: 'text-amber-400' },
+  dangerous: { badge: 'bg-rose-950 text-rose-300', border: 'border-rose-800', text: 'text-rose-400' },
+};
+const RISK_LABEL: Record<AiRiskLevel, string> = { safe: '只读', caution: '需谨慎', dangerous: '高风险' };
 
 type Phase = 'idle' | 'streaming' | 'done' | 'error';
 
@@ -57,12 +85,21 @@ const redactionSummary = (stats: AiContextStats) => {
   return parts.join(' ');
 };
 
-export const AiPanel: React.FC<AiPanelProps> = ({ request, onClose, theme }) => {
+export const AiPanel: React.FC<AiPanelProps> = ({
+  request,
+  onClose,
+  theme,
+  terminalConnected = false,
+  onRunCommand,
+}) => {
   const isLight = isLightTheme(theme);
+  const risk = isLight ? RISK_STYLE : RISK_STYLE_DARK;
 
   const clientRef = useRef<AiWSClient | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const lastRunRef = useRef<{ text: string; source: 'selection' | 'tail'; question?: string } | null>(null);
+  /** 回调里读 draft 原文用，避免把 draftRaw 塞进 runDraft 的依赖里导致反复重建 */
+  const draftRawRef = useRef('');
 
   const [config, setConfig] = useState<AiConfigView | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
@@ -80,9 +117,22 @@ export const AiPanel: React.FC<AiPanelProps> = ({ request, onClose, theme }) => 
   const [formModel, setFormModel] = useState('');
   const [formApiKey, setFormApiKey] = useState('');
   const [formRedactIp, setFormRedactIp] = useState(false);
+  const [formWhitelist, setFormWhitelist] = useState('');
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+
+  // ---- P1 命令草稿 ----
+  /** 当前流的是哪种请求，决定 delta 往哪写、底部按钮显示什么 */
+  const [mode, setMode] = useState<'diagnose' | 'draft'>('diagnose');
+  const [askText, setAskText] = useState('');
+  const [draft, setDraft] = useState<AiDraft | null>(null);
+  /** draft 模式流下来的原文（JSON）。只在解析失败降级时才会展示给人看 */
+  const [draftRaw, setDraftRaw] = useState('');
+  const [degraded, setDegraded] = useState(false);
+  const [confirmRunOpen, setConfirmRunOpen] = useState(false);
+  const [runNotice, setRunNotice] = useState<string | null>(null);
+  const lastDraftRef = useRef<{ text: string; source: 'selection' | 'tail'; question: string } | null>(null);
 
   const palette = useMemo(() => (isLight ? {
     panel: 'bg-white border-slate-200 text-slate-800',
@@ -111,6 +161,7 @@ export const AiPanel: React.FC<AiPanelProps> = ({ request, onClose, theme }) => 
     setFormBaseUrl((prev) => (prev ? prev : next.baseUrl));
     setFormModel((prev) => (prev ? prev : next.model));
     setFormRedactIp(next.redactPrivateIp);
+    setFormWhitelist((prev) => (prev ? prev : (next.commandWhitelist || []).join(', ')));
   }, []);
 
   // 初始化：拉配置 + 建长连接（长连接本身不发请求，只在有任务时用）
@@ -131,11 +182,16 @@ export const AiPanel: React.FC<AiPanelProps> = ({ request, onClose, theme }) => 
     };
   }, [applyConfig]);
 
-  const run = useCallback(async (input: { text: string; source: 'selection' | 'tail'; question?: string }) => {
+  const runDiagnose = useCallback(async (input: { text: string; source: 'selection' | 'tail'; question?: string }) => {
     const client = clientRef.current;
     if (!client) return;
 
     lastRunRef.current = input;
+    setMode('diagnose');
+    setDraft(null);
+    setDraftRaw('');
+    setDegraded(false);
+    setRunNotice(null);
     setPhase('streaming');
     setAnswer('');
     setPrepared(null);
@@ -168,6 +224,65 @@ export const AiPanel: React.FC<AiPanelProps> = ({ request, onClose, theme }) => 
     }
   }, [request?.host, request?.username, request?.cwd]);
 
+  /**
+   * 生成命令草稿。
+   *
+   * delta 不写进「回答」区 —— 那里流出来的是 JSON，给人看没意义；
+   * 只攒进 draftRaw，供解析失败降级时原样展示。
+   */
+  const runDraft = useCallback(async (question: string) => {
+    const client = clientRef.current;
+    if (!client || !question.trim()) return;
+
+    const text = request?.text ?? '';
+    const source = request?.source ?? 'tail';
+    lastDraftRef.current = { text, source, question };
+
+    setMode('draft');
+    setPhase('streaming');
+    setAnswer('');
+    setDraft(null);
+    setDraftRaw('');
+    draftRawRef.current = '';
+    setDegraded(false);
+    setRunNotice(null);
+    setPrepared(null);
+    setMeta(null);
+    setErrorMsg(null);
+
+    try {
+      await client.draft(
+        { text, source, question, host: request?.host, username: request?.username, cwd: request?.cwd },
+        {
+          onPrepared: (payload) => setPrepared(payload),
+          onDelta: (chunk) => {
+            draftRawRef.current += chunk;
+            setDraftRaw((prev) => prev + chunk);
+          },
+          onDraft: (result, resultMeta) => {
+            setDraft(result);
+            setMeta(resultMeta);
+            setPhase('done');
+          },
+          onError: (msg, aborted, info) => {
+            setErrorMsg(msg);
+            if (info?.fallback === 'readonly') {
+              // 服务端没能解析出结构 → 把原文当只读回答展示，不提供任何执行入口
+              setAnswer(draftRawRef.current);
+              setDegraded(true);
+              setPhase('done');
+            } else {
+              setPhase(aborted ? 'done' : 'error');
+            }
+          },
+        },
+      );
+    } catch (err: any) {
+      setErrorMsg(err?.message || '发起请求失败');
+      setPhase('error');
+    }
+  }, [request?.text, request?.source, request?.host, request?.username, request?.cwd]);
+
   // 请求进来（用户点了 AI 按钮）→ 等配置就绪后再发
   useEffect(() => {
     if (request) setPending(request);
@@ -177,8 +292,8 @@ export const AiPanel: React.FC<AiPanelProps> = ({ request, onClose, theme }) => 
     if (!pending || !config?.ready) return;
     const current = pending;
     setPending(null);
-    void run({ text: current.text, source: current.source, question: current.question });
-  }, [pending, config?.ready, run]);
+    void runDiagnose({ text: current.text, source: current.source, question: current.question });
+  }, [pending, config?.ready, runDiagnose]);
 
   // 流式过程中自动滚到底部，但用户主动上滚后不要抢滚动条
   const stickToBottomRef = useRef(true);
@@ -186,7 +301,7 @@ export const AiPanel: React.FC<AiPanelProps> = ({ request, onClose, theme }) => 
     const el = bodyRef.current;
     if (!el || !stickToBottomRef.current) return;
     el.scrollTop = el.scrollHeight;
-  }, [answer, prepared]);
+  }, [answer, prepared, draft, degraded]);
 
   const handleScroll = () => {
     const el = bodyRef.current;
@@ -199,7 +314,13 @@ export const AiPanel: React.FC<AiPanelProps> = ({ request, onClose, theme }) => 
     setTestResult(null);
     try {
       const next = await saveAiConfig(
-        { baseUrl: formBaseUrl, model: formModel, redactPrivateIp: formRedactIp },
+        {
+          baseUrl: formBaseUrl,
+          model: formModel,
+          redactPrivateIp: formRedactIp,
+          // 逗号 / 换行分隔；服务端还会再清洗一遍（只收命令名）
+          commandWhitelist: formWhitelist.split(/[,\n]/).map((s) => s.trim()).filter(Boolean),
+        },
         // 留空表示不动密钥：避免「改个模型名」把 key 清掉
         formApiKey.trim() ? formApiKey.trim() : undefined,
       );
@@ -226,23 +347,61 @@ export const AiPanel: React.FC<AiPanelProps> = ({ request, onClose, theme }) => 
   };
 
   const handleCopy = () => {
-    if (!answer) return;
-    navigator.clipboard?.writeText(answer).then(() => {
+    const text = mode === 'draft' && draft ? draft.command : answer;
+    if (!text) return;
+    navigator.clipboard?.writeText(text).then(() => {
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1600);
     }).catch(() => {});
   };
 
   const handleRegenerate = () => {
+    if (mode === 'draft') {
+      if (lastDraftRef.current) void runDraft(lastDraftRef.current.question);
+      return;
+    }
     if (!lastRunRef.current) return;
-    void run(lastRunRef.current);
+    void runDiagnose(lastRunRef.current);
   };
 
   const handleFollowUp = () => {
     const question = followUp.trim();
     if (!question || !lastRunRef.current) return;
     setFollowUp('');
-    void run({ ...lastRunRef.current, question });
+    void runDiagnose({ ...lastRunRef.current, question });
+  };
+
+  const handleGenerate = () => {
+    const question = askText.trim();
+    if (!question) return;
+    setAskText('');
+    void runDraft(question);
+  };
+
+  /** 从诊断结果追问式地要命令，省得用户再打一遍需求 */
+  const handleDraftFromAnswer = () => {
+    void runDraft('根据上面的输出，给出下一步该执行的命令');
+  };
+
+  /** submit=false：只把命令写进输入行；submit=true：连回车一起发出去 */
+  const dispatchCommand = (submit: boolean) => {
+    if (!draft || !onRunCommand) return;
+    const ok = onRunCommand(draft.command, submit);
+    setRunNotice(
+      ok
+        ? (submit ? '已发送到终端执行' : '已填入终端输入行，确认无误后自己按回车')
+        : '终端未连接，命令没有发出去',
+    );
+  };
+
+  const handleRunClick = () => {
+    if (!draft) return;
+    // 高风险必须再确认一次；其余等级也走一次确认，避免误触
+    if (draft.grade.level === 'dangerous') {
+      setConfirmRunOpen(true);
+      return;
+    }
+    dispatchCommand(true);
   };
 
   const streaming = phase === 'streaming';
@@ -332,6 +491,20 @@ export const AiPanel: React.FC<AiPanelProps> = ({ request, onClose, theme }) => 
               </span>
             </label>
 
+            <label className="block space-y-1">
+              <span className={palette.subtle}>命令白名单（可选，逗号分隔）</span>
+              <input
+                value={formWhitelist}
+                onChange={(e) => setFormWhitelist(e.target.value)}
+                placeholder="myctl, deploy"
+                className={`w-full rounded border px-2 py-1 text-[11px] font-mono focus:outline-none ${palette.input}`}
+              />
+              <span className={`block text-[10px] leading-relaxed ${palette.subtle}`}>
+                只收命令名。加进来的命令在「非 root 会话 + 判分只读」时才允许无人值守执行；
+                白名单<b>绕不过风险等级</b> —— 把 rm 加进来，rm -rf / 依然会被判高风险。
+              </span>
+            </label>
+
             <div className="flex items-center gap-2">
               <button onClick={handleSave} disabled={saving} className={`${buttonClass} ${palette.primary}`}>
                 {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
@@ -370,7 +543,9 @@ export const AiPanel: React.FC<AiPanelProps> = ({ request, onClose, theme }) => 
               {showContext ? <ChevronDown className="w-3 h-3 shrink-0" /> : <ChevronRight className="w-3 h-3 shrink-0" />}
               <span className="font-medium shrink-0">实际发送内容</span>
               <span className={`text-[10px] font-mono truncate ${palette.subtle}`}>
-                {prepared.stats.rawLines}→{prepared.stats.lines} 行 · 约 {prepared.stats.estTokens} tokens
+                {prepared.stats.rawLines > 0
+                  ? `${prepared.stats.rawLines}→${prepared.stats.lines} 行 · 约 ${prepared.stats.estTokens} tokens`
+                  : '本次没有终端内容'}
                 {prepared.stats.redactionTotal ? ` · 已抹除 ${prepared.stats.redactionTotal} 处` : ''}
               </span>
             </button>
@@ -385,16 +560,161 @@ export const AiPanel: React.FC<AiPanelProps> = ({ request, onClose, theme }) => 
                     {prepared.stats.omittedLines ? `中间略过 ${prepared.stats.omittedLines} 行` : ''}
                   </div>
                 )}
-                <pre className={`max-h-56 overflow-auto rounded border p-2 text-[10px] leading-relaxed font-mono whitespace-pre-wrap break-all ${palette.code}`}>
-                  {prepared.text}
-                </pre>
+                {prepared.text ? (
+                  <pre className={`max-h-56 overflow-auto rounded border p-2 text-[10px] leading-relaxed font-mono whitespace-pre-wrap break-all ${palette.code}`}>
+                    {prepared.text}
+                  </pre>
+                ) : (
+                  // 纯「生成命令」时没有终端内容可发，别摆一个空代码框看着像坏了
+                  <p className={`text-[10px] leading-relaxed ${palette.subtle}`}>
+                    这次没有终端内容，出网的只有上面的需求描述、主机与登录用户。
+                  </p>
+                )}
               </div>
             )}
           </div>
         )}
 
-        {/* 回答 */}
-        {(answer || streaming) && (
+        {/* 自然语言 → 命令。生成物一律先过服务端判分再露面 */}
+        {config?.ready && (
+          <div className={`rounded border p-2.5 space-y-2 ${palette.card}`}>
+            <div className="flex items-center gap-1.5 font-medium">
+              <Wand2 className="w-3.5 h-3.5 text-indigo-500" />
+              <span>生成命令</span>
+            </div>
+            <p className={`text-[11px] leading-relaxed ${palette.subtle}`}>
+              用一句话说清要做什么。AI 只负责提议，命令会先由服务端按规则表判分，
+              再由你决定是「仅填入」还是「执行」。
+            </p>
+            <div className="flex items-center gap-1.5">
+              <input
+                value={askText}
+                onChange={(e) => setAskText(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleGenerate(); }}
+                disabled={streaming}
+                placeholder="查看 docker 容器状态"
+                className={`flex-1 min-w-0 rounded border px-2 py-1 text-[11px] focus:outline-none disabled:opacity-50 ${palette.input}`}
+              />
+              <button
+                onClick={handleGenerate}
+                disabled={!askText.trim() || streaming}
+                className={`${buttonClass} ${palette.primary}`}
+              >
+                <span>生成</span>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* 命令草稿：风险等级只认服务端判分，模型自评仅作对照 */}
+        {mode === 'draft' && (draft || streaming) && (
+          <div className={`rounded border space-y-2 p-2.5 ${draft ? risk[draft.grade.level].border : palette.card}`}>
+            {draft ? (
+              <>
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${risk[draft.grade.level].badge}`}>
+                    {RISK_LABEL[draft.grade.level]}
+                  </span>
+                  <span className={`text-[10px] font-mono ${palette.subtle}`}>服务端判分</span>
+                  {draft.selfRisk && draft.selfRisk !== draft.grade.level && (
+                    <span className={`text-[10px] font-mono ${risk[draft.selfRisk].text}`}>
+                      模型自评 {RISK_LABEL[draft.selfRisk]}（不一致，以判分为准）
+                    </span>
+                  )}
+                  {draft.grade.allWhitelisted && (
+                    <span className={`text-[10px] font-mono ${palette.subtle}`}>全部在只读白名单内</span>
+                  )}
+                </div>
+
+                {draft.explain && <p className="leading-relaxed">{draft.explain}</p>}
+
+                <pre className={`max-h-40 overflow-auto rounded border p-2 text-[11px] leading-relaxed font-mono whitespace-pre-wrap break-all ${palette.code}`}>
+                  {draft.command}
+                </pre>
+
+                {draft.grade.reasons.length > 0 && (
+                  <ul className={`space-y-0.5 ${risk[draft.grade.level].text}`}>
+                    {draft.grade.reasons.map((reason) => (
+                      <li key={reason} className="flex items-start gap-1.5">
+                        <ShieldAlert className="w-3 h-3 mt-0.5 shrink-0" />
+                        <span>{reason}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+
+                {draft.grade.segments.length > 1 && (
+                  <div className={`text-[10px] font-mono space-y-0.5 ${palette.subtle}`}>
+                    {draft.grade.segments.map((seg, index) => (
+                      <div key={`${index}-${seg.raw}`} className="truncate" title={seg.raw}>
+                        {RISK_LABEL[seg.level]} · {seg.binary || '?'} · {seg.raw}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {draft.prerequisites.length > 0 && (
+                  <div className={`text-[11px] leading-relaxed ${palette.subtle}`}>
+                    前置条件：{draft.prerequisites.join('；')}
+                  </div>
+                )}
+
+                {draft.grade.rootSession && (
+                  <div className={`text-[10px] ${palette.subtle}`}>
+                    当前以 root 登录，自动执行判定已关闭（仍然可以手动确认执行）
+                  </div>
+                )}
+
+                <div className="flex items-center gap-2 flex-wrap">
+                  <button
+                    onClick={() => dispatchCommand(false)}
+                    disabled={!terminalConnected || !onRunCommand}
+                    className={`${buttonClass} ${palette.button}`}
+                    title="只写进终端输入行，不按回车"
+                  >
+                    <CornerDownLeft className="w-3 h-3" />
+                    <span>仅填入</span>
+                  </button>
+                  <button
+                    onClick={handleRunClick}
+                    disabled={!terminalConnected || !onRunCommand}
+                    className={`${buttonClass} ${draft.grade.level === 'dangerous' ? palette.danger : palette.primary}`}
+                    title="填入并回车执行"
+                  >
+                    <Play className="w-3 h-3" />
+                    <span>执行</span>
+                  </button>
+                  <button onClick={handleCopy} className={`${buttonClass} ${palette.button}`}>
+                    {copied ? <Check className="w-3 h-3 text-emerald-500" /> : <Copy className="w-3 h-3" />}
+                    <span>复制</span>
+                  </button>
+                  {!terminalConnected && (
+                    <span className={`text-[10px] ${palette.subtle}`}>终端未连接</span>
+                  )}
+                </div>
+
+                {runNotice && (
+                  <div className={`text-[10px] leading-relaxed ${palette.subtle}`}>{runNotice}</div>
+                )}
+              </>
+            ) : (
+              <div className="flex items-center gap-1.5 text-[11px]">
+                <Loader2 className="w-3 h-3 animate-spin text-indigo-500" />
+                <span className={palette.subtle}>正在生成命令…</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* 降级：模型没给出可解析的结构，只展示原文，不给任何执行入口 */}
+        {degraded && (
+          <div className={`rounded border p-2 text-[11px] leading-relaxed ${risk.caution.border} ${risk.caution.text}`}>
+            模型没有返回可用的命令结构，下面只是它的原始输出 —— 已降级为只读，本次没有生成任何可执行内容。
+          </div>
+        )}
+
+        {/* 回答：诊断模式，或草稿降级后展示模型原文 */}
+        {(mode === 'diagnose' || degraded) && (answer || streaming) && (
           <div className="space-y-1">
             <div className="flex items-center gap-1.5">
               <span className="font-medium">回答</span>
@@ -404,6 +724,17 @@ export const AiPanel: React.FC<AiPanelProps> = ({ request, onClose, theme }) => 
               {answer || <span className={palette.subtle}>等待首个 token…</span>}
             </div>
           </div>
+        )}
+
+        {/* 诊断完给一个「往下走」的入口：省得用户把需求再打一遍 */}
+        {mode === 'diagnose' && phase === 'done' && !streaming && config?.ready && answer && (
+          <button
+            onClick={handleDraftFromAnswer}
+            className={`${buttonClass} ${palette.primary} w-full justify-center`}
+          >
+            <Play className="w-3 h-3" />
+            <span>按这个结论生成可执行命令</span>
+          </button>
         )}
 
         {errorMsg && (
@@ -433,16 +764,27 @@ export const AiPanel: React.FC<AiPanelProps> = ({ request, onClose, theme }) => 
               <span>停止</span>
             </button>
           ) : (
-            <button onClick={handleRegenerate} disabled={!lastRunRef.current} className={`${buttonClass} ${palette.button}`}>
+            <button
+              onClick={handleRegenerate}
+              disabled={mode === 'draft' ? !lastDraftRef.current : !lastRunRef.current}
+              className={`${buttonClass} ${palette.button}`}
+            >
               <RefreshCw className="w-3 h-3" />
               <span>重新生成</span>
             </button>
           )}
-          <button onClick={handleCopy} disabled={!answer} className={`${buttonClass} ${palette.button}`}>
+          <button
+            onClick={handleCopy}
+            disabled={!(mode === 'draft' ? draft : answer)}
+            className={`${buttonClass} ${palette.button}`}
+          >
             {copied ? <Check className="w-3 h-3 text-emerald-500" /> : <Copy className="w-3 h-3" />}
             <span>复制</span>
           </button>
-          <span className={`ml-auto text-[10px] font-mono ${palette.subtle}`}>只读，不执行命令</span>
+          {/* 这句话在两种模式下含义不同，别让它说谎 */}
+          <span className={`ml-auto text-[10px] font-mono ${palette.subtle}`}>
+            {mode === 'draft' ? '判分后由你确认' : '只读，不执行命令'}
+          </span>
         </div>
 
         <div className="flex items-center gap-1.5">
@@ -463,6 +805,37 @@ export const AiPanel: React.FC<AiPanelProps> = ({ request, onClose, theme }) => 
           </button>
         </div>
       </div>
+
+      {/* 高风险命令的二次确认。复用项目里已有的危险操作确认对话框 */}
+      <ConfirmDialog
+        isOpen={confirmRunOpen}
+        theme={theme}
+        title="确认执行高风险命令"
+        confirmLabel="仍然执行"
+        cancelLabel="取消"
+        message={
+          <span className="block space-y-1.5">
+            <span className="block">服务端判分把这条命令标为「高风险」，它可能造成不可逆的改动：</span>
+            {draft && (
+              <span className="block">
+                {draft.grade.reasons.map((reason) => (
+                  <span key={reason} className="block">· {reason}</span>
+                ))}
+              </span>
+            )}
+            {draft && (
+              <code className="block mt-1 rounded bg-black/10 px-2 py-1 font-mono text-[11px] break-all whitespace-pre-wrap">
+                {draft.command}
+              </code>
+            )}
+          </span>
+        }
+        onConfirm={() => {
+          setConfirmRunOpen(false);
+          dispatchCommand(true);
+        }}
+        onCancel={() => setConfirmRunOpen(false)}
+      />
     </div>
   );
 };

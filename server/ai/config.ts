@@ -27,6 +27,29 @@ const MAX_MAX_OUTPUT_TOKENS = 8192;
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, Math.floor(value)));
 
+/** 白名单条数上限，纯粹防手滑贴进来一整份 /usr/bin 清单 */
+const MAX_COMMAND_WHITELIST = 50;
+
+/**
+ * 白名单只收**命令名**，不收路径、也不收「带参数的整条命令」。
+ * 这样语义唯一：白名单 = 「这个二进制可以自动跑」，而不是「匹配这个字符串的都可以」。
+ * 带空格的条目直接丢掉 —— 否则用户填 `rm -rf /tmp` 会以为自己很安全，
+ * 实际上那条规则既难匹配、又会给人错误的安全感。
+ */
+export function normalizeWhitelist(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const out: string[] = [];
+  for (const item of value) {
+    if (typeof item !== 'string') continue;
+    const name = item.trim().toLowerCase();
+    if (!name || name.length > 64) continue;
+    if (!/^[a-z0-9._+-]+$/.test(name)) continue;
+    if (!out.includes(name)) out.push(name);
+    if (out.length >= MAX_COMMAND_WHITELIST) break;
+  }
+  return out;
+}
+
 export interface ResolvedAiConfig {
   enabled: boolean;
   baseUrl: string;
@@ -35,6 +58,7 @@ export interface ResolvedAiConfig {
   maxInputTokens: number;
   maxOutputTokens: number;
   redactPrivateIp: boolean;
+  commandWhitelist: string[];
   keyFromEnv: boolean;
   /** 未就绪的原因，直接可以显示给用户 */
   reason?: string;
@@ -52,6 +76,7 @@ export interface PublicAiConfig {
   maxInputTokens: number;
   maxOutputTokens: number;
   redactPrivateIp: boolean;
+  commandWhitelist: string[];
 }
 
 interface AiSecret {
@@ -109,6 +134,7 @@ export function resolveAiConfig(): ResolvedAiConfig {
     maxInputTokens,
     maxOutputTokens,
     redactPrivateIp: settings.redactPrivateIp ?? false,
+    commandWhitelist: normalizeWhitelist(settings.commandWhitelist),
     keyFromEnv: Boolean(envKey),
     reason,
   };
@@ -128,6 +154,7 @@ export function publicAiConfig(): PublicAiConfig {
     maxInputTokens: config.maxInputTokens,
     maxOutputTokens: config.maxOutputTokens,
     redactPrivateIp: config.redactPrivateIp,
+    commandWhitelist: config.commandWhitelist,
   };
 }
 
@@ -148,6 +175,7 @@ export function saveAiSettings(
   if (patch.baseUrl !== undefined) next.baseUrl = String(patch.baseUrl).trim();
   if (patch.model !== undefined) next.model = String(patch.model).trim();
   if (patch.redactPrivateIp !== undefined) next.redactPrivateIp = Boolean(patch.redactPrivateIp);
+  if (patch.commandWhitelist !== undefined) next.commandWhitelist = normalizeWhitelist(patch.commandWhitelist);
   if (patch.maxInputTokens !== undefined) {
     const value = Number(patch.maxInputTokens);
     if (Number.isFinite(value) && value > 0) next.maxInputTokens = Math.floor(value);

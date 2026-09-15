@@ -40,6 +40,12 @@ export interface AiSettings {
   maxInputTokens?: number;
   maxOutputTokens?: number;
   redactPrivateIp?: boolean;
+  /**
+   * 追加到默认只读白名单里的命令名。命中白名单 + 判分 safe + 非 root 会话，
+   * 三者同时成立才允许无人值守执行（见 server/ai/grade.ts 的 autoRunnable）。
+   * 注意：白名单**绕不过**风险等级闸门 —— 把 `rm` 加进来，`rm -rf /` 依然是高风险。
+   */
+  commandWhitelist?: string[];
 }
 
 export interface AppConfig {

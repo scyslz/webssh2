@@ -26,6 +26,12 @@ export function registerAiRoutes(app: express.Express) {
     if (body.redactPrivateIp !== undefined) patch.redactPrivateIp = Boolean(body.redactPrivateIp);
     if (body.maxInputTokens !== undefined) patch.maxInputTokens = Number(body.maxInputTokens);
     if (body.maxOutputTokens !== undefined) patch.maxOutputTokens = Number(body.maxOutputTokens);
+    // 白名单走 config.ts 里的 normalizeWhitelist 清洗，这里只做形状检查
+    if (body.commandWhitelist !== undefined) {
+      patch.commandWhitelist = Array.isArray(body.commandWhitelist)
+        ? body.commandWhitelist.map((item: unknown) => String(item))
+        : String(body.commandWhitelist).split(/[\n,]/);
+    }
 
     // 只有显式出现 apiKey 这个键才动密钥，避免前端「保存其它字段」时把 key 抹掉
     let apiKey: string | null | undefined;
