@@ -7,6 +7,8 @@ import { Header } from './components/Header';
 import { Tabs } from './components/Tabs';
 import { TerminalView } from './components/terminal/TerminalView';
 import { SFTPView } from './components/SFTPView';
+import { AiPanel } from './components/AiPanel';
+import type { AiDiagnoseRequest } from './aiClient';
 import { ConnectionModal } from './components/ConnectionModal';
 import { SavedHostsModal } from './components/SavedHostsModal';
 import { SettingsModal } from './components/SettingsModal';
@@ -48,6 +50,12 @@ export default function App() {
   sessionSet('webssh_window_id', windowId);
   const activeTabsStorageKey = `webssh_active_tabs:${windowId}`;
   const activeTabIdStorageKey = `webssh_active_tab:${windowId}`;
+
+  // AI 面板：状态挂在 App 上、面板渲染在「发起它的那个 tab」里。
+  // 不放进 SSHTab 是因为 tab 会被序列化进 sessionStorage（redactTab），
+  // 而诊断请求可能带着几十 KB 的终端文本，不该进存储。
+  const [aiTabId, setAiTabId] = useState<string | null>(null);
+  const [aiRequest, setAiRequest] = useState<AiDiagnoseRequest | null>(null);
   const generateTabId = useCallback((existingTabs: SSHTab[]): string => {
     const usedIds = new Set(existingTabs.map((t) => t.id));
     let id: string;
@@ -765,7 +773,7 @@ export default function App() {
             const showSFTP = tab.activeView === 'sftp' || tab.activeView === 'split';
 
             return (
-              <div key={tab.id} className={`h-full w-full ${isTabActive ? 'flex' : 'hidden'}`}>
+              <div key={tab.id} className={`relative h-full w-full ${isTabActive ? 'flex' : 'hidden'}`}>
                 {/* Terminal View */}
                 <div
                   className={`${
@@ -790,6 +798,15 @@ export default function App() {
                      reconnectMode={tab.reconnectMode}
                      initialError={tab.error}
                      onQuickCommandsChange={handleQuickCommandsChange}
+                     onAskAi={(payload) => {
+                       setAiRequest({
+                         text: payload.text,
+                         source: payload.source,
+                         host: tab.sshInfo?.host,
+                         username: tab.sshInfo?.username,
+                       });
+                       setAiTabId(tab.id);
+                     }}
                   />
                 </div>
 
@@ -808,6 +825,19 @@ export default function App() {
                     isVisible={isTabActive && showSFTP}
                   />
                 </div>
+
+                {/* AI 面板：只渲染在发起它的 tab 里。tab 容器是 hidden 而不是卸载，
+                    所以切走再切回来流式回答还在。 */}
+                {aiTabId === tab.id && (
+                  <AiPanel
+                    theme={config.theme}
+                    request={aiRequest}
+                    onClose={() => {
+                      setAiTabId(null);
+                      setAiRequest(null);
+                    }}
+                  />
+                )}
               </div>
             );
           })

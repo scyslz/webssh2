@@ -1,5 +1,6 @@
 import http from 'http';
 import net from 'net';
+import type { Duplex } from 'stream';
 import { Client as SSHClient } from 'ssh2';
 import { RawData, WebSocket, WebSocketServer } from 'ws';
 import {
@@ -20,6 +21,7 @@ import {
 } from './lib.ts';
 import { copyEntry, moveEntry, removeEntry, type OpContext } from './sftp-ops.ts';
 import { createExecRunner } from './remote-exec.ts';
+import { handleAiConnection } from './ai/index.ts';
 
 interface SSHSession {
   id: string;
@@ -107,6 +109,34 @@ function normalizeIncomingData(msg: RawData, isBinary: boolean): Buffer | string
   if (msg instanceof ArrayBuffer) return Buffer.from(msg);
   if (Array.isArray(msg)) return Buffer.concat(msg.map((chunk) => Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
   return Buffer.from(msg as ArrayBufferLike);
+}
+
+/**
+ * `/ai` 通道的升级校验：HTTPS 强制 + 登录态 + origin，与 `/sftp` 同款。
+ *
+ * `/sys`、`/sftp`、`/term` 三个分支里各抄了一份同样的检查（顺序略有差异），
+ * 这里先只给新通道用，避免在鉴权路径上做大范围重构；后续可以一并收敛过来。
+ */
+function authorizeUpgrade(request: http.IncomingMessage, socket: Duplex): boolean {
+  const config = readAppConfig();
+  const httpsEnforced = config.httpsEnforced ?? (process.env.WEBSSH_REQUIRE_HTTPS === 'true');
+  if (httpsEnforced && !isHttpsRequest(request)) {
+    socket.write('HTTP/1.1 426 Upgrade Required\r\n\r\n');
+    socket.destroy();
+    return false;
+  }
+  if (isAuthConfigured(config) && !isAuthenticated(request, config)) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+    return false;
+  }
+  const originCheckEnabled = config.originCheckEnabled ?? true;
+  if (originCheckEnabled && !isAllowedOrigin(request, request.headers.origin)) {
+    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    socket.destroy();
+    return false;
+  }
+  return true;
 }
 
 export interface SessionManager {
@@ -718,6 +748,15 @@ export function createSessionManager(): SessionManager {
         }
         wss.handleUpgrade(request, socket, head, (ws) => {
           handleSftpConnection(ws, url);
+        });
+        return;
+      }
+
+      // /ai：与 SSH 会话无关的无状态通道，上下文由浏览器传入
+      if (url.pathname === '/ai') {
+        if (!authorizeUpgrade(request, socket)) return;
+        wss.handleUpgrade(request, socket, head, (ws) => {
+          handleAiConnection(ws);
         });
         return;
       }

@@ -1,5 +1,5 @@
 import React from 'react';
-import { Copy, Clipboard, Keyboard, CloudOff, Share2, ZoomIn, ZoomOut, Trash2, RefreshCw, ChevronUp, ChevronDown, Terminal } from 'lucide-react';
+import { Copy, Clipboard, Keyboard, CloudOff, Share2, ZoomIn, ZoomOut, Trash2, RefreshCw, ChevronUp, ChevronDown, Terminal, Sparkles } from 'lucide-react';
 
 interface TerminalToolbarProps {
   isLight: boolean;
@@ -17,6 +17,7 @@ interface TerminalToolbarProps {
   sshLatencyMs: number | null;
   onSelectMode: () => void;
   onCopySelection: () => void;
+  onAskAi: () => void;
   onPaste: () => void;
   onToggleKeyBar: () => void;
   onToggleQuickCmds: () => void;
@@ -60,6 +61,7 @@ export const TerminalToolbar: React.FC<TerminalToolbarProps> = ({
   sshLatencyMs,
   onSelectMode,
   onCopySelection,
+  onAskAi,
   onPaste,
   onToggleKeyBar,
   onToggleQuickCmds,
@@ -110,6 +112,19 @@ export const TerminalToolbar: React.FC<TerminalToolbarProps> = ({
         >
           <Copy className="w-3 h-3 text-amber-500" />
           {selectedText && <span className="text-[9px] font-mono">({selectedText.length})</span>}
+        </button>
+
+        {/* AI 诊断：有选区就分析选区，没有就取最后若干行；只解释不执行 */}
+        <button
+          onClick={onAskAi}
+          className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium border transition cursor-pointer shrink-0 ${
+            isLight
+              ? 'bg-white hover:bg-slate-200 text-indigo-600 border-slate-300'
+              : 'bg-slate-800 hover:bg-slate-700 text-indigo-300 border-slate-700'
+          }`}
+          title={selectedText ? 'Explain Selection with AI' : 'Explain Recent Output with AI'}
+        >
+          <Sparkles className="w-3 h-3 text-indigo-500" />
         </button>
 
         <button

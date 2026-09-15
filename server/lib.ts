@@ -29,6 +29,19 @@ export interface QuickCommandConfig {
   enabled: boolean;
 }
 
+/**
+ * AI 配置里可以落盘的部分。**API key 不在这里** —— 它单独存进 ai_secrets.json
+ * 的加密存储（见 server/ai/config.ts），避免跟着普通配置一起被备份/导出。
+ */
+export interface AiSettings {
+  enabled?: boolean;
+  baseUrl?: string;
+  model?: string;
+  maxInputTokens?: number;
+  maxOutputTokens?: number;
+  redactPrivateIp?: boolean;
+}
+
 export interface AppConfig {
   savePass?: boolean;
   timeout?: number;
@@ -46,6 +59,7 @@ export interface AppConfig {
   keyBarSize?: number;
   hapticFeedback?: boolean;
   quickCommands?: QuickCommandConfig[];
+  ai?: AiSettings;
 }
 
 export interface StoredSSHHost {
@@ -222,6 +236,32 @@ export function writeSavedHosts(hosts: StoredSSHHost[]) {
   fs.writeFileSync(tempPath, JSON.stringify(encryptStore(hosts), null, 2), { encoding: 'utf8', mode: 0o600 });
   fs.renameSync(tempPath, SSH_SECRET_PATH);
   try { fs.chmodSync(SSH_SECRET_PATH, 0o600); } catch {}
+}
+
+/** 数据目录下的文件路径（密钥/加密存储都落在这里，便于整体挂载或备份） */
+export function dataPath(fileName: string) {
+  return path.join(DATA_DIR, path.basename(fileName));
+}
+
+/**
+ * 通用加密文件读写。AI 的 API key 这类「小但机密」的配置复用它，
+ * 走的是和 ssh_secrets.json 同一套 AES-256-GCM + 主密钥。
+ */
+export function readEncryptedFile<T>(filePath: string, fallback: T): T {
+  try {
+    if (!fs.existsSync(filePath)) return fallback;
+    const store = JSON.parse(fs.readFileSync(filePath, 'utf8')) as EncryptedStore;
+    return (decryptStore(store) as T) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+export function writeEncryptedFile(filePath: string, value: unknown) {
+  const tempPath = `${filePath}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(encryptStore(value), null, 2), { encoding: 'utf8', mode: 0o600 });
+  fs.renameSync(tempPath, filePath);
+  try { fs.chmodSync(filePath, 0o600); } catch {}
 }
 
 export function publicHost(host: StoredSSHHost) {

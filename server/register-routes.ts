@@ -1,6 +1,7 @@
 import express from 'express';
 import { requireAuth, requireHttps, requireOrigin } from './lib.ts';
 import { registerAuthRoutes } from './routes/auth-routes.ts';
+import { registerAiRoutes } from './routes/ai-routes.ts';
 import { registerConfigRoutes } from './routes/config-routes.ts';
 import { registerFileRoutes } from './routes/file-routes.ts';
 import { registerSshRoutes } from './routes/ssh-routes.ts';
@@ -11,10 +12,11 @@ export function registerRoutes(app: express.Express, sessionManager: SessionMana
 
   registerAuthRoutes(app);
 
-  app.use(['/check', '/ssh', '/config', '/file'], requireAuth);
-  app.use(['/ssh', '/config', '/file'], requireOrigin);
+  app.use(['/check', '/ssh', '/config', '/file', '/ai'], requireAuth);
+  app.use(['/ssh', '/config', '/file', '/ai'], requireOrigin);
 
   registerSshRoutes(app, sessionManager);
   registerConfigRoutes(app);
   registerFileRoutes(app, sessionManager);
+  registerAiRoutes(app);
 }

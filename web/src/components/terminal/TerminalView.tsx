@@ -20,6 +20,9 @@ import { TerminalToolbar } from './TerminalToolbar';
 import { getXTermTheme, isLightTheme } from '../../theme';
 import { QuickCommandBar } from './QuickCommandBar';
 
+/** 没有选区时送给 AI 的终端末尾行数（真正发出去前服务端还会按 token 预算裁剪） */
+const AI_TAIL_LINES = 150;
+
 interface TerminalViewProps {
   tabId: string;
   sshInfo: SSHInfo;
@@ -35,6 +38,8 @@ interface TerminalViewProps {
   onNewSession?: () => void;
   initialError?: string;
   onQuickCommandsChange?: (cmds: WebSSHConfig['quickCommands']) => void;
+  /** 请求 AI 诊断：带上要分析的文本与来源（选区 / 末尾若干行） */
+  onAskAi?: (payload: { text: string; source: 'selection' | 'tail' }) => void;
 }
 
 export const TerminalView: React.FC<TerminalViewProps> = ({
@@ -52,6 +57,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   onNewSession,
   initialError,
   onQuickCommandsChange,
+  onAskAi,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<XTerminal | null>(null);
@@ -560,6 +566,33 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     }
     setSelectionBufferText(lines.join('\n'));
     setSelectionModalOpen(true);
+  };
+
+  /**
+   * AI 诊断的入参准备。
+   *
+   * 没选中内容时取终端末尾若干行 —— 这里直接读 xterm 的 buffer 而不是重放字节流：
+   * `translateToString()` 拿到的已经是渲染后的纯文本，ANSI 控制序列天然不存在，
+   * 省掉了在服务端（或这里）再写一遍剥离逻辑。
+   */
+  const handleAskAi = () => {
+    if (!onAskAi) return;
+    const term = terminalRef.current;
+    const selection = term?.getSelection() || selectedText;
+    if (selection && selection.trim()) {
+      onAskAi({ text: selection, source: 'selection' });
+      return;
+    }
+
+    const buffer = term?.buffer.active;
+    const lines: string[] = [];
+    if (buffer) {
+      const from = Math.max(0, buffer.length - AI_TAIL_LINES);
+      for (let i = from; i < buffer.length; i += 1) {
+        lines.push(buffer.getLine(i)?.translateToString(true) ?? '');
+      }
+    }
+    onAskAi({ text: lines.join('\n'), source: 'tail' });
   };
 
   const handleCopySelection = () => {
@@ -1353,6 +1386,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         sshLatencyMs={sshLatencyMs}
         onSelectMode={handleOpenSelectionModal}
         onCopySelection={handleCopySelection}
+        onAskAi={handleAskAi}
         onPaste={handlePaste}
         onToggleKeyBar={() => setShowKeyBar(!showKeyBar)}
         onToggleQuickCmds={() => setShowQuickCmds(!showQuickCmds)}
