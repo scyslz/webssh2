@@ -114,7 +114,8 @@ export const TerminalToolbar: React.FC<TerminalToolbarProps> = ({
           {selectedText && <span className="text-[9px] font-mono">({selectedText.length})</span>}
         </button>
 
-        {/* AI 诊断：有选区就分析选区，没有就取最后若干行；只解释不执行 */}
+        {/* 只负责打开 AI 面板。分析要用户在面板里再点一次 —— 开面板就自动发几十 KB
+            终端文本，既浪费也没机会让人先确认要问什么。 */}
         <button
           onClick={onAskAi}
           className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium border transition cursor-pointer shrink-0 ${
@@ -122,7 +123,7 @@ export const TerminalToolbar: React.FC<TerminalToolbarProps> = ({
               ? 'bg-white hover:bg-slate-200 text-indigo-600 border-slate-300'
               : 'bg-slate-800 hover:bg-slate-700 text-indigo-300 border-slate-700'
           }`}
-          title={selectedText ? 'Explain Selection with AI' : 'Explain Recent Output with AI'}
+          title="Open AI panel"
         >
           <Sparkles className="w-3 h-3 text-indigo-500" />
         </button>

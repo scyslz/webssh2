@@ -8,7 +8,7 @@ import { Tabs } from './components/Tabs';
 import { TerminalView } from './components/terminal/TerminalView';
 import { SFTPView } from './components/SFTPView';
 import { AiPanel } from './components/AiPanel';
-import type { AiDiagnoseRequest } from './aiClient';
+import type { TerminalBridge } from './aiClient';
 import { ConnectionModal } from './components/ConnectionModal';
 import { SavedHostsModal } from './components/SavedHostsModal';
 import { SettingsModal } from './components/SettingsModal';
@@ -54,8 +54,21 @@ export default function App() {
   // AI 面板：状态挂在 App 上、面板渲染在「发起它的那个 tab」里。
   // 不放进 SSHTab 是因为 tab 会被序列化进 sessionStorage（redactTab），
   // 而诊断请求可能带着几十 KB 的终端文本，不该进存储。
+  //
+  // 这里**只存「面板开在哪个 tab」**，不存终端文本快照：文本由面板在点
+  // 「Explain」的那一刻现取（`getContext`），避免开面板就抓一份、等用户想用时已经过期。
   const [aiTabId, setAiTabId] = useState<string | null>(null);
-  const [aiRequest, setAiRequest] = useState<AiDiagnoseRequest | null>(null);
+
+  // 终端上下文取源：tabId → 「取选区，没有就取末尾若干行」。
+  // 与命令 sink / 执行桥同一个模式：能力由 TerminalView 注册，App 只当中转。
+  const contextSourcesRef = useRef<Map<string, () => { text: string; source: 'selection' | 'tail' }>>(new Map());
+  const registerContextSource = useCallback(
+    (tabId: string) => (source: (() => { text: string; source: 'selection' | 'tail' }) | null) => {
+      if (source) contextSourcesRef.current.set(tabId, source);
+      else contextSourcesRef.current.delete(tabId);
+    },
+    [],
+  );
 
   // 命令下发通道：tabId → 「把命令写进该 tab 终端输入行」的函数。
   // 用 ref 而不是 state：它只在事件回调里被读，进 state 会让整棵树白重渲染；
@@ -65,6 +78,17 @@ export default function App() {
     (tabId: string) => (sink: ((command: string, submit: boolean) => boolean) | null) => {
       if (sink) commandSinksRef.current.set(tabId, sink);
       else commandSinksRef.current.delete(tabId);
+    },
+    [],
+  );
+
+  // Agent 的执行桥：tabId → 该 tab 终端的「结构化采集 + 身份探测」能力。
+  // 同样用 ref：Agent 循环是个异步状态机，回调里读到的必须是最新那一条连接。
+  const execBridgesRef = useRef<Map<string, TerminalBridge>>(new Map());
+  const registerExecBridge = useCallback(
+    (tabId: string) => (bridge: TerminalBridge | null) => {
+      if (bridge) execBridgesRef.current.set(tabId, bridge);
+      else execBridgesRef.current.delete(tabId);
     },
     [],
   );
@@ -117,6 +141,15 @@ export default function App() {
     if (typeof window === 'undefined') return 0;
     return window.visualViewport?.height || window.innerHeight;
   });
+  /**
+   * 视觉视口的滚动偏移 —— 手机软键盘「把整页顶上去」的真正来源。
+   *
+   * 键盘弹出时浏览器会把视觉视口往下滚，好让聚焦的输入框露出来。应用本身没动
+   * （body 是 `position: fixed`），是被这个滚动带出屏幕的：顶栏没了、整页往上蹿。
+   * 把这个偏移用 `marginTop` 补回来，应用就正好落在可见区域里 —— 不是被顶上去，
+   * 而是老老实实缩到键盘上方那一块。
+   */
+  const [viewportTop, setViewportTop] = useState<number>(0);
 
   // Start/stop /sys WebSocket for health monitoring
   useEffect(() => {
@@ -278,8 +311,12 @@ export default function App() {
 
   useEffect(() => {
     const syncHeight = () => {
-      const vh = window.visualViewport?.height || window.innerHeight;
-      setViewportHeight(vh);
+      const vv = window.visualViewport;
+      // 捏合缩放时 visualViewport 同样会变小并位移，但那不是键盘 ——
+      // 跟着改会让页面在缩放过程中乱跳，所以缩放到非 1 时一律不更新
+      if (vv && vv.scale > 1.01) return;
+      setViewportHeight(vv?.height || window.innerHeight);
+      setViewportTop(Math.max(0, vv?.offsetTop || 0));
     };
 
     syncHeight();
@@ -669,6 +706,8 @@ export default function App() {
           ? {
               height: `calc(${viewportHeight}px + env(safe-area-inset-bottom))`,
               width: '100vw',
+              // 补掉键盘弹出时视觉视口的滚动量，否则整页会被顶出屏幕顶部
+              marginTop: `${viewportTop}px`,
               paddingTop: 'env(safe-area-inset-top)',
               paddingBottom: 'env(safe-area-inset-bottom)',
             }
@@ -810,16 +849,12 @@ export default function App() {
                      reconnectMode={tab.reconnectMode}
                      initialError={tab.error}
                      onQuickCommandsChange={handleQuickCommandsChange}
-                     onAskAi={(payload) => {
-                       setAiRequest({
-                         text: payload.text,
-                         source: payload.source,
-                         host: tab.sshInfo?.host,
-                         username: tab.sshInfo?.username,
-                       });
-                       setAiTabId(tab.id);
-                     }}
+                     // 工具栏那颗按钮只负责把面板打开，不触发任何请求 ——
+                     // 「分析」是面板里那个按钮的事，得用户再点一次
+                     onOpenAi={() => setAiTabId(tab.id)}
                      onRegisterCommandSink={registerCommandSink(tab.id)}
+                     onRegisterExecBridge={registerExecBridge(tab.id)}
+                     onRegisterContextSource={registerContextSource(tab.id)}
                   />
                 </div>
 
@@ -844,14 +879,17 @@ export default function App() {
                 {aiTabId === tab.id && (
                   <AiPanel
                     theme={config.theme}
-                    request={aiRequest}
+                    target={{ host: tab.sshInfo?.host, username: tab.sshInfo?.username }}
+                    // Agent 复用这个 tab 的 SSH 会话；面板只拿到 id，连接仍归 /term 管
+                    sessionId={tab.sessionId}
+                    getContext={() => contextSourcesRef.current.get(tab.id)?.() ?? null}
                     terminalConnected={Boolean(tab.connected)}
                     onRunCommand={(command, submit) =>
                       commandSinksRef.current.get(tab.id)?.(command, submit) ?? false}
-                    onClose={() => {
-                      setAiTabId(null);
-                      setAiRequest(null);
-                    }}
+                    // 传 getter 而不是当时的值：桥是在子组件 effect 里注册的，
+                    // 而 effect 跑在父组件这次渲染之后 —— 渲染期读 ref 只会拿到 null
+                    getExecBridge={() => execBridgesRef.current.get(tab.id) ?? null}
+                    onClose={() => setAiTabId(null)}
                   />
                 )}
               </div>

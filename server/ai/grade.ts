@@ -34,7 +34,13 @@ export interface GradeSegment {
   elevated: boolean;
   level: RiskLevel;
   hits: string[];
+  /**
+   * 这一段属于「只读」（命中内置只读表）**或**在用户配置的允许名单里。
+   * 它参与的是**风险等级**判断，不是「能不能自动跑」。
+   */
   whitelisted: boolean;
+  /** 这一段的二进制**明确出现在用户配置的允许名单里** */
+  allowlisted: boolean;
 }
 
 export interface GradeResult {
@@ -44,11 +50,25 @@ export interface GradeResult {
   /** 人话摘要，直接可以显示在面板上 */
   reasons: string[];
   segments: GradeSegment[];
-  /** 每个片段都在只读白名单内 */
+  /**
+   * 每个片段都够「只读」。
+   *
+   * 注意：这**不等于**用户授权的允许名单 —— 内置只读表覆盖了 ps / ls / cat 等一大批
+   * 命令，所以几乎所有 safe 命令都会是 true。把它当成「没查出危险操作」来用，
+   * 不要当成「用户同意无人值守」。
+   */
   allWhitelisted: boolean;
+  /** 每个片段的二进制都在用户配置的允许名单里 —— 这才是用户显式授权的自动执行 */
+  allAllowlisted: boolean;
   /** 会话登录用户是否为 root */
   rootSession: boolean;
-  /** 是否允许无人值守自动执行（Agent 模式只对这类放开） */
+  /**
+   * 是否允许无人值守自动执行（Agent 模式只对这类放开）。
+   *
+   * 三个条件缺一不可，且**必须包含用户的显式授权**：风险为 safe、每个命令都在
+   * 允许名单里、且不是 root 会话。默认允许名单为空 → 默认什么都不自动跑，
+   * 与「禁止 AI 默认自动执行」一致。
+   */
   autoRunnable: boolean;
 }
 
@@ -461,6 +481,8 @@ function gradeInternal(command: string, options: GradeOptions, depth: number): G
       level,
       hits: segmentHits,
       whitelisted: !analysis.elevated && isWhitelisted(analysis, extra),
+      // 提权的命令一律不算用户授权（sudo 出来的效果远超名单里的字面命令）
+      allowlisted: !analysis.elevated && Boolean(analysis.binary) && extra.includes(analysis.binary as string),
     };
   });
 
@@ -470,7 +492,8 @@ function gradeInternal(command: string, options: GradeOptions, depth: number): G
   }
 
   const allWhitelisted = segments.length > 0 && segments.every((s) => s.whitelisted);
-  const autoRunnable = level === 'safe' && allWhitelisted && !rootSession;
+  const allAllowlisted = segments.length > 0 && segments.every((s) => s.allowlisted);
+  const autoRunnable = level === 'safe' && allAllowlisted && !rootSession;
 
   return {
     level,
@@ -478,6 +501,7 @@ function gradeInternal(command: string, options: GradeOptions, depth: number): G
     reasons: hits.map((h) => h.label),
     segments,
     allWhitelisted,
+    allAllowlisted,
     rootSession,
     autoRunnable,
   };

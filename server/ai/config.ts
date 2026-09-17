@@ -117,13 +117,13 @@ export function resolveAiConfig(): ResolvedAiConfig {
     ? clamp(Number(settings.maxOutputTokens), MIN_MAX_OUTPUT_TOKENS, MAX_MAX_OUTPUT_TOKENS)
     : DEFAULT_MAX_OUTPUT_TOKENS;
 
+  // apiKey **不参与**就绪判定：局域网网关（ollama / vLLM / one-api 直连）多数不校验 key，
+  // 强制要求会逼用户编一个假 key。真要鉴权的端点会在调用时报 401，错误照样能看见。
   const reason = !baseUrl
-    ? '尚未填写模型服务地址'
+    ? 'Base URL not set'
     : !model
-      ? '尚未填写模型名称'
-      : !apiKey
-        ? '尚未填写 API Key'
-        : undefined;
+      ? 'Model not set'
+      : undefined;
 
   return {
     // 三项齐备才默认开启；用户显式关掉则以用户为准

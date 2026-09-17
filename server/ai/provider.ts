@@ -30,6 +30,49 @@ export class AiProviderError extends Error {
   }
 }
 
+/* --------------------------- Tool calling --------------------------- */
+
+/** OpenAI 格式的工具声明 */
+export interface ToolSchema {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+}
+
+/** 模型要求调用的一个工具。`arguments` 是**字符串**，要不要解析由调用方决定 */
+export interface ToolCallSpec {
+  id: string;
+  type: 'function';
+  function: { name: string; arguments: string };
+}
+
+/** 工具执行结果回灌给模型的那条消息 */
+export interface ToolResultMessage {
+  role: 'tool';
+  tool_call_id: string;
+  content: string;
+}
+
+/** 带 tool_calls 的 assistant 消息。原样回灌，模型才知道自己在等哪个调用的结果 */
+export interface AssistantToolCallMessage {
+  role: 'assistant';
+  content: string | null;
+  tool_calls: ToolCallSpec[];
+}
+
+export type LLMessage = ChatMessage | ToolResultMessage | AssistantToolCallMessage;
+
+export interface ChatCompletionResult {
+  message: { role: 'assistant'; content: string | null; tool_calls?: ToolCallSpec[] };
+  model?: string;
+  usage?: StreamUsage;
+  finishReason?: string;
+  ms: number;
+}
+
 const DEFAULT_TIMEOUT_MS = 120000;
 
 function extractErrorMessage(body: string) {
@@ -43,9 +86,10 @@ function extractErrorMessage(body: string) {
 
 async function postChat(
   config: ResolvedAiConfig,
-  messages: ChatMessage[],
+  messages: LLMessage[],
   stream: boolean,
   signal: AbortSignal,
+  tools?: ToolSchema[],
 ): Promise<Response> {
   const endpoint = resolveChatEndpoint(config.baseUrl);
   const payload: Record<string, unknown> = {
@@ -56,13 +100,17 @@ async function postChat(
     temperature: 0.2,
   };
   if (stream) payload.stream_options = { include_usage: true };
+  // 只在真的有工具时带上：不带工具却被网关以「不支持 tools」拒掉的悲剧就不用演了
+  if (tools && tools.length) payload.tools = tools;
+
+  // 局域网网关（ollama / vLLM / one-api 直连）通常不校验 key。留空就**不发**这个头，
+  // 而不是逼用户编一个假 key —— 假 key 会被真实网关拒掉，反而把问题掩盖成 401。
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
 
   const send = (body: Record<string, unknown>) => fetch(endpoint, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${config.apiKey}`,
-    },
+    headers,
     body: JSON.stringify(body),
     signal,
   });
@@ -76,7 +124,7 @@ async function postChat(
       delete payload.stream_options;
       return send(payload);
     }
-    throw new AiProviderError(`模型服务返回 400：${extractErrorMessage(body)}`, 400);
+    throw new AiProviderError(`Model service returned 400: ${extractErrorMessage(body)}`, 400);
   }
 
   return response;
@@ -91,8 +139,7 @@ export async function streamChatCompletion(args: {
 }): Promise<StreamOutcome> {
   const { config, messages, signal, onDelta } = args;
   const endpoint = resolveChatEndpoint(config.baseUrl);
-  if (!endpoint) throw new AiProviderError('模型服务地址未配置');
-  if (!config.apiKey) throw new AiProviderError('API Key 未配置');
+  if (!endpoint) throw new AiProviderError('Base URL not set');
 
   // 外部取消 + 总超时合成一个内部 signal，避免把超时暴露成「用户取消」
   const controller = new AbortController();
@@ -105,7 +152,7 @@ export async function streamChatCompletion(args: {
 
     if (!response.ok) {
       const body = await response.text().catch(() => '');
-      throw new AiProviderError(`模型服务返回 ${response.status}：${extractErrorMessage(body)}`, response.status);
+      throw new AiProviderError(`Model service returned ${response.status}: ${extractErrorMessage(body)}`, response.status);
     }
 
     const contentType = response.headers.get('content-type') || '';
@@ -122,14 +169,14 @@ export async function streamChatCompletion(args: {
         model = parsed?.model;
         usage = parsed?.usage;
       } catch {
-        throw new AiProviderError(`模型服务返回了无法解析的内容（content-type=${contentType || 'unknown'}）`);
+        throw new AiProviderError(`Model service returned unparsable content (content-type=${contentType || 'unknown'})`);
       }
       if (content) onDelta(content);
       return { model, usage, chars: content.length, firstTokenMs: content ? Date.now() : undefined };
     }
 
     const reader = response.body?.getReader();
-    if (!reader) throw new AiProviderError('模型服务没有返回响应体');
+    if (!reader) throw new AiProviderError('Model service returned no body');
 
     const decoder = new TextDecoder();
     let buffer = '';
@@ -155,7 +202,7 @@ export async function streamChatCompletion(args: {
         } catch {
           continue; // 不完整或非 JSON 的帧，跳过而不是炸掉整条流
         }
-        if (json.error) throw new AiProviderError(json.error.message || '模型服务返回错误');
+        if (json.error) throw new AiProviderError(json.error.message || 'Model service error');
         if (json.model) model = json.model;
         if (json.usage) usage = json.usage;
 
@@ -187,10 +234,92 @@ export async function streamChatCompletion(args: {
 
     return { model, usage, finishReason, chars, firstTokenMs };
   } catch (err: any) {
-    if (signal.aborted) throw new AiProviderError('已取消');
-    if (err?.name === 'AbortError') throw new AiProviderError('请求模型服务超时');
+    if (signal.aborted) throw new AiProviderError('Cancelled');
+    if (err?.name === 'AbortError') throw new AiProviderError('Model request timed out');
     if (err instanceof AiProviderError) throw err;
-    throw new AiProviderError(`调用模型服务失败：${err?.message || err}`);
+    throw new AiProviderError(`Model request failed: ${err?.message || err}`);
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
+/**
+ * 一次**非流式**对话，供 Agent Loop 使用。
+ *
+ * 为什么不流式：Agent 回合的中间产物是 `tool_calls`，逐 token 流出来对用户毫无意义
+ * （而且流式 tool_calls 是分片增量，拼装比这里整段解析麻烦得多）。
+ * 进度靠 `agent_tool_call` / `agent_tool_result` 事件体现，那才是人看得懂的东西。
+ *
+ * `tools` 直接透传给网关：不绑 SDK，也不做「模拟 tool calling」
+ * （有些框架在模型不支持时用提示词假装，那种假装有结构性缺陷，不做）。
+ */
+export async function chatCompletion(args: {
+  config: ResolvedAiConfig;
+  messages: LLMessage[];
+  tools?: ToolSchema[];
+  signal: AbortSignal;
+  timeoutMs?: number;
+}): Promise<ChatCompletionResult> {
+  const { config, messages, signal } = args;
+  if (!resolveChatEndpoint(config.baseUrl)) throw new AiProviderError('Base URL not set');
+
+  const controller = new AbortController();
+  const onAbort = () => controller.abort();
+  signal.addEventListener('abort', onAbort, { once: true });
+  const timer = setTimeout(() => controller.abort(), args.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const startedAt = Date.now();
+
+  try {
+    const response = await postChat(config, messages, false, controller.signal, args.tools);
+    const body = await response.text();
+
+    if (!response.ok) {
+      /**
+       * 网关不认 `tools` 太常见了（老版本 vLLM、某些中转层）。
+       * 这种 400 必须说人话 —— 否则用户只看到「HTTP 400」，第一反应是自己把地址填错了，
+       * 而真正的原因是这个模型端点不支持 function calling。
+       */
+      if (response.status === 400 && args.tools?.length && /tool|function_call/i.test(body)) {
+        throw new AiProviderError(
+          'This model endpoint rejected tool calling, which the Agent needs. '
+          + 'Use a model with function-calling support, or use Explain / Generate command instead.',
+          400,
+        );
+      }
+      throw new AiProviderError(`Model service returned ${response.status}: ${extractErrorMessage(body)}`, response.status);
+    }
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      throw new AiProviderError('Model service returned unparsable JSON');
+    }
+    if (parsed?.error) throw new AiProviderError(parsed.error?.message || 'Model service error');
+
+    const choice = parsed?.choices?.[0];
+    const raw = choice?.message ?? {};
+    const toolCalls = Array.isArray(raw.tool_calls)
+      ? raw.tool_calls.filter((call: any) => call?.id && call?.function?.name)
+      : undefined;
+
+    return {
+      message: {
+        role: 'assistant',
+        content: typeof raw.content === 'string' ? raw.content : null,
+        ...(toolCalls && toolCalls.length ? { tool_calls: toolCalls } : {}),
+      },
+      model: parsed.model,
+      usage: parsed.usage,
+      finishReason: choice?.finish_reason,
+      ms: Date.now() - startedAt,
+    };
+  } catch (err: any) {
+    if (signal.aborted) throw new AiProviderError('Cancelled');
+    if (err?.name === 'AbortError') throw new AiProviderError('Model request timed out');
+    if (err instanceof AiProviderError) throw err;
+    throw new AiProviderError(`Model request failed: ${err?.message || err}`);
   } finally {
     clearTimeout(timer);
     signal.removeEventListener('abort', onAbort);
@@ -199,8 +328,7 @@ export async function streamChatCompletion(args: {
 
 /** 配置页的「测试连接」：一次最小的非流式调用，只关心能不能通。 */
 export async function verifyAiConfig(config: ResolvedAiConfig): Promise<{ ok: boolean; message: string; model?: string }> {
-  if (!resolveChatEndpoint(config.baseUrl)) return { ok: false, message: '模型服务地址未配置' };
-  if (!config.apiKey) return { ok: false, message: 'API Key 未配置' };
+  if (!resolveChatEndpoint(config.baseUrl)) return { ok: false, message: 'Base URL not set' };
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20000);
@@ -213,15 +341,15 @@ export async function verifyAiConfig(config: ResolvedAiConfig): Promise<{ ok: bo
     );
     const body = await response.text();
     if (!response.ok) {
-      return { ok: false, message: `HTTP ${response.status}：${extractErrorMessage(body)}` };
+      return { ok: false, message: `HTTP ${response.status}: ${extractErrorMessage(body)}` };
     }
     let model: string | undefined;
     try {
       model = JSON.parse(body)?.model;
     } catch {}
-    return { ok: true, message: '连接正常', model };
+    return { ok: true, message: 'Connected', model };
   } catch (err: any) {
-    return { ok: false, message: err?.name === 'AbortError' ? '连接超时' : `连接失败：${err?.message || err}` };
+    return { ok: false, message: err?.name === 'AbortError' ? 'Timed out' : `Connection failed: ${err?.message || err}` };
   } finally {
     clearTimeout(timer);
   }

@@ -14,7 +14,7 @@ export const CHARS_PER_TOKEN = 2;
 /** 裁剪时头部保留的比例，其余留给尾部 —— 日志的结论通常在最后 */
 const HEAD_RATIO = 0.35;
 
-export const DEFAULT_QUESTION = '请解释这段终端输出：有没有异常？问题出在哪？下一步该查什么？';
+export const DEFAULT_QUESTION = 'Explain this terminal output: any errors, what is wrong, what to check next?';
 
 export interface RawContext {
   text: string;
@@ -81,7 +81,7 @@ export function collapseRepeats(text: string): { text: string; collapsed: number
     while (i + run < lines.length && lines[i + run] === lines[i]) run += 1;
 
     if (run >= 3 && lines[i].trim() !== '') {
-      output.push(`${lines[i]}    … 同上重复 ${run} 次`);
+      output.push(`${lines[i]}    … repeated ${run}x`);
       collapsed += run - 1;
     } else {
       for (let k = 0; k < run; k += 1) output.push(lines[i]);
@@ -113,7 +113,7 @@ export function clipMiddle(text: string, maxChars: number): { text: string; omit
 
   const omittedLines = Math.max(0, lineCount(text) - lineCount(head) - lineCount(tail));
   return {
-    text: `${head}\n\n… 略过 ${omittedLines} 行 …\n\n${tail}`,
+    text: `${head}\n\n… ${omittedLines} lines omitted …\n\n${tail}`,
     omittedLines,
     truncated: true,
   };
@@ -121,12 +121,12 @@ export function clipMiddle(text: string, maxChars: number): { text: string; omit
 
 function buildEnvLine(raw: RawContext): string {
   const parts: string[] = [];
-  if (raw.host) parts.push(`主机 ${raw.host}`);
-  if (raw.username) parts.push(`用户 ${raw.username}`);
-  if (raw.cwd) parts.push(`目录 ${raw.cwd}`);
-  if (raw.os) parts.push(`系统 ${raw.os}`);
+  if (raw.host) parts.push(`host ${raw.host}`);
+  if (raw.username) parts.push(`user ${raw.username}`);
+  if (raw.cwd) parts.push(`cwd ${raw.cwd}`);
+  if (raw.os) parts.push(`os ${raw.os}`);
   if (raw.shell) parts.push(`shell ${raw.shell}`);
-  parts.push(raw.source === 'selection' ? '来源：用户选中的终端片段' : '来源：终端最后若干行');
+  parts.push(raw.source === 'selection' ? 'source: selected output' : 'source: last lines');
   return parts.join(' | ');
 }
 

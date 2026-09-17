@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useLayoutEffect } from 'react';
+import React, { useCallback, useEffect, useRef, useState, useLayoutEffect } from 'react';
 import { Terminal as XTerminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
@@ -6,6 +6,7 @@ import '@xterm/xterm/css/xterm.css';
 import { SSHInfo, WebSSHConfig } from '../../types';
 import { wsUrl } from '../../api';
 import { sysClient, SessionHealth } from '../../sysClient';
+import type { TerminalBridge, AiExecResult, AiSessionIdent } from '../../aiClient';
 import { sessionGet, sessionSet, globalGet, globalSet } from '../../storage';
 import {
   Copy,
@@ -38,13 +39,30 @@ interface TerminalViewProps {
   onNewSession?: () => void;
   initialError?: string;
   onQuickCommandsChange?: (cmds: WebSSHConfig['quickCommands']) => void;
-  /** 请求 AI 诊断：带上要分析的文本与来源（选区 / 末尾若干行） */
-  onAskAi?: (payload: { text: string; source: 'selection' | 'tail' }) => void;
+  /**
+   * 打开 AI 面板。**只打开，不带文本** —— 以前这颗按钮会顺手抓一份上下文并直接开跑，
+   * 用户还没决定要问什么，几十 KB 终端文本就已经出网了。现在文本由面板在点
+   * 「Explain」时通过 `onRegisterContextSource` 现取。
+   */
+  onOpenAi?: () => void;
+  /**
+   * 把「取当前终端上下文」的能力交给上层（AI 面板用）：有选区取选区，否则取末尾若干行。
+   * 注册的是**取数函数**而不是数据本身，这样每次调用拿到的都是当时的屏幕内容。
+   */
+  onRegisterContextSource?: (source: (() => { text: string; source: 'selection' | 'tail' }) | null) => void;
   /**
    * 把「向终端写命令」的能力交给上层（AI 面板用）。
    * 连接就绪时注册，断开或卸载时用 null 注销；`submit` 为 false 时只填不回车。
    */
   onRegisterCommandSink?: (sink: ((command: string, submit: boolean) => boolean) | null) => void;
+  /**
+   * 把「结构化执行 + 身份探测」的能力交给上层（Agent 面板用）。
+   *
+   * 与 onRegisterCommandSink 的区别：那条路把命令写进用户的输入行、由用户按回车；
+   * 这条路走 /term 的 exec_capture，**不经过 PTY，终端里看不到**。所以拿到这个桥的
+   * 调用方有义务把命令原文完整展示给用户 —— 这是「看不见」的唯一补偿。
+   */
+  onRegisterExecBridge?: (bridge: TerminalBridge | null) => void;
 }
 
 export const TerminalView: React.FC<TerminalViewProps> = ({
@@ -62,8 +80,10 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   onNewSession,
   initialError,
   onQuickCommandsChange,
-  onAskAi,
+  onOpenAi,
+  onRegisterContextSource,
   onRegisterCommandSink,
+  onRegisterExecBridge,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<XTerminal | null>(null);
@@ -71,6 +91,13 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const wsRef = useRef<WebSocket | null>(null);
   /** 每渲染刷新一次的命令下发实现，供稳定的注册函数间接调用 */
   const commandSinkRef = useRef<((command: string, submit: boolean) => boolean) | null>(null);
+  /** 每渲染刷新一次的采集桥实现，同样由稳定注册函数间接调用 */
+  const execBridgeRef = useRef<TerminalBridge | null>(null);
+  /** 等待 /term 回执的采集/身份请求；连接断开时必须逐个补齐，否则 Agent 循环会空等 */
+  const bridgePendingRef = useRef(new Map<string, { resolve: (value: any) => void; timer: number; onClose: unknown }>());
+  const bridgeSeqRef = useRef(0);
+  /** 结算一个挂起请求；meta 分发处通过它回调，避免依赖闭包里的最新实现 */
+  const settleBridgeRef = useRef<(key: string, value: unknown) => void>(() => {});
   const decoderRef = useRef<TextDecoder | null>(null);
   const connectionCleanupRef = useRef<(() => void) | null>(null);
   const connectionAttemptRef = useRef<number>(0);
@@ -577,20 +604,17 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   };
 
   /**
-   * AI 诊断的入参准备。
+   * 取当前终端上下文：有选区取选区，否则取末尾若干行。
    *
-   * 没选中内容时取终端末尾若干行 —— 这里直接读 xterm 的 buffer 而不是重放字节流：
-   * `translateToString()` 拿到的已经是渲染后的纯文本，ANSI 控制序列天然不存在，
-   * 省掉了在服务端（或这里）再写一遍剥离逻辑。
+   * 没选中内容时读 xterm 的 buffer 而不是重放字节流：`translateToString()` 拿到的
+   * 已经是渲染后的纯文本，ANSI 控制序列天然不存在，省掉了在服务端（或这里）再写一遍剥离逻辑。
+   *
+   * 纯函数、不发起任何请求 —— 抓上下文和「拿它去问模型」是两件事，中间隔着用户那一次点击。
    */
-  const handleAskAi = () => {
-    if (!onAskAi) return;
+  const captureAiContext = useCallback((): { text: string; source: 'selection' | 'tail' } => {
     const term = terminalRef.current;
     const selection = term?.getSelection() || selectedText;
-    if (selection && selection.trim()) {
-      onAskAi({ text: selection, source: 'selection' });
-      return;
-    }
+    if (selection && selection.trim()) return { text: selection, source: 'selection' };
 
     const buffer = term?.buffer.active;
     const lines: string[] = [];
@@ -600,8 +624,10 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         lines.push(buffer.getLine(i)?.translateToString(true) ?? '');
       }
     }
-    onAskAi({ text: lines.join('\n'), source: 'tail' });
-  };
+    return { text: lines.join('\n'), source: 'tail' };
+  }, [selectedText]);
+
+  const handleOpenAi = () => onOpenAi?.();
 
   /**
    * 命令下发通道（AI 面板 → 终端输入行）。
@@ -633,6 +659,88 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     onRegisterCommandSink(stable);
     return () => onRegisterCommandSink(null);
   }, [connected, onRegisterCommandSink]);
+
+  /**
+   * 结构化采集桥（Agent 面板 → /term 的 exec_capture / session_ident）。
+   *
+   * 请求-响应靠自增 id 配对；两边都设超时，避免对端没回执时把 Agent 循环挂死。
+   * 每个挂起项都带一个 `onClose` 值：连接断开时用它立即结算，而不是让调用方等超时。
+   */
+  useEffect(() => {
+    const settle = (key: string, value: unknown) => {
+      const entry = bridgePendingRef.current.get(key);
+      if (!entry) return;
+      bridgePendingRef.current.delete(key);
+      window.clearTimeout(entry.timer);
+      entry.resolve(value);
+    };
+    settleBridgeRef.current = settle;
+    execBridgeRef.current = {
+      capture: (command, options) => new Promise<AiExecResult>((resolve) => {
+        const ws = wsRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          resolve({ status: 'no-shell', error: 'not connected' });
+          return;
+        }
+        const id = `c${Date.now().toString(36)}-${++bridgeSeqRef.current}`;
+        const timer = window.setTimeout(() => {
+          bridgePendingRef.current.delete(id);
+          resolve({ status: 'error', error: 'capture reply timed out' });
+        }, (options?.timeoutMs ?? 20000) + 5000);
+        bridgePendingRef.current.set(id, { resolve, timer, onClose: { status: 'error', error: 'connection closed' } });
+        ws.send(JSON.stringify({
+          type: 'exec_capture',
+          id,
+          command,
+          ...(options?.timeoutMs ? { timeoutMs: options.timeoutMs } : {}),
+          ...(options?.auto ? { auto: true } : {}),
+        }));
+      }),
+      identify: () => new Promise<AiSessionIdent>((resolve) => {
+        const ws = wsRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          resolve({ status: 'unavailable' });
+          return;
+        }
+        const id = `s${Date.now().toString(36)}-${++bridgeSeqRef.current}`;
+        const timer = window.setTimeout(() => {
+          bridgePendingRef.current.delete(id);
+          resolve({ status: 'unavailable' });
+        }, 15000);
+        bridgePendingRef.current.set(id, { resolve, timer, onClose: { status: 'unavailable' } });
+        ws.send(JSON.stringify({ type: 'session_ident', id }));
+      }),
+    };
+  });
+
+  useEffect(() => {
+    if (!onRegisterExecBridge) return;
+    if (!connected) {
+      onRegisterExecBridge(null);
+      return;
+    }
+    const stable: TerminalBridge = {
+      capture: (command, options) => execBridgeRef.current?.capture(command, options)
+        ?? Promise.resolve<AiExecResult>({ status: 'no-shell', error: 'bridge unavailable' }),
+      identify: () => execBridgeRef.current?.identify()
+        ?? Promise.resolve<AiSessionIdent>({ status: 'unavailable' }),
+    };
+    onRegisterExecBridge(stable);
+    return () => onRegisterExecBridge(null);
+  }, [connected, onRegisterExecBridge]);
+
+  /**
+   * 上下文取源。注册的是包装函数，内部每次转发到最新的 `captureAiContext`
+   * —— 选区状态每次渲染都在变，注册一次就固化会拿到过期的闭包。
+   */
+  const contextSourceRef = useRef(captureAiContext);
+  contextSourceRef.current = captureAiContext;
+  useEffect(() => {
+    if (!onRegisterContextSource) return;
+    const stable = () => contextSourceRef.current();
+    onRegisterContextSource(stable);
+    return () => onRegisterContextSource(null);
+  }, [onRegisterContextSource]);
 
   const handleCopySelection = () => {
     const selection = terminalRef.current?.getSelection() || selectedText;
@@ -899,6 +1007,13 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         try {
           const meta = JSON.parse(event.data.slice(WS_META_PREFIX.length));
           pushDebugEvent(`ws meta ${JSON.stringify(meta)}`);
+
+          // 采集 / 身份回执：配对挂起请求后就结束，不参与下面的连接状态处理
+          if ((meta.type === 'exec_result' || meta.type === 'session_ident') && typeof meta.id === 'string') {
+            settleBridgeRef.current(meta.id, meta);
+            return;
+          }
+
           if (meta.type === 'session_info') {
             if (typeof meta.shared === 'boolean') setSharedSession(meta.shared);
             if (typeof meta.sessionId === 'string') {
@@ -1093,6 +1208,18 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       }
       if (sysUnsubscribeRef.current) sysUnsubscribeRef.current();
       lastHeartbeatPingAtRef.current = null;
+
+      // 连接断了，挂起的采集/身份请求不可能再收到回执：立刻按失败结算，
+      // 否则 Agent 循环要空等到各自的超时（最长 25s）才知道这一步没结果
+      if (bridgePendingRef.current.size) {
+        const entries: Array<{ resolve: (value: any) => void; timer: number; onClose: unknown }> = [];
+        bridgePendingRef.current.forEach((entry) => entries.push(entry));
+        bridgePendingRef.current.clear();
+        for (const entry of entries) {
+          window.clearTimeout(entry.timer);
+          entry.resolve(entry.onClose);
+        }
+      }
       if (heartbeatTimeoutRef.current !== null) {
         window.clearTimeout(heartbeatTimeoutRef.current);
         heartbeatTimeoutRef.current = null;
@@ -1424,7 +1551,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         sshLatencyMs={sshLatencyMs}
         onSelectMode={handleOpenSelectionModal}
         onCopySelection={handleCopySelection}
-        onAskAi={handleAskAi}
+        onAskAi={handleOpenAi}
         onPaste={handlePaste}
         onToggleKeyBar={() => setShowKeyBar(!showKeyBar)}
         onToggleQuickCmds={() => setShowQuickCmds(!showQuickCmds)}

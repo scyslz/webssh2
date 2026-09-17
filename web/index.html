@@ -2,7 +2,10 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover" />
+    <!-- interactive-widget=resizes-content：软键盘弹出时让**布局视口**跟着缩小，
+         而不是把视觉视口滚一段（后者表现为整页上移）。Safari 不吃这个属性，
+         由 App 里 visualViewport 的 offsetTop 补偿兜底。 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
     <title>WebSSH</title>
     <meta name="description" content="Web-based SSH terminal and SFTP client" />
     <meta name="theme-color" content="#020617" />

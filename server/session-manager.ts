@@ -20,7 +20,7 @@ import {
   formatByteSize,
 } from './lib.ts';
 import { copyEntry, moveEntry, removeEntry, type OpContext } from './sftp-ops.ts';
-import { createExecRunner } from './remote-exec.ts';
+import { createExecRunner, execCapture } from './remote-exec.ts';
 import { handleAiConnection } from './ai/index.ts';
 
 interface SSHSession {
@@ -43,6 +43,15 @@ interface SSHSession {
   sshLatencyMs?: number;
   latencyProbeTimer?: NodeJS.Timeout;
   latencyProbeInFlight?: boolean;
+  /** 远端登录身份，懒探一次后缓存（见 resolveSessionIdentity） */
+  identity?: SessionIdentity;
+}
+
+/** 远端真实登录身份。**这是判「能不能自动执行」的唯一可信来源** */
+interface SessionIdentity {
+  user: string;
+  uid: number;
+  isRoot: boolean;
 }
 
 interface SysClient {
@@ -197,6 +206,30 @@ export function createSessionManager(): SessionManager {
   // 避免阻止进程退出
   if ((wsPingTimer as any).unref) (wsPingTimer as any).unref();
 
+  /**
+   * 所有 WebSocket 升级都必须走这里登记存活标记。
+   *
+   * noServer 模式下 `wss.handleUpgrade(request, socket, head, cb)` 用的是**自定义回调**，
+   * 它**不会触发 `wss.on('connection')`** —— 也就是说没有哪个钩子能自动兜住所有通道，
+   * 每个升级点都得自己挂。漏挂的后果非常隐蔽：`isAlive` 永远是 false，心跳第二轮
+   * 直接 `terminate()`，连接在 30~60 秒后被静默掐断，报出来的是和心跳毫不相干的
+   * 「连接断开」。`/ai` 就是这么漏的（2026-09-15 修）。
+   *
+   * 所以把「升级 + 登记」合成一个入口，让漏挂这件事在新加通道时不可能再发生。
+   */
+  function upgradeWithLiveness(
+    request: http.IncomingMessage,
+    socket: Duplex,
+    head: Buffer,
+    onReady: (ws: WebSocket) => void,
+  ) {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      (ws as any).isAlive = true;
+      (ws as any).on('pong', () => { (ws as any).isAlive = true; });
+      onReady(ws);
+    });
+  }
+
   function broadcastSessionSharedState(session: SSHSession) {
     for (const clientWs of session.attachedSockets) {
       if (clientWs.readyState === WebSocket.OPEN) {
@@ -318,9 +351,154 @@ export function createSessionManager(): SessionManager {
     };
   }
 
+  /* ---------------- AI Agent 的执行侧控制帧 ----------------
+   *
+   * 为什么放在 /term 而不是 /ai：/ai 是刻意无状态的，不持有 SSH 凭据、不知道 sessionId，
+   * 这是 P0 立下的信任边界 —— 模型那侧永远碰不到 SSH。所以执行必须由**持有会话的
+   * 终端通道**来做，浏览器当经纪人，在两者之间转手。
+   *
+   * 两条帧：
+   *  - `session_ident`：实测远端登录身份（`id -un` / `id -u`），懒探一次后缓存。
+   *    前端自报的用户名不足为凭，只有这里知道的才是真的。
+   *  - `exec_capture`：跑一条命令并带回 stdout / stderr / 退出码。带 `auto` 的帧表示
+   *    没有用户点过这一步（Agent 循环发起），此时 root 会话与身份未知的会话一律拒绝。
+   *
+   * 注意 `exec_capture` 是被执行**看不见的**：走 conn.exec()，不经过用户的 PTY，终端里
+   * 不会显示。因此它比「填入输入行」少了一层肉眼可见性，调用方（Agent 面板）必须把
+   * 命令原文完整展示给用户，这是唯一的补偿。
+   */
+  const captureInflight = new Map<WebSocket, number>();
+  const MAX_CAPTURE_INFLIGHT = 2;
+  const MAX_CAPTURE_COMMAND_BYTES = 8 * 1024;
+  const MAX_CAPTURE_TIMEOUT_MS = 120_000;
+
+  /** 身份探测中：多个请求复用同一次探测，避免并发开一堆 channel */
+  const identInflight = new WeakMap<SSHSession, Promise<SessionIdentity | null>>();
+
+  /**
+   * 探一次远端真实登录身份并缓存。
+   *
+   * 为什么必须实测：前端自报的用户名不可信 —— 它可能来自 URL 参数、可能被 UI 传错，
+   * 而「是不是 root」直接决定能不能无人值守执行。`id -u` 是唯一说了算的答案。
+   * 拿不到（受限账号没有 shell、命令被 ForceCommand 换掉）就返回 null，调用方按
+   * **不自动执行**处理。
+   */
+  function resolveSessionIdentity(session: SSHSession): Promise<SessionIdentity | null> {
+    if (session.identity) return Promise.resolve(session.identity);
+    const running = identInflight.get(session);
+    if (running) return running;
+
+    const task = execCapture(session.client, 'id -un; id -u', { timeoutMs: 5000, enforceRemoteTimeout: true })
+      .then((outcome) => {
+        if (outcome.kind !== 'captured' || outcome.code !== 0) return null;
+        const lines = outcome.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+        if (lines.length < 2) return null;
+        const uid = Number(lines[1]);
+        if (!Number.isFinite(uid)) return null;
+        const identity: SessionIdentity = { user: lines[0], uid, isRoot: uid === 0 };
+        session.identity = identity;
+        return identity;
+      })
+      .catch(() => null)
+      .finally(() => { identInflight.delete(session); });
+
+    identInflight.set(session, task);
+    return task;
+  }
+
+  function handleSessionIdent(session: SSHSession, ws: WebSocket, frame: any) {
+    const id = typeof frame.id === 'string' ? frame.id : undefined;
+    void resolveSessionIdentity(session).then((identity) => {
+      try {
+        sendMetaMessage(ws, {
+          type: 'session_ident',
+          ...(id ? { id } : {}),
+          status: identity ? 'ok' : 'unavailable',
+          ...(identity ? { user: identity.user, uid: identity.uid, isRoot: identity.isRoot } : {}),
+        });
+      } catch {}
+    });
+  }
+
+  function handleExecCapture(session: SSHSession, ws: WebSocket, frame: any) {
+    const id = typeof frame.id === 'string' ? frame.id : '';
+    if (!id) return;
+
+    const reply = (body: Record<string, unknown>) => {
+      try { sendMetaMessage(ws, { type: 'exec_result', id, ...body }); } catch {}
+    };
+
+    const command = typeof frame.command === 'string' ? frame.command.trim() : '';
+    if (!command) return reply({ status: 'rejected', error: 'empty command' });
+    if (command.length > MAX_CAPTURE_COMMAND_BYTES) return reply({ status: 'rejected', error: 'command too long' });
+
+    const client = session.client;
+    if (!client) return reply({ status: 'no-shell' });
+
+    const busy = captureInflight.get(ws) ?? 0;
+    if (busy >= MAX_CAPTURE_INFLIGHT) return reply({ status: 'rejected', error: 'too many concurrent captures' });
+    captureInflight.set(ws, busy + 1);
+    const release = () => {
+      const left = (captureInflight.get(ws) ?? 1) - 1;
+      if (left <= 0) captureInflight.delete(ws);
+      else captureInflight.set(ws, left);
+    };
+
+    // Agent 循环本身就是串行的，这里的并发上限只是防御性护栏
+    const requested = typeof frame.timeoutMs === 'number' && frame.timeoutMs > 0 ? frame.timeoutMs : undefined;
+    const timeoutMs = requested ? Math.min(requested, MAX_CAPTURE_TIMEOUT_MS) : undefined;
+    /** 无人值守执行：由 Agent 循环发起，没有用户点这一步 */
+    const isAuto = frame.auto === true;
+
+    // 日志只记元数据，不记命令正文（沿用 P1 的约定：命令里可能带凭据）
+    sshLog('exec capture requested', { sessionId: session.id, id, commandBytes: command.length, timeoutMs: timeoutMs ?? null, auto: isAuto });
+
+    void (async () => {
+      try {
+        if (isAuto) {
+          // root 会话一律不给无人值守执行。这条闸放在 /term 而不是 /ai，
+          // 因为只有这里能实测登录用户（/ai 是无状态的，收到什么都只能照信）。
+          const identity = await resolveSessionIdentity(session);
+          if (!identity) {
+            sshLog('exec capture auto refused (identity unavailable)', { sessionId: session.id, id });
+            return reply({ status: 'rejected', error: 'unattested-session' });
+          }
+          if (identity.isRoot) {
+            sshLog('exec capture auto refused (root session)', { sessionId: session.id, id, user: identity.user });
+            return reply({ status: 'rejected', error: 'root-session' });
+          }
+        }
+
+        const outcome = await execCapture(client, command, {
+          ...(timeoutMs ? { timeoutMs } : {}),
+          // 本地超时只能关通道，远端进程未必被连带杀掉；让远端自己设上限
+          enforceRemoteTimeout: true,
+        });
+
+        if (outcome.kind === 'no-shell') return reply({ status: 'no-shell' });
+        reply({
+          status: 'captured',
+          stdout: outcome.stdout,
+          stderr: outcome.stderr,
+          code: outcome.code,
+          truncated: outcome.truncated,
+          timedOut: outcome.timedOut,
+          durationMs: outcome.durationMs,
+          ...(outcome.channelError ? { channelError: outcome.channelError } : {}),
+        });
+        sshLog('exec capture finished', {
+          sessionId: session.id, id, code: outcome.code, timedOut: outcome.timedOut,
+          truncated: outcome.truncated, stdoutBytes: outcome.stdout.length, durationMs: outcome.durationMs,
+        });
+      } catch (e: any) {
+        reply({ status: 'error', error: e?.message || 'capture failed' });
+      } finally {
+        release();
+      }
+    })();
+  }
+
   function handleSysConnection(ws: WebSocket, windowId: string) {
-    (ws as any).isAlive = true;
-    (ws as any).on('pong', () => { (ws as any).isAlive = true; });
     const sys: SysClient = {
       windowId,
       ws,
@@ -359,8 +537,6 @@ export function createSessionManager(): SessionManager {
   }
 
   function handleSftpConnection(ws: WebSocket, url: URL) {
-    (ws as any).isAlive = true;
-    (ws as any).on('pong', () => { (ws as any).isAlive = true; });
     const sessionId = url.searchParams.get('sessionId') || '';
     if (!sessionId) {
       ws.close(1008, 'Missing sessionId');
@@ -721,7 +897,7 @@ export function createSessionManager(): SessionManager {
           return;
         }
         const windowId = url.searchParams.get('windowId') || 'default';
-        wss.handleUpgrade(request, socket, head, (ws) => {
+        upgradeWithLiveness(request, socket, head, (ws) => {
           handleSysConnection(ws, windowId);
         });
         return;
@@ -746,7 +922,7 @@ export function createSessionManager(): SessionManager {
           socket.destroy();
           return;
         }
-        wss.handleUpgrade(request, socket, head, (ws) => {
+        upgradeWithLiveness(request, socket, head, (ws) => {
           handleSftpConnection(ws, url);
         });
         return;
@@ -755,8 +931,14 @@ export function createSessionManager(): SessionManager {
       // /ai：与 SSH 会话无关的无状态通道，上下文由浏览器传入
       if (url.pathname === '/ai') {
         if (!authorizeUpgrade(request, socket)) return;
-        wss.handleUpgrade(request, socket, head, (ws) => {
-          handleAiConnection(ws);
+        upgradeWithLiveness(request, socket, head, (ws) => {
+          // 只借会话，不交出生命周期：Agent 用完就还，断开/回收仍然归这里管
+          handleAiConnection(ws, {
+            getSession: (id) => {
+              const session = sshSessions.get(id);
+              return session?.client ? { client: session.client } : undefined;
+            },
+          });
         });
         return;
       }
@@ -797,14 +979,12 @@ export function createSessionManager(): SessionManager {
       }
 
       sshLog('websocket upgrade accepted');
-      wss.handleUpgrade(request, socket, head, (ws) => {
+      upgradeWithLiveness(request, socket, head, (ws) => {
         wss.emit('connection', ws, request, url);
       });
     });
 
     wss.on('connection', (ws: WebSocket, _request: http.IncomingMessage, url: URL) => {
-      (ws as any).isAlive = true;
-      (ws as any).on('pong', () => { (ws as any).isAlive = true; });
       const sessionId = url.searchParams.get('sessionId') || url.searchParams.get('id') || '';
       const clientId = url.searchParams.get('clientId') || '';
       const sshInfoParam = url.searchParams.get('sshInfo') || '';
@@ -937,6 +1117,14 @@ export function createSessionManager(): SessionManager {
             if (parsed.type === 'rename_session' && typeof parsed.title === 'string') {
               existingSession.title = parsed.title;
               broadcastSessionTitle(existingSession);
+              return;
+            }
+            if (parsed.type === 'session_ident') {
+              handleSessionIdent(existingSession, ws, parsed);
+              return;
+            }
+            if (parsed.type === 'exec_capture') {
+              handleExecCapture(existingSession, ws, parsed);
               return;
             }
           } catch {}
