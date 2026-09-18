@@ -55,6 +55,14 @@ const HISTORY_CHAR_BUDGET = 120_000;
 /** 单次工具调用展示给界面的参数长度上限 */
 const MAX_DISPLAY_ARG_CHARS = 2000;
 
+/**
+ * 「session auto 已开」这个开关在 approvalMemory 里的 key。
+ *
+ * 用户在某条常规改动上点「Approve Session」后写入；之后同一 SSH 会话里的**常规改动**
+ * 都自动执行，直到会话结束（记忆挂 AiSession，跨重连/接管保留）。高危命令不受它影响。
+ */
+const AUTO_SESSION_KEY = '__auto_session__';
+
 export interface AgentToolCallView {
   id: string;
   name: string;
@@ -70,7 +78,19 @@ export interface AgentApprovalRequest {
   display: string;
   level: RiskLevel;
   reasons: string[];
+  /** 高危：界面只给 Approve / Deny，不给「Approve Session」 */
+  dangerous: boolean;
+  /** 是否提供「Approve Session」（常规改动为 true；高危恒 false） */
+  canRemember: boolean;
 }
+
+/** 一次审批的应答。remember=true 表示用户希望本轮内同类工具都自动放行 */
+export interface ApprovalDecision {
+  allow: boolean;
+  remember: boolean;
+}
+
+export type ApprovalMethod = 'once' | 'session';
 
 export interface AgentEventSink {
   /** 开始第 step 轮（从 1 起） */
@@ -79,8 +99,13 @@ export interface AgentEventSink {
   onMessage?: (text: string) => void;
   onToolCall?: (call: AgentToolCallView) => void;
   onToolResult?: (payload: { callId: string; name: string; output: string; truncated: boolean }) => void;
-  /** 需要人点头。resolve(false) = 拒绝；取消时应 resolve(false) 而不是挂住 */
-  requestApproval: (request: AgentApprovalRequest) => Promise<boolean>;
+  /**
+   * 因为「本次会话已放行」（approvalMemory 命中）而跳过审批时通知界面，
+   * 让前端把这条工具调用标成「auto-approved」，而不是让它悬在 awaiting 上。
+   */
+  onToolApproved?: (callId: string, method: ApprovalMethod) => void;
+  /** 需要人点头。resolve 的 decision.allow=false = 拒绝；取消时应 resolve(allow:false) 而不是挂住 */
+  requestApproval: (request: AgentApprovalRequest) => Promise<ApprovalDecision>;
 }
 
 export type AgentStopReason = 'final' | 'max-steps' | 'cancelled';
@@ -92,6 +117,32 @@ export interface AgentRunResult {
   /** 走过的工具调用次数 */
   toolCalls: number;
   modelCalls: number;
+}
+
+/**
+ * 审批记忆：一次请求内的「同类自动放行」判定。
+ *
+ * 默认每次需要审批的工具调用都问人；用户点「Allow for this session」后，
+ * 同一类工具（按 `signature` 区分）之后的调用就不再打断。
+ * 记忆只活在**这一次 runAgent 请求**里 —— 不跨请求、不落盘、进程重启即失，
+ * 符合「最小授权面」的基调（见 index.ts 顶部说明）。
+ */
+export interface ApprovalMemory {
+  /** 该请求内是否已对这一类工具做过「session 级」放行 */
+  isAllowed(signature: string): boolean;
+  /** 记录一次 session 级放行 */
+  remember(signature: string): void;
+  /** 当前已放行的签名数量，仅用于日志/遥测 */
+  size(): number;
+}
+
+export function createApprovalMemory(): ApprovalMemory {
+  const allowed = new Set<string>();
+  return {
+    isAllowed: (sig) => allowed.has(sig),
+    remember: (sig) => { allowed.add(sig); },
+    size: () => allowed.size,
+  };
 }
 
 export interface AgentRunArgs {
@@ -106,6 +157,8 @@ export interface AgentRunArgs {
   events: AgentEventSink;
   /** 单轮模型调用的超时 */
   modelTimeoutMs?: number;
+  /** 审批记忆：命中即跳过人工审批。不传则每次都问人 */
+  approvalMemory?: ApprovalMemory;
 }
 
 /** 把古老的工具输出清掉，给最近几步腾地方 */
@@ -179,12 +232,12 @@ export async function runAgentLoop(args: AgentRunArgs): Promise<AgentRunResult> 
       // 原样回灌 assistant 的 tool_calls：模型靠 id 把结果对回自己的请求
       history.push({ role: 'assistant', content: content ?? null, tool_calls: calls });
 
-      for (const call of calls.slice(0, MAX_TOOL_CALLS_PER_TURN)) {
+       for (const call of calls.slice(0, MAX_TOOL_CALLS_PER_TURN)) {
         if (signal.aborted) {
           return { answer: lastText, steps, stopReason: 'cancelled', toolCalls, modelCalls };
         }
         toolCalls += 1;
-        await runOneCall(call, ctx, history, events, signal);
+        await runOneCall(call, ctx, history, events, signal, args.approvalMemory);
       }
 
       trimHistory(history);
@@ -210,6 +263,7 @@ async function runOneCall(
   history: LLMessage[],
   events: AgentEventSink,
   signal: AbortSignal,
+  approvalMemory?: ApprovalMemory,
 ): Promise<void> {
   const callId = call.id;
   const name = call.function?.name || '';
@@ -255,30 +309,47 @@ async function runOneCall(
 
   if (plan.needsApproval) {
     /**
-     * 审批与取消赛跑。
-     *
-     * 界面那侧挂着一个永远没人点的对话框时，取消必须还能收得了场 ——
-     * 不能让人点了 Stop 之后，服务端还占着一个模型调用的上下文在那儿干等。
-     * 这条是兜底：正常路径下调用方（/ai 通道）收到 cancel 会主动以「拒绝」应答。
+     * session auto 是否已开：用户在某条常规改动上点过「Approve Session」。
+     * 单个 key 表示整个 SSH 会话级开关（挂在 AiSession.approvalMemory 上，跨连接保留）。
+     * 高危命令（plan.dangerous）**不看**这个开关，永远逐条确认。
      */
-    const allowed = await Promise.race([
-      events.requestApproval({
-        callId, name, arguments: parsed, display, level: plan.level, reasons: plan.reasons,
-      }),
-      new Promise<boolean>((resolve) => {
-        if (signal.aborted) return resolve(false);
-        signal.addEventListener('abort', () => resolve(false), { once: true });
-      }),
-    ]);
-    if (!allowed || signal.aborted) {
-      pushToolResult(history, events, {
-        callId,
-        name,
-        // 明确告诉它「别重试」：否则小模型会把同一条命令再发一遍
-        output: '[denied] The user declined this action. Do not retry it. '
-          + 'Continue with a read-only approach, or report what you found so far.',
-      });
-      return;
+    const autoOn = approvalMemory?.isAllowed(AUTO_SESSION_KEY) === true;
+
+    if (!plan.dangerous && plan.sessionRememberable && autoOn) {
+      // auto 已开 + 常规改动 → 直接跑，界面标 auto-approved
+      events.onToolApproved?.(callId, 'session');
+    } else {
+      /**
+       * 审批与取消赛跑。界面那侧挂着一个永远没人点的框时，取消必须还能收场 ——
+       * 不能让人点了 Stop 之后，服务端还占着一个模型调用的上下文干等。
+       */
+      const decision = await Promise.race([
+        events.requestApproval({
+          callId, name, arguments: parsed, display, level: plan.level, reasons: plan.reasons,
+          dangerous: plan.dangerous,
+          canRemember: plan.sessionRememberable,
+        }),
+        new Promise<ApprovalDecision>((resolve) => {
+          if (signal.aborted) return resolve({ allow: false, remember: false });
+          signal.addEventListener('abort', () => resolve({ allow: false, remember: false }), { once: true });
+        }),
+      ]);
+      if (!decision.allow || signal.aborted) {
+        pushToolResult(history, events, {
+          callId,
+          name,
+          // 明确告诉它「别重试」：否则小模型会把同一条命令再发一遍
+          output: '[denied] The user declined this action. Do not retry it. '
+            + 'Continue with a read-only approach, or report what you found so far.',
+        });
+        return;
+      }
+      // 常规改动 + 用户选了「Approve Session」→ 开启整个会话的 auto。
+      // 高危命令不允许 remember（canRemember=false），即便前端误传也忽略。
+      if (decision.remember && plan.sessionRememberable && !plan.dangerous) {
+        approvalMemory?.remember(AUTO_SESSION_KEY);
+        events.onToolApproved?.(callId, 'session');
+      }
     }
   }
 

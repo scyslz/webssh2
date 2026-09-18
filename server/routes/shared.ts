@@ -13,8 +13,7 @@ export function resolveSSHInfo(sessionManager: SessionManager, sessionId: string
 
 export function isSessionReusable(sessionManager: SessionManager, sessionId: string | undefined): boolean {
   if (!sessionId) return false;
-  const client = sessionManager.getSessionClient(sessionId);
-  return !!client && client.readyForAuth !== false;
+  return Boolean(sessionManager.getSessionClient(sessionId));
 }
 
 export function connectSSH(

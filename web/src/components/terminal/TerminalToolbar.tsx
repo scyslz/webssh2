@@ -86,7 +86,9 @@ export const TerminalToolbar: React.FC<TerminalToolbarProps> = ({
         isLight ? 'bg-slate-100 border-slate-200 text-slate-800' : 'bg-slate-900 border-slate-800 text-slate-100'
       }`}
     >
-      <div className="flex items-center gap-1 overflow-x-auto scrollbar-none">
+      {/* 左侧可横向滚动（min-w-0 让它能收缩，不会把右侧固定按钮挤出容器）；
+          右侧 shrink-0 固定，刷新/字号等按钮永远可见。 */}
+      <div className="flex items-center gap-1 overflow-x-auto scrollbar-none flex-1 min-w-0">
         <button
           onClick={onSelectMode}
           disabled={!(connected || offlineSuspended)}
@@ -117,24 +119,21 @@ export const TerminalToolbar: React.FC<TerminalToolbarProps> = ({
         {/* 只负责打开 AI 面板。分析要用户在面板里再点一次 —— 开面板就自动发几十 KB
             终端文本，既浪费也没机会让人先确认要问什么。 */}
         <button
-          onClick={onAskAi}
-          className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium border transition cursor-pointer shrink-0 ${
-            isLight
-              ? 'bg-white hover:bg-slate-200 text-indigo-600 border-slate-300'
-              : 'bg-slate-800 hover:bg-slate-700 text-indigo-300 border-slate-700'
-          }`}
-          title="Open AI panel"
-        >
-          <Sparkles className="w-3 h-3 text-indigo-500" />
-        </button>
-
-        <button
           onClick={onPaste}
           disabled={!(connected || offlineSuspended)}
           className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium border transition cursor-pointer shrink-0 disabled:opacity-40 ${btnBg}`}
           title="Paste Clipboard Content"
         >
           <Clipboard className="w-3 h-3 text-emerald-500" />
+        </button>
+
+        <button
+          onClick={onAskAi}
+          disabled={!(connected || offlineSuspended)}
+          className={`flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-medium border transition cursor-pointer shrink-0 disabled:opacity-40 ${btnBg}`}
+          title="Ask AI about this terminal"
+        >
+          <Sparkles className="w-3 h-3 text-indigo-500" />
         </button>
 
         <button

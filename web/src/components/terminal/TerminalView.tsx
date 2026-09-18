@@ -63,6 +63,13 @@ interface TerminalViewProps {
    * 调用方有义务把命令原文完整展示给用户 —— 这是「看不见」的唯一补偿。
    */
   onRegisterExecBridge?: (bridge: TerminalBridge | null) => void;
+  /**
+   * 「终端当前不可用」上报（连接中 / 重连中 / 已断开）。
+   *
+   * 上层据此在 tab 层铺遮罩 —— AI 面板与终端不在同一 stacking context，
+   * 终端内部的弹窗盖不住它，必须在共同祖先层统一盖。
+   */
+  onBusyChange?: (busy: boolean) => void;
 }
 
 export const TerminalView: React.FC<TerminalViewProps> = ({
@@ -84,6 +91,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   onRegisterContextSource,
   onRegisterCommandSink,
   onRegisterExecBridge,
+  onBusyChange,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<XTerminal | null>(null);
@@ -113,6 +121,8 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const cycleSuppressOutputRef = useRef<boolean>(false);
   const countdownTimerRef = useRef<number | null>(null);
   const silentReconnectRef = useRef<boolean>(false);
+  /** 每个组件实例只打一次 "Connecting to …" 横幅，避免双挂载/effect 抖动打两遍 */
+  const connectBannerShownRef = useRef<boolean>(false);
   const sysUnsubscribeRef = useRef<() => void>(null);
   const lastHeartbeatPingAtRef = useRef<number | null>(null);
   const heartbeatTimeoutRef = useRef<number | null>(null);
@@ -149,9 +159,32 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     }
   });
   const offlineHoldEnabledRef = useRef<boolean>(offlineHoldEnabled);
-  useEffect(() => { offlineHoldEnabledRef.current = offlineHoldEnabled; }, [offlineHoldEnabled]);
+  useEffect(() => {
+    offlineHoldEnabledRef.current = offlineHoldEnabled;
+  }, [offlineHoldEnabled]);
+
   const [offlineSuspended, setOfflineSuspended] = useState<boolean>(false);
   const [reconnectSending, setReconnectSending] = useState<boolean>(false);
+
+  /**
+   * 终端「不可用」判定＝蒙版可见条件：重连弹窗，或 DisconnectedOverlay 显示时。
+   *
+   * 直接对齐下方蒙版的渲染条件 `!connected && !connecting && !offlineSuspended`：
+   * 有蒙版 → AI 面板收起（仅隐藏，开关状态不变，重连后自动恢复）。
+   * 刻意不含 `connecting`：新 tab 打开必然先 connecting，此时无蒙版，
+   * 若算 busy 会导致刚乐观打开的面板闪藏一次。offlineSuspended 也无蒙版，不算。
+   * 不用 everConnectedRef：TerminalView 按 reconnectToken remount，ref 会丢失，
+   * 导致重连失败后蒙版已出、busy 仍为 false（面板收不起来）。
+   */
+  const terminalBusy = reconnectSending || (!connected && !connecting && !offlineSuspended);
+  // 回调放 ref：父组件每次渲染都会传新箭头函数，若进依赖会让 effect 每帧重跑，
+  // 配合 setState 就是无限循环。这里只依赖状态本身。
+  const onBusyChangeRef = useRef(onBusyChange);
+  useEffect(() => { onBusyChangeRef.current = onBusyChange; }, [onBusyChange]);
+  useEffect(() => {
+    onBusyChangeRef.current?.(terminalBusy);
+  }, [terminalBusy]);
+
   const [countdownLeft, setCountdownLeft] = useState<number | null>(null);
   const [retryAttempt, setRetryAttempt] = useState<number>(1);
   const [debugEnabled, setDebugEnabled] = useState<boolean>(() => {
@@ -957,7 +990,16 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     const curSshInfo = sshInfoRef.current;
     const curConfig = configRef.current;
     const curSessionId = sessionIdRef.current;
-    if (!silentReconnect) {
+    /**
+     * 只打一次连接横幅。
+     *
+     * 初始挂载时这个 effect 可能被跑两次（StrictMode / reconnectMode、initialError 抖动），
+     * 而两次都会走到这里。xterm 的 clear() 是异步刷新的，第二次的 clear + writeln 与
+     * 第一次的 writeln 竞争，用户就会看到两行 "Connecting to …"。
+     * 用 ref 保证每个组件实例只打一次；真正的重连（silentReconnect）本来也不打。
+     */
+    if (!silentReconnect && !connectBannerShownRef.current) {
+      connectBannerShownRef.current = true;
       term.writeln(`\r\n\x1b[32m[WebSSH]\x1b[0m Connecting to \x1b[36m${curSshInfo.username}@${curSshInfo.host}:${curSshInfo.port}\x1b[0m...`);
     }
 

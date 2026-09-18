@@ -95,6 +95,27 @@ body {
   display: none;
 }
 
+/* AI 面板等内部滚动区：显示一条细滚动条，提示「这里可以滚」。
+   默认的 overlay 滚动条在部分浏览器不可见，用户会以为内容被截断。 */
+.thin-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.5) transparent;
+}
+.thin-scrollbar::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.thin-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.thin-scrollbar::-webkit-scrollbar-thumb {
+  background-color: rgba(148, 163, 184, 0.5);
+  border-radius: 9999px;
+}
+.thin-scrollbar::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(148, 163, 184, 0.8);
+}
+
 .xterm-screen {
   background-color: transparent !important;
   touch-action: pan-y;

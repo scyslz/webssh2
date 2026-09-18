@@ -21,7 +21,7 @@ import {
 } from './lib.ts';
 import { copyEntry, moveEntry, removeEntry, type OpContext } from './sftp-ops.ts';
 import { createExecRunner, execCapture } from './remote-exec.ts';
-import { handleAiConnection } from './ai/index.ts';
+import { handleAiConnection, createAiSession, disposeAiSession, closeAiSockets, type AiSession } from './ai/index.ts';
 
 interface SSHSession {
   id: string;
@@ -45,6 +45,13 @@ interface SSHSession {
   latencyProbeInFlight?: boolean;
   /** 远端登录身份，懒探一次后缓存（见 resolveSessionIdentity） */
   identity?: SessionIdentity;
+  /**
+   * AI 会话状态，跟随本 SSH 会话常驻。
+   *
+   * 懒建：第一次有 /ai 连接挂上来时创建。持有进行中的 Agent run、审批记忆与
+   * 断开期间的事件缓冲 —— 所以前端断开重连后还能接着看，会话销毁时一起清。
+   */
+  ai?: AiSession;
 }
 
 /** 远端真实登录身份。**这是判「能不能自动执行」的唯一可信来源** */
@@ -75,6 +82,13 @@ export interface SessionHealth {
   shared: boolean;
   title?: string;
   credentialId?: string;
+  /**
+   * 该会话的 AI 面板是否开着。
+   *
+   * 面板开关是会话级状态（存于 session.ai.panelOpen）。接管/重连方在**挂载面板前**
+   * 通过 /sys 快照读到这里，就知道要不要自动打开 —— 无需先建一条 /ai 连接。
+   */
+  aiPanelOpen?: boolean;
 }
 
 export interface HealthSnapshot {
@@ -186,6 +200,39 @@ export interface SessionManager {
 
 export function createSessionManager(): SessionManager {
   const sshSessions = new Map<string, SSHSession>();
+  /**
+   * AI 会话兜底表：key = sessionId。
+   *
+   * 正常情况 AI 会话挂在 `SSHSession.ai` 上，随 SSH 会话销毁。但存在一个窗口：
+   * SSH 会话还没建立（tab 的 sessionId 已定但后端未创建）或已回收，此时也必须
+   * 让先后到来的 /ai 连接拿到**同一个**会话对象 —— 否则 agent 跑完的 history
+   * 落在临时对象上，新连接拿到另一个，回放永远是空的。
+   * 一旦有了真正的 SSHSession，就把这里的条目迁移过去并清掉。
+   */
+  const aiSessions = new Map<string, AiSession>();
+  /** 兜底条目的最后使用时间，用于回收「始终没等到 SSH 会话」的孤儿条目 */
+  const aiSessionSeenAt = new Map<string, number>();
+  /**
+   * 兜底 AI 会话的空闲回收阈值。与 SSH 会话语义一致（会话通常活几小时到一天）；
+   * 只回收「SSH 会话始终没建起来、且当前没有连接挂着」的孤儿，正常挂在 SSHSession
+   * 上的 AI 会话随 SSH 会话销毁，不靠这个 TTL。
+   */
+  const AI_ORPHAN_TTL_MS = 24 * 60 * 60 * 1000;
+  function sweepOrphanAiSessions() {
+    const now = Date.now();
+    for (const [id, at] of aiSessionSeenAt) {
+      if (now - at <= AI_ORPHAN_TTL_MS) continue;
+      const session = aiSessions.get(id);
+      // 有连接挂着就不算孤儿
+      if (session && session.sockets.size === 0) {
+        disposeAiSession(session);
+        aiSessions.delete(id);
+        aiSessionSeenAt.delete(id);
+      } else if (!session) {
+        aiSessionSeenAt.delete(id);
+      }
+    }
+  }
   const wss = new WebSocketServer({ noServer: true });
   const sysClients = new Map<string, SysClient>();
   const startTime = Date.now();
@@ -251,6 +298,9 @@ export function createSessionManager(): SessionManager {
     if (session.latencyProbeTimer) clearInterval(session.latencyProbeTimer);
     session.latencyProbeTimer = undefined;
     session.latencyProbeInFlight = false;
+    // AI 会话跟着 SSH 会话一起死：中止在跑的 Agent，清缓冲与审批等待
+    disposeAiSession(session.ai);
+    session.ai = undefined;
     for (const ws of session.attachedSockets) {
       if (ws.readyState === WebSocket.OPEN) {
         sendTerminalMessage(ws, '\r\n\x1b[33m[WebSSH] Session terminated by user.\x1b[0m\r\n');
@@ -265,6 +315,8 @@ export function createSessionManager(): SessionManager {
     if (session.disconnectTimer) clearTimeout(session.disconnectTimer);
     session.disconnectTimer = setTimeout(() => {
       if (session.attachedSockets.size === 0) {
+        disposeAiSession(session.ai);
+        session.ai = undefined;
         try { session.stream?.end(); session.client?.end(); } catch {}
         sshSessions.delete(session.id);
         sshLog('session removed after detach timeout', { sessionId: session.id, delayMs });
@@ -288,6 +340,9 @@ export function createSessionManager(): SessionManager {
           }
         }
         session.attachedSockets.clear();
+        // 会话易主：原设备的 AI 连接也必须踢掉，否则它还挂着这条已被别人接管的会话。
+        // 历史与审批记忆留在 session.ai 上，接管方新开 /ai 时能重新回放。
+        closeAiSockets(session.ai, 'session taken over');
       } else {
         sendMetaMessage(ws, { type: 'session_busy', sessionId: session.id });
         sendTerminalMessage(ws, '\r\n\x1b[31m[WebSSH] Session is already attached from another browser tab or device.\x1b[0m\r\n');
@@ -336,6 +391,7 @@ export function createSessionManager(): SessionManager {
         shared: session.shared,
         title: session.title,
         credentialId: session.sshConfig.id || undefined,
+        aiPanelOpen: Boolean(session.ai?.panelOpen),
       });
     }
     return {
@@ -741,6 +797,8 @@ export function createSessionManager(): SessionManager {
           }
         }
         session.attachedSockets.clear();
+        disposeAiSession(session.ai);
+        session.ai = undefined;
         try { session.stream?.end(); } catch {}
         try { conn.end(); } catch {}
         sshSessions.delete(session.id);
@@ -819,6 +877,8 @@ export function createSessionManager(): SessionManager {
               }
             }
             if (session.disconnectTimer) clearTimeout(session.disconnectTimer);
+            disposeAiSession(session.ai);
+            session.ai = undefined;
             sshSessions.delete(sessionId);
             conn.end();
           });
@@ -938,7 +998,24 @@ export function createSessionManager(): SessionManager {
               const session = sshSessions.get(id);
               return session?.client ? { client: session.client } : undefined;
             },
-          });
+            getAiSession: (id) => {
+              sweepOrphanAiSessions();
+              const sshSession = sshSessions.get(id);
+              if (sshSession) {
+                if (!sshSession.ai) {
+                  // SSH 会话已存在：优先接手兜底表里可能已有历史的那一份
+                  sshSession.ai = aiSessions.get(id) || createAiSession(id);
+                  aiSessions.delete(id);
+                  aiSessionSeenAt.delete(id);
+                }
+                return sshSession.ai;
+              }
+              // SSH 会话暂不存在：用兜底表保证同一 sessionId 始终拿到同一个对象
+              if (!aiSessions.has(id)) aiSessions.set(id, createAiSession(id));
+              aiSessionSeenAt.set(id, Date.now());
+              return aiSessions.get(id)!;
+            },
+          }, url.searchParams.get('sessionId') || '');
         });
         return;
       }
@@ -1201,6 +1278,13 @@ export function createSessionManager(): SessionManager {
       for (const sid of ids) {
         const session = sshSessions.get(sid);
         if (!session) {
+          // SSH 会话不在，但兜底表里可能还留着这个 sessionId 的 AI 会话
+          // （面板先于终端建过连接）—— 一并清掉，避免条目永久泄漏。
+          const orphan = aiSessions.get(sid);
+          if (orphan) {
+            disposeAiSession(orphan);
+            aiSessions.delete(sid);
+          }
           results.push({ sessionId: sid, status: 'not_found' });
           continue;
         }

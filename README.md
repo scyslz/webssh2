@@ -1,75 +1,92 @@
 # WebSSH
 
-一个面向浏览器的 SSH Terminal + SFTP Client。无需本地安装终端工具，打开网页即可连接远程 Linux / Unix 服务器，完成命令行操作、文件管理和会话恢复。
+A browser-based SSH terminal and SFTP client with a built-in AI agent. Open one page and get an interactive shell, file management, session recovery, and an AI assistant that can read context and — with your approval — run commands on the remote host.
 
-## 核心功能优势
+## Highlights
 
-- 浏览器即终端。基于 WebSocket + `ssh2` + `xterm.js`，直接在网页里获得实时 SSH 交互体验。
-- Terminal 和 SFTP 一体化。一个连接同时支持命令执行、目录浏览、文件上传下载、文本文件在线编辑，减少工具切换。
-- 会话可恢复。支持后台 SSH 会话保活、同浏览器标签重连、强制接管，网络抖动或误关标签后更容易继续工作。
-- 移动端可用。针对手机和平板做了输入、粘贴、快捷键栏、选择复制等适配，不只是桌面端可用。
-- 支持密码和私钥登录。兼容常见 SSH 认证方式，覆盖多数运维场景。
-- 内置基础访问保护。支持应用级登录保护，避免服务裸露后任何人都能直接进入连接页。
-- 可配置体验。支持主题、终端字号、后台会话超时等设置。
-
-## 功能清单
-
-- Web Terminal
-- SFTP 文件浏览
-- 文件上传 / 下载
-- 在线文本编辑
-- Saved Hosts 管理
-- Split View 终端 + 文件双栏操作
-- 会话恢复与接管
-- 登录鉴权保护
-- 多主题切换
+- **Terminal in the browser.** WebSocket + `ssh2` + `xterm.js` for a real interactive shell, not a command runner.
+- **Terminal and SFTP in one connection.** Browse directories, upload/download files, and edit text files online without switching tools. Split view shows both side by side.
+- **Recoverable sessions.** SSH sessions are kept alive server-side and can be reattached from the same tab, another tab, or another device (with optional force takeover). Network blips or accidental tab closes do not lose the session.
+- **AI agent, scoped to a session.** An AI panel answers questions about the terminal and, when a live session exists, can run tools (`ssh_exec` / `ssh_read` / `ssh_write` / `ssh_list`) with server-side risk grading and human approval for anything risky.
+- **Mobile-friendly.** Dedicated handling for soft keyboards, paste, a quick-key bar, and selection/copy on phones and tablets.
+- **Password and private-key auth.** Covers the common SSH login setups.
+- **Built-in access protection.** Application-level login, HTTPS enforcement, origin checks, and login rate limiting.
+- **Configurable.** Theme, terminal font size, session keep-alive timeout, and more.
 
 ## Snapshot
-<img width="196" height="341" alt="image" src="https://github.com/user-attachments/assets/3de17455-4ed6-4d70-9a2e-7e2f99f8ecf8" /> 
 
+<img width="196" height="341" alt="image" src="https://github.com/user-attachments/assets/3de17455-4ed6-4d70-9a2e-7e2f99f8ecf8" />
 <img width="948" height="413" alt="image" src="https://github.com/user-attachments/assets/41a54ade-9c05-49f4-9a09-f8c6c3308ec9" />
 
+## Features
 
+- Web terminal (multi-tab, rename, duplicate, split view)
+- SFTP file browsing, upload, download
+- In-browser text editing
+- Saved hosts management
+- Session recovery and takeover
+- AI panel: read-only diagnosis, command drafting, and an agent loop with approvals
+- Login protection and access controls
+- Light/dark themes
 
-## 技术栈
+## Architecture
 
-- Frontend: React 19, Vite, Tailwind CSS 4
-- Terminal: `@xterm/xterm`, `@xterm/addon-fit`, `@xterm/addon-web-links`
-- Backend: Express, WebSocket, `ssh2`, `multer`
-- Runtime: Node.js
+Three WebSocket channels with clearly separated responsibilities:
 
-## 目录结构
+| Channel | Role | Holds SSH credentials? |
+| --- | --- | --- |
+| `/term` | Terminal session: PTY bytes, resize, heartbeat, session lifecycle | Yes (server-side only) |
+| `/sftp` | File operations on an existing session | No — reuses the session |
+| `/ai` | AI requests and the agent loop | No — borrows an existing session by `sessionId` |
 
-- `web/`: 前端工程，包含 `index.html` 和 `src/`
-- `server/`: 后端路由、SSH 会话管理和服务端工具函数
-- `conf/`: 默认配置和示例环境变量
-- `dist/`: 生产构建产物
-- `Dockerfile` / `docker-compose.yaml`: 容器化部署配置
+Key design points:
 
-## 本地运行
+- **The `/ai` channel never owns an SSH connection.** It borrows an existing session from the session manager via `sessionId` and runs tools as new channels on that already-authenticated connection. If the session is gone, the agent refuses to start rather than fail step by step.
+- **AI state is session-scoped.** An `AiSession` (conversation history, approval memory, in-flight run, event buffer) lives alongside the SSH session. A dropped `/ai` connection only detaches — the run continues. On reconnect or takeover the server replays a **full conversation snapshot** (`ai_history`) plus the resumed-run marker; the client rebuilds from that and follows subsequent events live. A device that never sent a request attaches as a passive follower, so it keeps receiving output instead of waiting for a refresh.
+- **Risk grading is server-side.** The model proposes tool calls; the server grades each command (`safe` / `caution` / `dangerous`) and decides whether human approval is required. The model's self-assessment is shown only for comparison.
+- **AI credentials are separate.** The provider API key is stored encrypted, never in the plain config file, and never returned to the client.
 
-### 前置要求
+## Tech Stack
+
+- **Frontend:** React 19, Vite, Tailwind CSS 4
+- **Terminal:** `@xterm/xterm`, `@xterm/addon-fit`, `@xterm/addon-web-links`
+- **Backend:** Express, WebSocket (`ws`), `ssh2`, `multer`
+- **Runtime:** Node.js
+
+## Project Structure
+
+```
+web/          Frontend (index.html + src/)
+server/       Backend routes, SSH session manager, AI module
+  ai/         Provider client, agent loop, tools, grading, config
+  routes/     HTTP routes (auth, ssh, config, file, ai)
+conf/         Default config and example env
+dist/         Production build output
+Dockerfile / docker-compose.yaml
+```
+
+## Getting Started
+
+### Requirements
 
 - Node.js 18+
-- 可访问的 SSH 服务器
+- A reachable SSH server
 
-### 安装依赖
+### Install
 
 ```bash
 npm install
 ```
 
-### 开发模式
+### Development
 
 ```bash
 npm run dev
 ```
 
-默认监听：
+Listens on `http://0.0.0.0:3000` by default.
 
-- `http://0.0.0.0:3000`
-
-### 生产构建
+### Production Build
 
 ```bash
 npm run build
@@ -77,9 +94,11 @@ npm run start
 ```
 
 ### Docker Compose
-```
+
+```yaml
 services:
   webssh2:
+    build:
       dockerfile: Dockerfile
     image: scyslz/webssh2:latest
     container_name: webssh2
@@ -91,7 +110,7 @@ services:
       PORT: 3000
       WEBSSH_DATA_DIR: /app/data
       WEBSSH_CONFIG_DIR: /app/data
-      WEBSSH_MASTER_KEY: "${WEBSSH_MASTER_KEY:-replace-with-a-high-entroapy-secret}"
+      WEBSSH_MASTER_KEY: "${WEBSSH_MASTER_KEY:-replace-with-a-high-entropy-secret}"
       WEBSSH_AUTH_SECRET: "${WEBSSH_AUTH_SECRET:-replace-with-a-different-high-entropy-secret}"
       WEBSSH_REQUIRE_HTTPS: "${WEBSSH_REQUIRE_HTTPS:-false}"
       WEBSSH_ALLOWED_ORIGINS: "${WEBSSH_ALLOWED_ORIGINS:-}"
@@ -100,70 +119,81 @@ services:
 
 volumes:
   webssh2-data:
-
 ```
 
 ```bash
 docker compose up -d --build
 ```
 
-如需自定义密钥和端口，可先基于 `conf/.env.example` 创建自己的 `.env`。
+For custom secrets and ports, copy `conf/.env.example` to `.env` and adjust.
 
-## 配置说明
+## Configuration
 
-源码仓库中的默认配置文件：
+Source defaults:
 
-- `conf/webssh_config.json`: 应用默认配置，如主题、字号、会话保活时长、登录保护
-- `conf/.env.example`: 环境变量示例
+- `conf/webssh_config.json` — application defaults (theme, font size, session keep-alive, login protection)
+- `conf/.env.example` — example environment variables
 
-运行时数据默认行为：
+Runtime data locations:
 
-- 本地直接运行时：
-  - 配置文件读取 `conf/webssh_config.json`
-  - SSH 凭据保存到根目录 `ssh_secrets.json`
-  - 本地主密钥保存到根目录 `.webssh_master_key`
-- Docker Compose 运行时：
-  - 配置文件、SSH 凭据和主密钥都保存在卷 `/app/data`
-  - 通过 `WEBSSH_DATA_DIR` 和 `WEBSSH_CONFIG_DIR` 控制路径
+- **Local run:**
+  - Config: `conf/webssh_config.json`
+  - SSH credentials: `ssh_secrets.json` (project root)
+  - AI provider key: `ai_secrets.json` (encrypted)
+  - Master key: `.webssh_master_key` (project root)
+- **Docker Compose:**
+  - Config, credentials, and master key all live under the `/app/data` volume, controlled by `WEBSSH_DATA_DIR` and `WEBSSH_CONFIG_DIR`.
 
-默认可配置项包括：
+Commonly configurable options:
 
-- `theme`
-- `fontSize`
-- `timeout`
-- `savePass`
-- `httpsEnforced`
-- `originCheckEnabled`
-- `authEnabled`
-- `authUsername`
-- `authPassword`
+- `theme`, `fontSize`, `timeout`, `savePass`
+- `httpsEnforced`, `originCheckEnabled`
+- `authEnabled`, `authUsername`, `authPassword`
 
-## 适用场景
+### AI Provider
 
-- 内网运维面板
-- 轻量级堡垒机 / 跳板机前端
-- 开发测试环境远程访问
-- 需要在移动端临时处理服务器问题的场景
-- 希望把终端和文件操作收敛到一个 Web 工具中的团队
+AI configuration is split in two places:
 
-## 安全说明
+- Non-secret settings (`enabled`, `baseUrl`, `model`, token budgets, `redactPrivateIp`, `commandWhitelist`) go into `conf/webssh_config.json`.
+- The API key goes into an encrypted `<data dir>/ai_secrets.json`.
 
-- SSH 主机凭据使用 AES-256-GCM 加密保存，主密钥优先从 `WEBSSH_MASTER_KEY` 读取；未配置时开发环境会生成权限为 `0600` 的本地 `.webssh_master_key`。
-- `/ssh/list` 只返回主机元数据和 `hasCredential`，不会返回密码、私钥或 passphrase。
-- 新 SSH 连接通过 POST 创建后端会话，WebSocket URL 不携带 SSH 凭据。
-- 生产环境必须配置 `WEBSSH_MASTER_KEY`，并使用 HTTPS/WSS；不要依赖自动生成的本地密钥做多实例部署。
-- 不建议把 `ssh_secrets.json` 纳入仓库；它属于运行时敏感数据，不属于 `conf/` 里的源码配置。
-- 应用登录密码使用 `scrypt` 哈希保存，`/config` 不会返回密码或密码哈希；生产环境应配置 `WEBSSH_AUTH_SECRET`。
-- `httpsEnforced` 开启后，HTTP 和 `ws://` 请求会被拒绝；反向代理需要正确传递 `X-Forwarded-Proto: https`。如果配置里未设置，仍可回退使用 `WEBSSH_REQUIRE_HTTPS=true`。
-- 登录接口按来源 IP 限制为 15 分钟最多 5 次失败，触发后临时锁定 15 分钟。
-- `originCheckEnabled` 开启后，HTTP 写操作和 WebSocket 会校验浏览器 `Origin`；跨域部署时通过 `WEBSSH_ALLOWED_ORIGINS` 配置允许的来源。
-- 应用级登录保护适合做第一层访问控制，但不应替代更完整的网络隔离、反向代理鉴权或企业级审计能力。
+Environment variables override the stored config, so you can avoid persisting secrets in containers:
 
-## 开发脚本
+- `WEBSSH_AI_BASE_URL`
+- `WEBSSH_AI_MODEL`
+- `WEBSSH_AI_API_KEY`
+
+Agent behavior is bounded: a configurable max step count per request (hard-capped server-side), output truncation limits per tool, and an optional command allowlist for skipping approval on known-safe binaries.
+
+## Use Cases
+
+- Internal ops panels
+- Lightweight bastion / jump-host frontends
+- Remote access to dev and test environments
+- Handling server issues from a phone
+- Teams that want terminal and file operations in one web tool
+- Assisted diagnosis and command drafting with an AI that still asks before doing anything destructive
+
+## Security Notes
+
+- SSH host credentials are encrypted with AES-256-GCM. The master key is read from `WEBSSH_MASTER_KEY`; in development, a local `.webssh_master_key` (mode `0600`) is generated if unset.
+- `/ssh/list` returns only host metadata and `hasCredential` — never passwords, private keys, or passphrases.
+- New SSH connections create a backend session over HTTP; the WebSocket URL does not carry SSH credentials.
+- The AI provider key is stored separately from normal config and is never returned to the client (`hasKey` boolean only).
+- **The agent cannot bypass approval on its own.** Risk levels come from server-side grading, not the model. `dangerous` actions always require explicit confirmation.
+- Production must set `WEBSSH_MASTER_KEY` and use HTTPS/WSS. Do not rely on an auto-generated local key for multi-instance deployments.
+- Do not commit `ssh_secrets.json` / `ai_secrets.json`; they are runtime secrets, not source config.
+- The application login password is stored as a `scrypt` hash; `/config` never returns the password or its hash. Set `WEBSSH_AUTH_SECRET` in production.
+- When `httpsEnforced` is on, HTTP and `ws://` requests are rejected; reverse proxies must pass `X-Forwarded-Proto: https` correctly. `WEBSSH_REQUIRE_HTTPS=true` is the fallback when the config value is unset.
+- Login attempts are rate-limited to 5 failures per source IP per 15 minutes, with a 15-minute lockout.
+- When `originCheckEnabled` is on, HTTP writes and WebSocket upgrades validate the browser `Origin`; configure allowed origins via `WEBSSH_ALLOWED_ORIGINS`.
+- Application-level login is a first layer of access control, not a substitute for network isolation, reverse-proxy auth, or enterprise auditing.
+
+## Scripts
 
 ```bash
-npm run dev
-npm run build
-npm run start
-npm run lint
+npm run dev     # start dev server
+npm run build   # build frontend + bundle server
+npm run start   # run production build
+npm run lint    # type-check (tsc --noEmit)
 ```

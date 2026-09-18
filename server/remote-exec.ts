@@ -21,6 +21,12 @@ import { StringDecoder } from 'node:string_decoder';
 import { sshLog } from './lib.ts';
 
 const PROBE_MARKER = '__webssh_exec_ok__';
+/**
+ * shell 能力探测的超时。注意这**不是**命令执行超时（那是 execCapture 的 timeoutMs）：
+ * 探测只跑一句 `echo`，正常毫秒级返回。给太久只会让「无 shell」的会话在 fallback
+ * 到 SFTP 之前干等，所以取一个「远超 echo 正常耗时、又不拖慢 fallback」的值。
+ */
+const PROBE_TIMEOUT_MS = 10_000;
 
 /** 一次远端命令的结果 */
 export type ExecResult =
@@ -98,6 +104,8 @@ export interface CaptureOptions {
    * 服务端实现，**不保证**。套 `timeout` 是唯一可靠的远端自保手段。
    * 代价：极简系统（没有 coreutils、busybox 也没编 `timeout`）会以 127 失败，
    * 调用方需要能识别这种情况再退一步。默认关闭。
+   * 注意：只把命令整体交给 `timeout`，不加 `--` 分隔符 —— 部分系统的 `timeout`
+   * （busybox、某些嵌入式）不认 `--`，会报 `failed to run command '--'`。
    */
   enforceRemoteTimeout?: boolean;
 }
@@ -123,7 +131,7 @@ export async function execCapture(
   const maxBytes = options.maxBytes && options.maxBytes > 0 ? options.maxBytes : DEFAULT_CAPTURE_MAX_BYTES;
 
   const prefixed = options.enforceRemoteTimeout
-    ? `LC_ALL=C LANG=C timeout -k 2 ${Math.max(1, Math.ceil(timeoutMs / 1000))} -- ${command}`
+    ? `LC_ALL=C LANG=C timeout ${Math.max(1, Math.ceil(timeoutMs / 1000))} ${command}`
     : `LC_ALL=C LANG=C ${command}`;
 
   return new Promise<CaptureOutcome>((resolve) => {
@@ -254,12 +262,20 @@ export function createExecRunner(client: Client): ExecRunner {
     const settle = (ok: boolean) => {
       if (settled) return;
       settled = true;
+      if (timer !== undefined) clearTimeout(timer);
       state = ok ? 'ready' : 'unavailable';
       if (!ok) sshLog('SSH exec unavailable, SFTP-only fallback enabled');
       const pending = waiting;
       waiting = [];
       pending.forEach((fn) => fn(ok));
     };
+
+    /**
+     * 探测超时：连接半死（收到 SYN 但 exec 回调永不触发）时，waiting 里的调用方
+     * 会永久挂起。到点按「无 shell」收场，让它们回退到 SFTP 路径。
+     */
+    let timer: NodeJS.Timeout | undefined;
+    timer = setTimeout(() => settle(false), PROBE_TIMEOUT_MS);
 
     try {
       client.exec(`echo ${PROBE_MARKER}`, (err: Error | undefined, stream: any) => {

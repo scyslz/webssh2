@@ -55,5 +55,11 @@
       "cmd": "clear\n",
       "enabled": false
     }
-  ]
+  ],
+  "ai": {
+    "baseUrl": "http://192.168.100.1:8787/v1",
+    "model": "auto",
+    "redactPrivateIp": false,
+    "commandWhitelist": []
+  }
 }

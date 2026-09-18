@@ -22,6 +22,9 @@ export interface AiConfigView {
 
 export type AiRiskLevel = 'safe' | 'caution' | 'dangerous';
 
+/** 发给服务端的对话历史（纯文字，用于让 Agent 延续上下文）。role 限定为两端都会用的两个 */
+export type ChatMessage = { role: 'user' | 'assistant'; content: string };
+
 export interface AiGradeHit {
   rule: string;
   label: string;
@@ -117,6 +120,10 @@ export interface AiAgentApproval {
   display: string;
   level: AiRiskLevel;
   reasons: string[];
+  /** 高危：界面只给 Approve / Deny */
+  dangerous: boolean;
+  /** 是否提供「Approve Session」 */
+  canRemember: boolean;
 }
 
 export interface AiAgentIdentity {
@@ -176,6 +183,25 @@ export interface AiDoneMeta {
   chars?: number;
 }
 
+export interface AiHistoryEntry {
+  kind: 'user' | 'text' | 'agent';
+  text?: string;
+  withScreen?: boolean;
+  answer?: string;
+  error?: string;
+  aborted?: boolean;
+  goal?: string;
+  identity?: unknown;
+  items?: Array<Record<string, unknown>>;
+  final?: string;
+  stopReason?: string;
+  steps?: number;
+  /** 条目创建时间（epoch ms），由服务端给，刷新/接管后仍在 */
+  at?: number;
+  /** agent run 的服务端实测总耗时（完成后才有） */
+  ms?: number;
+}
+
 export interface AiHandlers {
   onPrepared?: (payload: { text: string; env: string; question: string; stats: AiContextStats }) => void;
   onDelta?: (text: string) => void;
@@ -195,7 +221,8 @@ export interface AiHandlers {
   onStatus?: (status: 'connecting' | 'open' | 'closed') => void;
 
   /* ---- Agent：服务端驱动的循环，浏览器只负责渲染与应答 ---- */
-  onAgentStart?: (payload: { maxSteps: number }) => void;
+  /** resumed=true 表示这是重连后接回的一条**已在跑**的会话，不是新开的 */
+  onAgentStart?: (payload: { maxSteps: number; resumed?: boolean; startedAt?: number }) => void;
   /** 服务端实测出来的远端身份；null 表示没探到 */
   onAgentIdentity?: (identity: AiAgentIdentity) => void;
   onAgentStep?: (step: number) => void;
@@ -203,10 +230,12 @@ export interface AiHandlers {
   onAgentToolCall?: (call: AiAgentToolCall) => void;
   onAgentToolResult?: (result: AiAgentToolResult) => void;
   /**
-   * 需要用户表态。返回一个 Promise，由界面在用户点 Allow / Deny 时 resolve。
+   * 需要用户表态。返回一个 Promise（含 remember 标志），由界面在用户点 Allow / Deny 时 resolve。
    * 不 resolve 循环就停在那里 —— 这是刻意的，审批不能被超时绕过。
    */
-  onAgentApproval?: (request: AiAgentApproval) => Promise<boolean>;
+  onAgentApproval?: (request: AiAgentApproval) => Promise<{ allow: boolean; remember: boolean }>;
+  /** 因「本次会话已放行」而跳过审批时触发，前端据此把这条工具标成 auto-approved */
+  onAgentToolApproved?: (payload: { callId: string; method: 'once' | 'session' }) => void;
   onAgentDone?: (payload: AiAgentDone) => void;
   onAgentError?: (msg: string, aborted: boolean) => void;
 }
@@ -219,19 +248,89 @@ export class AiWSClient {
   private pingTimer: number | null = null;
   private pendingConnect: Promise<void> | null = null;
   private handlers: AiHandlers = {};
+  /**
+   * 被动跟随 handlers：接管/围观时本地没发过请求（handlers 为空），
+   * 服务端回放与实时事件走这里渲染。不随 send 覆盖，跨请求有效。
+   */
+  private passiveHandlers: AiHandlers = {};
+  /** 本地发出去的 run id（send 建的）。只属于它的事件才走 handlers */
+  private ownedId: string | null = null;
   private currentId: string | null = null;
   private seq = 0;
+  /**
+   * 绑定的 SSH 会话。绑定后：
+   *  - 建连时作为 query 传给 /ai，服务端据此 attach 到对应 AI 会话（复用其 run / 缓冲 / 审批记忆）；
+   *  - 断线后自动重连，服务端会把断开期间缓冲的事件重放回来，用户看到同一条跑动中的会话。
+   */
+  private sessionId = '';
+  private reconnectTimer: number | null = null;
+  private closedByUser = false;
 
   onConfig?: (config: AiConfigView) => void;
+  /**
+   * 重连接回一条**已在跑**的会话时触发（不随 send 覆盖，跨请求有效）。
+   *
+   * 服务端在重连后先发 `agent_start{resumed}`，再重放断开期间缓冲的事件。
+   * 面板据此新建一条 entry 承接后续重放/实时的 tool_call / tool_result / done。
+   */
+  onResumed?: (payload: { id: string; resumed?: boolean; startedAt?: number }) => void;
+  /**
+   * 新连接 attach 时发现服务端有一条**非 agent** 的 run 在跑（diagnose/draft）。
+   *
+   * 这类 run 没有 `agent_start` 可认回，只能从 `ready` 帧得知；delta 本身也不进
+   * 服务端缓冲，所以接管方接手后只能从此刻起继续渲染。面板据此建一条 text entry
+   * 承接后续 `onDelta`/`onDone`。
+   */
+  onFollowedRun?: (payload: { id: string; kind: 'diagnose' | 'draft'; startedAt?: number }) => void;
+  /**
+   * 新连接（重连 / 别的设备接管同一 SSH 会话）时，服务端回放整段对话历史。
+   * 面板据此重建聊天窗口 —— 与 onResumed 不同，这是**完整的历史快照**，
+   * 收到后应替换当前列表再继续。
+   */
+  onHistory?: (entries: AiHistoryEntry[]) => void;
+  /** 服务端确认历史已清空 */
+  onCleared?: () => void;
+  /**
+   * 面板开关状态（会话级，跨设备同步）。
+   *
+   * - 建连后的 ready 帧会带一次当前状态；
+   * - 任一设备切换面板时广播。
+   * 前端据此自动打开/关闭面板，实现「重连或接管后延续原设备的面板状态」。
+   */
+  onPanelState?: (open: boolean) => void;
+
+  /**
+   * 安装被动跟随 handlers：本地没发过请求时（接管/围观），
+   * 属于跟随会话的事件走这里渲染。不随 send 覆盖。
+   */
+  setPassiveHandlers(handlers: AiHandlers) {
+    this.passiveHandlers = handlers || {};
+  }
+
+  /** 绑定 / 更新目标 SSH 会话。变了就断开重连到新的 AI 会话 */
+  setSession(sessionId: string | undefined) {
+    const next = sessionId || '';
+    if (next === this.sessionId) return;
+    this.sessionId = next;
+    if (this.ws) {
+      const old = this.ws;
+      this.ws = null;
+      try { old.close(); } catch {}
+    }
+    this.pendingConnect = null;
+    if (next && !this.closedByUser) void this.connect().catch(() => {});
+  }
 
   connect(): Promise<void> {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) return Promise.resolve();
     if (this.pendingConnect) return this.pendingConnect;
 
+    this.closedByUser = false;
     this.handlers.onStatus?.('connecting');
 
     this.pendingConnect = new Promise<void>((resolve, reject) => {
-      const ws = new WebSocket(wsUrl('/ai', ''));
+      const params = this.sessionId ? `sessionId=${encodeURIComponent(this.sessionId)}` : '';
+      const ws = new WebSocket(wsUrl('/ai', params));
       this.ws = ws;
 
       const timer = window.setTimeout(() => {
@@ -265,12 +364,10 @@ export class AiWSClient {
         if (this.ws !== ws) return;
         this.ws = null;
         this.pendingConnect = null;
-        // 流到一半断线：主动告诉调用方，否则面板会永远停在「生成中」
-        if (this.currentId) {
-          this.currentId = null;
-          this.handlers.onError?.('Connection lost before the response finished. Retry.', false);
-        }
         this.handlers.onStatus?.('closed');
+        // 网络级断开：服务端会话仍在跑，自动重连去接回缓冲的事件。
+        // 主动 close()（面板/tab 关闭）不重连。
+        if (!this.closedByUser && this.sessionId) this.scheduleReconnect();
       };
 
       ws.onerror = () => {
@@ -287,18 +384,103 @@ export class AiWSClient {
     return this.pendingConnect;
   }
 
+  private scheduleReconnect() {
+    if (this.reconnectTimer !== null || this.closedByUser) return;
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.closedByUser) return;
+      this.connect().catch(() => this.scheduleReconnect());
+    }, 2000);
+  }
+
   private dispatch(message: any) {
     // 连接级消息（不带 id）与请求级消息分开处理
     if (message.type === 'ready' || message.type === 'config') {
       if (message.config) this.onConfig?.(message.config);
+      /*
+       * ready 帧带回当前面板开关状态，但**只在 true 时**通知上层打开面板。
+       *
+       * 不能在 false 时触发「关闭」：新 tab 刚刚挂载面板时，自己的 ai_panel_open
+       * 还没送到服务端，ready 里的 panelOpen 仍是上一次的 false —— 若据此关闭，
+       * 面板会「刚弹出就被卸载」，然后再被用户点开，表现为挂载两次。
+       * 真正的「别人关掉了面板」由运行时的 ai_panel_state 广播表达，不走这里。
+       */
+      if (message.type === 'ready' && message.panelOpen === true) {
+        this.onPanelState?.(true);
+      }
+      // ready 里带着「有一条 run 在跑」的信息。agent 走随后的 agent_start 认回；
+      // 非 agent（diagnose/draft）没有 agent_start，这里直接通知面板建 text entry。
+      if (message.type === 'ready' && message.resumed && message.resumedKind && message.resumedKind !== 'agent') {
+        // 非 agent 的跟随流不会有 agent_start，currentId 得在这里认回来，
+        // 否则随后到达的 delta/done 会因「id 不匹配 currentId(null)」被整批丢掉。
+        this.currentId = String(message.resumed);
+        this.onFollowedRun?.({
+          id: String(message.resumed),
+          kind: message.resumedKind,
+          startedAt: typeof message.resumedStartedAt === 'number' ? message.resumedStartedAt : undefined,
+        });
+      }
       return;
     }
     if (message.type === 'pong') return;
-    if (message.id && this.currentId && message.id !== this.currentId) return;
+
+    // 面板开关状态变化（别的设备打开/关闭了）
+    if (message.type === 'ai_panel_state') {
+      this.onPanelState?.(message.open === true);
+      return;
+    }
+
+    // 会话历史快照：新连接（重连 / 接管）时服务端回放整段对话，交给面板重建
+    if (message.type === 'ai_history') {
+      this.onHistory?.(Array.isArray(message.entries) ? message.entries : []);
+      return;
+    }
+    if (message.type === 'cleared') {
+      this.onCleared?.();
+      return;
+    }
+
+    // 跟随认回：`agent_start` 的 id 不是本地发出去的（ownedId 对不上），
+    // 说明这是别人跑起来的会话（接管 / 重连后别人的 run / attach 后新开的 run）。
+    // 先把 currentId 认回来，否则下面的 id 匹配会把它的后续事件全丢掉；
+    // 再交给 onResumed（独立回调，不被 send 覆盖）让面板建 entry 承接。
+    // 自己发出去的 run（id === ownedId）走正常 handlers 链路；重连回自己的 run
+    //（resumed 且 id === ownedId）同样要过 onResumed 复用 entry。
+    if (message.type === 'agent_start' && message.id) {
+      const id = String(message.id);
+      const startedAt = typeof message.startedAt === 'number' ? message.startedAt : undefined;
+      const isOwned = this.ownedId !== null && id === this.ownedId;
+      if (id === this.currentId) {
+        if (message.resumed) this.onResumed?.({ id, resumed: true, startedAt });
+        else this.handlers.onAgentStart?.({ maxSteps: 0, startedAt });
+        return;
+      }
+      if (!isOwned) {
+        this.currentId = id;
+        this.onResumed?.({ id, resumed: Boolean(message.resumed), startedAt });
+        return;
+      }
+      if (message.resumed) {
+        this.currentId = id;
+        this.onResumed?.({ id, resumed: true, startedAt });
+        return;
+      }
+    }
+
+    // 只处理属于「当前跟踪」的消息。currentId 为 null（已停止/连接刚建）或 id 不匹配时，
+    // 一律丢弃 —— 否则被中止的那一跑残留的 agent_done / agent_message 会漏进新请求的回调，
+    // 表现为「停止后还在输出」或「新指令显示旧结果」。
+    if (message.id && message.id !== this.currentId) return;
+
+    // 路由：自己发出去的 run 走 handlers；跟随的 run（id !== ownedId）只走 passiveHandlers。
+    // 接管方没发过请求、handlers 为空时，靠的就是这一路 —— 否则回放/实时全被丢掉，
+    // 只能靠刷新拿静态历史。不回落到 handlers：那可能是上一轮遗留的闭包，会写进错的 entry。
+    const isOwnedMsg = Boolean(message.id && this.ownedId !== null && message.id === this.ownedId);
+    const h: AiHandlers = isOwnedMsg ? this.handlers : this.passiveHandlers;
 
     switch (message.type) {
       case 'prepared':
-        this.handlers.onPrepared?.({
+        h.onPrepared?.({
           text: message.text || '',
           env: message.env || '',
           question: message.question || '',
@@ -306,11 +488,11 @@ export class AiWSClient {
         });
         return;
       case 'delta':
-        this.handlers.onDelta?.(message.text || '');
+        h.onDelta?.(message.text || '');
         return;
       case 'done':
-        this.currentId = null;
-        this.handlers.onDone?.({
+        this.clearTracked(message.id);
+        h.onDone?.({
           model: message.model,
           usage: message.usage,
           finishReason: message.finishReason,
@@ -320,8 +502,8 @@ export class AiWSClient {
         });
         return;
       case 'draft':
-        this.currentId = null;
-        this.handlers.onDraft?.(
+        this.clearTracked(message.id);
+        h.onDraft?.(
           {
             command: message.command || '',
             explain: message.explain || '',
@@ -349,23 +531,23 @@ export class AiWSClient {
         );
         return;
       case 'agent_start':
-        this.handlers.onAgentStart?.({ maxSteps: Number(message.maxSteps) || 20 });
+        h.onAgentStart?.({ maxSteps: Number(message.maxSteps) || 20, resumed: Boolean(message.resumed) });
         return;
       case 'agent_identity':
-        this.handlers.onAgentIdentity?.({
+        h.onAgentIdentity?.({
           user: typeof message.user === 'string' ? message.user : null,
           uid: typeof message.uid === 'number' ? message.uid : null,
           isRoot: Boolean(message.isRoot),
         });
         return;
       case 'agent_step':
-        this.handlers.onAgentStep?.(Number(message.step) || 0);
+        h.onAgentStep?.(Number(message.step) || 0);
         return;
       case 'agent_message':
-        this.handlers.onAgentMessage?.(String(message.content || ''));
+        h.onAgentMessage?.(String(message.content || ''));
         return;
       case 'agent_tool_call':
-        this.handlers.onAgentToolCall?.({
+        h.onAgentToolCall?.({
           callId: String(message.callId || ''),
           tool: String(message.tool || ''),
           arguments: message.arguments && typeof message.arguments === 'object' ? message.arguments : {},
@@ -373,7 +555,7 @@ export class AiWSClient {
         });
         return;
       case 'agent_tool_result':
-        this.handlers.onAgentToolResult?.({
+        h.onAgentToolResult?.({
           callId: String(message.callId || ''),
           tool: String(message.tool || ''),
           output: String(message.output || ''),
@@ -384,9 +566,9 @@ export class AiWSClient {
         // 循环此刻正 await 在服务端。必须应答，否则它会一直挂着 ——
         // 拿不到应答就按拒绝处理，宁可少做一步也不让人以为已经批准了。
         const callId = String(message.callId || '');
-        const handler = this.handlers.onAgentApproval;
+        const handler = h.onAgentApproval;
         if (!handler) {
-          this.respondApproval(callId, false);
+          this.respondApproval(callId, false, false);
           return;
         }
         void Promise.resolve(handler({
@@ -396,14 +578,27 @@ export class AiWSClient {
           display: String(message.display || ''),
           level: (['safe', 'caution', 'dangerous'].includes(message.level) ? message.level : 'caution') as AiRiskLevel,
           reasons: Array.isArray(message.reasons) ? message.reasons.map(String) : [],
+          dangerous: message.dangerous === true,
+          canRemember: message.canRemember === true,
         }))
-          .then((allow) => this.respondApproval(callId, allow === true))
-          .catch(() => this.respondApproval(callId, false));
+          // remember 再按 canRemember 兜一层：高危即使前端误传也不进 auto。
+          .then((decision) => this.respondApproval(
+            callId,
+            decision.allow === true,
+            decision.remember === true && message.canRemember === true && message.dangerous !== true,
+          ))
+          .catch(() => this.respondApproval(callId, false, false));
         return;
       }
+      case 'agent_tool_approved':
+        h.onAgentToolApproved?.({
+          callId: String(message.callId || ''),
+          method: message.method === 'session' ? 'session' : 'once',
+        });
+        return;
       case 'agent_done':
-        this.currentId = null;
-        this.handlers.onAgentDone?.({
+        this.clearTracked(message.id);
+        h.onAgentDone?.({
           answer: String(message.answer || ''),
           steps: Number(message.steps) || 0,
           stopReason: (['final', 'max-steps', 'cancelled'].includes(message.stopReason)
@@ -414,12 +609,12 @@ export class AiWSClient {
         });
         return;
       case 'agent_error':
-        this.currentId = null;
-        this.handlers.onAgentError?.(String(message.msg || 'Agent failed'), Boolean(message.aborted));
+        this.clearTracked(message.id);
+        h.onAgentError?.(String(message.msg || 'Agent failed'), Boolean(message.aborted));
         return;
       case 'error':
-        this.currentId = null;
-        this.handlers.onError?.(message.msg || 'Request failed', Boolean(message.aborted), {
+        this.clearTracked(message.id);
+        h.onError?.(message.msg || 'Request failed', Boolean(message.aborted), {
           fallback: message.fallback === 'readonly' ? 'readonly' : undefined,
           reason: typeof message.reason === 'string' ? message.reason : undefined,
           raw: typeof message.raw === 'string' ? message.raw : undefined,
@@ -470,20 +665,22 @@ export class AiWSClient {
    *
    * @param sessionId 要借用的 SSH 会话。Agent 复用**当前这个终端 tab** 的连接，
    *                  不给就跑不起来 —— 一个只会思考不能执行的 Agent 没有意义。
+   * @param history 同一条对话里前几轮的问答（纯文字），让模型延续上下文。
    */
   async agent(
     request: AiDiagnoseRequest,
-    options: { sessionId: string; maxSteps: number },
+    options: { sessionId: string; maxSteps: number; history?: ChatMessage[] },
     handlers: AiHandlers,
   ): Promise<string> {
     return this.send('agent', request, handlers, {
       sessionId: options.sessionId,
       maxSteps: options.maxSteps,
+      ...(options.history && options.history.length ? { history: options.history } : {}),
     });
   }
 
   /** 回答一次审批。循环在服务端 await 着这个应答 */
-  private respondApproval(callId: string, allow: boolean) {
+  private respondApproval(callId: string, allow: boolean, remember: boolean) {
     if (!this.currentId) return;
     if (this.ws?.readyState !== WebSocket.OPEN) return;
     this.ws.send(JSON.stringify({
@@ -491,6 +688,7 @@ export class AiWSClient {
       id: this.currentId,
       callId,
       allow,
+      remember,
     }));
   }
 
@@ -505,20 +703,46 @@ export class AiWSClient {
 
     const id = `${Date.now()}-${++this.seq}`;
     this.handlers = handlers;
+    this.ownedId = id;
     this.currentId = id;
     this.ws.send(JSON.stringify({ id, type, context: request, ...(extra || {}) }));
     return id;
+  }
+
+  /** 让服务端清空这条会话的对话历史（与本地清空配套） */
+  clearHistory() {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'clear' }));
+  }
+
+  /** 上报面板开关状态（会话级，服务端记住并同步给其它设备） */
+  setPanelOpen(open: boolean) {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: open ? 'ai_panel_open' : 'ai_panel_close' }));
+    }
+  }
+
+  /** 一次 run 结束（done/error）：只清跟踪态，不动别人的 handlers */
+  private clearTracked(id: unknown) {
+    if (typeof id === 'string' && id && id !== this.currentId) return;
+    this.currentId = null;
+    if (typeof id === 'string' && id && id === this.ownedId) this.ownedId = null;
   }
 
   cancel() {
     if (!this.currentId) return;
     const id = this.currentId;
     this.currentId = null;
+    if (id === this.ownedId) this.ownedId = null;
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'cancel', id }));
     this.handlers.onError?.('Cancelled', true);
   }
 
   close() {
+    this.closedByUser = true;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.stopPing();
     this.currentId = null;
     if (this.ws) {
@@ -572,4 +796,21 @@ export async function testAiConfig(): Promise<{ ok: boolean; message: string; mo
   const res = await apiFetch('/ai/test', { method: 'POST' });
   if (!res.ok) return { ok: false, message: await describeFailure(res) };
   return res.json();
+}
+
+/**
+ * 查询某 SSH 会话的 AI 面板是否开着。
+ *
+ * 接管设备在**挂载面板之前**调用：没有面板就没有 /ai 连接，也就收不到 ready.panelOpen，
+ * 所以必须先用 HTTP 问一次，才知道要不要自动打开面板。
+ */
+export async function fetchAiPanelOpen(sessionId: string): Promise<boolean> {
+  try {
+    const res = await apiFetch(`/ai/panel-state?sessionId=${encodeURIComponent(sessionId)}`);
+    if (!res.ok) return false;
+    const data = await res.json();
+    return data?.open === true;
+  } catch {
+    return false;
+  }
 }

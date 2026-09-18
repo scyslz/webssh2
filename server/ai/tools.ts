@@ -259,20 +259,46 @@ export interface ToolPlan {
   reasons: string[];
   /** 需要人在界面上点头。为 false 才允许无人值守地跑 */
   needsApproval: boolean;
+  /**
+   * 「本次会话放行」的匹配键。
+   *
+   * 以前用 `${tool}:${level}`，粒度过粗：用户放行一次 `apt-get update`（caution），
+   * 之后**所有** caution 级 exec（包括完全不同的命令）都跟着免审。改成按
+   * 「工具 + 涉及的命令二进制 + 等级」分组，放行 apt 就不会顺带放行 rm/iptables。
+   */
+  signature: string;
+  /**
+   * 这条调用是不是「高危」。
+   *
+   * 高危 = grade 判 dangerous / 提权 / 身份未知。高危命令：
+   *  - **即使已开启 session auto，也每次都问**（auto 不覆盖高危）；
+   *  - 审批时只给 `Approve` / `Deny`，不给「Approve Session」（高危不参与 auto）。
+   */
+  dangerous: boolean;
+  /**
+   * 这条调用是否属于「常规改动」，可以被「Approve Session」纳入 auto 记忆。
+   *
+   * - 纯只读 → 不需要审批，也不参与 auto（本来就自动）。
+   * - 常规改动（启停服务、装包、改权限、容器操作…）→ true：未开 auto 时弹三键，
+   *   点 Approve Session 后整个 SSH 会话的常规改动都自动跑。
+   * - 高危 → false：永远逐条确认，不进 auto。
+   */
+  sessionRememberable: boolean;
 }
 
 /**
- * 执行**之前**的判断：这个调用是什么等级、要不要审批。
+ * 执行**之前**的判断：这个调用是什么等级、要不要审批、能不能被 session auto 覆盖。
  *
- * 三条规则：
- * 1. `ssh_write` 永远要审批 —— 写文件是不可逆的，没有例外。
- * 2. `ssh_read` / `ssh_list` 是纯读，直接放行；它们不经过 shell，模型塞什么都不影响。
- * 3. `ssh_exec` 交给 grade.ts 按命令片段判。可以免审批的条件是
- *    「判分 safe **且** 在用户允许名单里 **且** 身份实测过 **且** 不是 root」
- *    —— 四个条件同时成立，缺一就要人点头。
+ * 三档结局：
+ * 1. 纯只读（只读表/白名单，safe）→ 直接跑，任何状态都不弹。
+ * 2. 常规改动（启停服务、装包、改权限、容器操作、写 /tmp…）→
+ *    - 未开启 auto：弹三键（Approve / Approve Session / Deny）；
+ *    - 已开启 auto：直接跑。
+ * 3. 高危（grade dangerous / 提权 / 身份未知）→ 永远弹，且只给 Approve / Deny
+ *    （auto 不覆盖高危，也不提供 Approve Session）。
  *
- * 身份这条值得多说一句：以前它由浏览器自报（`session.source === 'terminal'`），
- * 现在循环搬到服务端、身份是服务端自己 `id -un` 跑出来的，浏览器无从伪造。
+ * `needsApproval` 表示「**在未开启 auto 的前提下**是否需要弹窗」；真正是否弹窗
+ * 由 agent-loop 结合 `approvalMemory`（auto 是否已开）决定。
  */
 export function planToolCall(
   name: string,
@@ -280,24 +306,33 @@ export function planToolCall(
   ctx: ToolContext,
 ): ToolPlan {
   if (name === 'ssh_write') {
-    return { level: 'caution', reasons: ['Writes a file - always confirmed by you'], needsApproval: true };
+    const path = readPath(args);
+    // 写 /tmp、/var/tmp、家目录 = 常规改动（可被 session auto 覆盖）；
+    // 其余路径（/etc、/usr、/boot…）= 高危，永远逐条确认。
+    const safeTarget = /^(\/tmp\/|\/var\/tmp\/|\/home\/|\/root\/|\/Users\/|~\/)/.test(path);
+    return {
+      level: safeTarget ? 'safe' : 'dangerous',
+      reasons: safeTarget ? [] : ['Writes outside /tmp or the user home directory'],
+      needsApproval: true,
+      signature: `ssh_write:${safeTarget ? 'tmp' : 'system'}`,
+      dangerous: !safeTarget,
+      sessionRememberable: safeTarget,
+    };
   }
 
   if (name === 'ssh_read' || name === 'ssh_list') {
     // 校验放在这里而不是执行时：参数不合法要能立刻回给模型，别等它跑完一圈
     readPath(args);
-    return { level: 'safe', reasons: [], needsApproval: false };
+    return { level: 'safe', reasons: [], needsApproval: false, signature: `${name}`, dangerous: false, sessionRememberable: false };
   }
 
   if (name !== 'ssh_exec') {
     /**
-     * 未知工具**不送去审批**。
-     *
-     * 让人去批准一个不存在的工具没有意义，而且会把它挡在 `executeToolCall` 那条
-     * 「unknown tool，可用的是这四个」的提示后面 —— 那句话才是模型能拿来纠错的东西。
-     * 这里放行是安全的：未知工具在 executeToolCall 里只会产出一段错误文本，不碰任何东西。
+     * 未知工具**不送去审批**。让人批准一个不存在的工具没有意义，而且会把它挡在
+     * executeToolCall 那句「unknown tool」提示后面 —— 那句话才是模型能拿来纠错的。
+     * 未知工具在 executeToolCall 里只会产出一段错误文本，不碰任何东西，放行是安全的。
      */
-    return { level: 'safe', reasons: [], needsApproval: false };
+    return { level: 'safe', reasons: [], needsApproval: false, signature: `unknown:${name}`, dangerous: false, sessionRememberable: false };
   }
 
   const command = readString(args, 'command', MAX_COMMAND_CHARS);
@@ -311,13 +346,32 @@ export function planToolCall(
     isRoot: ctx.identity?.isRoot ?? false,
   });
 
-  const autoRunnable =
-    grade.autoRunnable && ctx.identity !== null && !ctx.identity!.isRoot;
+  const bins = Array.from(new Set(grade.segments.map((s) => s.binary).filter((b): b is string => Boolean(b)))).sort();
+  const signature = `ssh_exec:${bins.join(',') || 'shell'}:${grade.level}`;
+
+  const elevated = grade.segments.some((s) => s.elevated);
+
+  /** 纯只读：每段都在只读表/白名单且整体 safe → 直接跑 */
+  const fullyReadOnly = grade.level === 'safe' && (grade.allWhitelisted || grade.allAllowlisted);
+
+  /** 高危：grade 判死 / 提权 / 身份未知。永远人工，且 auto 不覆盖 */
+  const dangerous = elevated || grade.level === 'dangerous' || ctx.identity === null;
+
+  const reasons: string[] = [];
+  if (grade.level === 'dangerous') reasons.push(...grade.reasons);
+  else if (elevated) reasons.push('Runs with elevated privileges (sudo/su)');
+  else if (ctx.identity === null) reasons.push('Remote identity unknown - cannot auto-run');
+  else reasons.push(...grade.reasons);
 
   return {
     level: grade.level,
-    reasons: autoRunnable ? [] : grade.reasons,
-    needsApproval: !autoRunnable,
+    reasons,
+    // 只读不需要弹；高危与常规改动都要弹（常规改动在 auto 开启后由 agent-loop 放行）
+    needsApproval: !fullyReadOnly,
+    signature,
+    dangerous,
+    // 高危不进 auto；常规改动（含高危以外的一切非只读）可被 Approve Session 覆盖
+    sessionRememberable: !dangerous && !fullyReadOnly,
   };
 }
 
@@ -335,12 +389,27 @@ async function execShell(ctx: ToolContext, args: Record<string, unknown>): Promi
   if (/[\r\n]/.test(command)) throw new ToolArgumentError('"command" must be a single line');
   const timeoutMs = readTimeout(args);
 
-  const outcome = await execCapture(ctx.client, command, {
+  // 远端套一层 timeout 做兜底自保（本地超时只关通道，不保证杀掉远端子进程）。
+  // 但部分系统的 timeout 不认 `--` 分隔符，会报 `failed to run command '--'` 然后 127 ——
+  // 那不是命令本身的错，是包装层炸了。这种情况**静默重试一次去掉 wrapper**，
+  // 让模型拿到真实输出，而不是看到一堆它从没写过的 `timeout` 报错还以为是环境问题。
+  let outcome = await execCapture(ctx.client, command, {
     timeoutMs,
     maxBytes: EXEC_MAX_BYTES,
-    // 远端再套一层 timeout：本地掐断只关通道，sshd 不一定杀掉子进程
     enforceRemoteTimeout: true,
   });
+
+  if (
+    outcome.kind === 'captured'
+    && outcome.code === 127
+    && /failed to run command/i.test(outcome.stderr)
+  ) {
+    outcome = await execCapture(ctx.client, command, {
+      timeoutMs,
+      maxBytes: EXEC_MAX_BYTES,
+      enforceRemoteTimeout: false,
+    });
+  }
 
   if (outcome.kind === 'no-shell') {
     return {
@@ -356,6 +425,11 @@ async function execShell(ctx: ToolContext, args: Record<string, unknown>): Promi
     `duration: ${outcome.durationMs}ms`,
   ];
   if (outcome.channelError) lines.push(`channel_error: ${outcome.channelError}`);
+  // 兜底 wrapper 仍然失败时，明确告诉模型这是执行环境的限制而非它的命令问题，
+  // 让它能换思路（比如改用 ssh_read / ssh_list）而不是空转重试。
+  if (outcome.code === 127 && /failed to run command/i.test(outcome.stderr)) {
+    lines.push('note: the remote `timeout` wrapper could not run this command; the failure is in the execution wrapper, not your command. Try again without assuming the wrapper, or use file-based tools.');
+  }
   lines.push('stdout:', outcome.stdout || '(empty)');
   if (outcome.stderr.trim()) lines.push('stderr:', outcome.stderr);
 

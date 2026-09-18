@@ -51,13 +51,56 @@ export default function App() {
   const activeTabsStorageKey = `webssh_active_tabs:${windowId}`;
   const activeTabIdStorageKey = `webssh_active_tab:${windowId}`;
 
-  // AI 面板：状态挂在 App 上、面板渲染在「发起它的那个 tab」里。
-  // 不放进 SSHTab 是因为 tab 会被序列化进 sessionStorage（redactTab），
-  // 而诊断请求可能带着几十 KB 的终端文本，不该进存储。
-  //
-  // 这里**只存「面板开在哪个 tab」**，不存终端文本快照：文本由面板在点
-  // 「Explain」的那一刻现取（`getContext`），避免开面板就抓一份、等用户想用时已经过期。
-  const [aiTabId, setAiTabId] = useState<string | null>(null);
+  // AI 面板：每个 tab 独立实例，X 只隐藏（hidden 保活，历史保留），
+  // 只有 tab 关闭 / 会话被杀时才真正卸载。不放进 SSHTab 是因为 tab 会被
+  // 序列化进 sessionStorage，而诊断文本可能几十 KB，不该进存储。
+  const [aiMountedTabs, setAiMountedTabs] = useState<string[]>([]);
+  const [aiOpenTabs, setAiOpenTabs] = useState<string[]>([]);
+  /**
+   * 用户对 AI 面板的**意图**（是否希望它开着），tabId → boolean。
+   *
+   * 与 aiOpenTabs 的区别：终端断开会被动卸载面板，但用户的意图仍是「开着」，
+   * 重连成功后据此自动恢复。用 ref 是因为它只在连接状态回调里读，不该驱动渲染。
+   */
+  const aiIntentRef = useRef<Map<string, boolean>>(new Map());
+  // 供只跑一次的 /sys 订阅 effect 读取最新值（避免闭包过期）
+  const tabsRef = useRef<SSHTab[]>([]);
+  const aiOpenRef = useRef<string[]>([]);
+  const openAiPanelRef = useRef<(id: string) => void>(() => {});
+  const openAiPanel = useCallback((id: string) => {
+    aiIntentRef.current.set(id, true);
+    setAiMountedTabs((prev) => (prev.includes(id) ? prev : [...prev, id]));
+    setAiOpenTabs((prev) => (prev.includes(id) ? prev : [...prev, id]));
+  }, []);
+  openAiPanelRef.current = openAiPanel;
+  const closeAiPanel = useCallback((id: string) => {
+    // 只有用户主动关（或对端同步关）才改意图；被动卸载走 removeAiPanel
+    aiIntentRef.current.set(id, false);
+    setAiOpenTabs((prev) => (prev.includes(id) ? prev.filter((t) => t !== id) : prev));
+  }, []);
+  const removeAiPanel = useCallback((id: string) => {
+    // 被动卸载：保留意图，等重连恢复。
+    // 注意每个 setter 在「无变化」时返回原引用 —— 否则值没变但引用变，
+    // 会触发重渲染 → onBusyChange 再次触发 → 无限 setState 循环。
+    setAiMountedTabs((prev) => (prev.includes(id) ? prev.filter((t) => t !== id) : prev));
+    setAiOpenTabs((prev) => (prev.includes(id) ? prev.filter((t) => t !== id) : prev));
+  }, []);
+
+  /**
+   * 终端不可用的 tab（重连中 / 已断开）。
+   *
+   * 语义按产品要求：**终端不能操作时，AI 面板收起**（隐藏），但面板本身保持挂载、
+   * 开关状态（aiOpenTabs / 服务端 panelOpen）不变 —— 重连成功后自动重新显示。
+   * 用隐藏而非卸载：卸载会 close() 掉 /ai 连接、丢掉卡片状态，且重连后又得重建。
+   */
+  const [busyTabs, setBusyTabs] = useState<string[]>([]);
+  const handleBusyChange = useCallback((tabId: string, busy: boolean) => {
+    setBusyTabs((prev) => {
+      const has = prev.includes(tabId);
+      if (busy) return has ? prev : [...prev, tabId];
+      return has ? prev.filter((t) => t !== tabId) : prev;
+    });
+  }, []);
 
   // 终端上下文取源：tabId → 「取选区，没有就取末尾若干行」。
   // 与命令 sink / 执行桥同一个模式：能力由 TerminalView 注册，App 只当中转。
@@ -165,6 +208,20 @@ export default function App() {
     const unsubscribe = sysClient.subscribe((snapshot) => {
       setSessions(snapshot.sessions);
       setActiveSessionCount(snapshot.sessions.length);
+      // 服务端（会话）是面板开关状态的权威来源：有会话开着面板、而本地对应 tab 没开，
+      // 就补开 —— 覆盖「另一设备打开」「接管后恢复」两种情况。
+      // 只补开、不主动关：关闭由 ai_panel_state 广播 / 用户操作处理，避免网络抖动时来回切。
+      // 关键：**终端不可用的 tab 不补开**。被别的设备接管后，本机 tab 还挂着同一个
+      // sessionId，若照常补开，面板会在刚被卸载后又被拉回来（表现为「接管后面板不收」）。
+      for (const sess of snapshot.sessions) {
+        if (!sess.aiPanelOpen) continue;
+        const tab = tabsRef.current.find((t) => t.sessionId === sess.sessionId);
+        if (!tab || aiOpenRef.current.includes(tab.id)) continue;
+        // 只有「本机就是这个会话的 owner」才补开。被别的设备接管后 owner 变成对方，
+        // 本机 tab 虽仍持同一 sessionId，也不该再把面板拉回来。
+        const owned = !sess.ownerClientId || sess.ownerClientId === tab.id;
+        if (tab.connected && owned) openAiPanelRef.current(tab.id);
+      }
     });
     return unsubscribe;
   }, []);
@@ -191,7 +248,12 @@ export default function App() {
     } catch {
       // ignore
     }
+    tabsRef.current = tabs;
   }, [tabs]);
+
+  useEffect(() => {
+    aiOpenRef.current = aiOpenTabs;
+  }, [aiOpenTabs]);
 
   useEffect(() => {
     try {
@@ -450,6 +512,7 @@ export default function App() {
   }, [tabs, editingSavedHostIndex, saveHostToBackend, upsertSavedHost, resetConnectionModalState, generateTabId, buildTabTitle]);
 
   const handleCloseTab = useCallback((id: string) => {
+    removeAiPanel(id);
     setTabs((prev) => {
       const tabToClose = prev.find((t) => t.id === id);
       if (tabToClose) {
@@ -470,6 +533,8 @@ export default function App() {
   }, [activeTabId]);
 
   const handleCloseAllTabs = useCallback(() => {
+    setAiMountedTabs([]);
+    setAiOpenTabs([]);
     setTabs((prev) => {
       const ids = prev.map((tab) => tab.sessionId || tab.id);
       apiFetch(apiUrl('/ssh/sessions/kill'), {
@@ -483,6 +548,8 @@ export default function App() {
   }, []);
 
   const handleCloseOtherTabs = useCallback((id: string) => {
+    setAiMountedTabs((prev) => prev.filter((t) => t === id));
+    setAiOpenTabs((prev) => prev.filter((t) => t === id));
     setTabs((prev) => {
       const others = prev.filter((t) => t.id !== id);
       const ids = others.map((tab) => tab.sessionId || tab.id);
@@ -535,6 +602,12 @@ export default function App() {
 
   const handleConnectionChange = useCallback((id: string, connected: boolean) => {
     setTabs((prev) => prev.map((tab) => (tab.id === id ? { ...tab, connected, error: connected ? undefined : tab.error } : tab)));
+    // 重连成功：用户在断线前希望面板开着的话，这里自动恢复。
+    // 恢复后面板连上服务端会收到 panelOpen 状态，与服务端保持一致。
+    if (connected && aiIntentRef.current.get(id)) {
+      setAiMountedTabs((prev) => (prev.includes(id) ? prev : [...prev, id]));
+      setAiOpenTabs((prev) => (prev.includes(id) ? prev : [...prev, id]));
+    }
   }, []);
 
   const handleSessionInfo = useCallback((id: string, sessionId: string) => {
@@ -665,11 +738,20 @@ export default function App() {
 
     setTabs((prev) => [...prev, newTab]);
     setActiveTabId(newTabId);
-  }, [tabs, handleRecoverSession, generateTabId]);
+    // 与 term 同帧打开 AI 面板：不能等 /sys 快照的 aiPanelOpen —— 那是下一次推送，
+    // 会让面板比终端晚半拍出现。先乐观打开，若服务端状态是关，随后的
+    // ai_panel_state / /sys 校正会把它关掉。
+    openAiPanel(newTabId);
+  }, [tabs, handleRecoverSession, generateTabId, openAiPanel]);
 
   const handleSessionKilled = useCallback((sessionId: string) => {
     setTabs((prev) => {
       const next = prev.filter((tab) => tab.sessionId !== sessionId && tab.id !== sessionId);
+      const removedIds = prev.filter((tab) => tab.sessionId === sessionId || tab.id === sessionId).map((tab) => tab.id);
+      if (removedIds.length) {
+        setAiMountedTabs((ids) => ids.filter((id) => !removedIds.includes(id)));
+        setAiOpenTabs((ids) => ids.filter((id) => !removedIds.includes(id)));
+      }
       if (activeTabId && !next.some((tab) => tab.id === activeTabId)) {
         setActiveTabId(next.length > 0 ? next[next.length - 1].id : null);
       }
@@ -825,9 +907,9 @@ export default function App() {
 
             return (
               <div key={tab.id} className={`relative h-full w-full ${isTabActive ? 'flex' : 'hidden'}`}>
-                {/* Terminal View */}
+                {/* Terminal View：AI 面板挂在终端容器内，避免盖住 SFTP 操作区 */}
                 <div
-                  className={`${
+                  className={`relative ${
                     tab.activeView === 'split'
                       ? `w-1/2 border-r ${isLight ? 'border-slate-200' : 'border-slate-800'}`
                       : 'w-full'
@@ -849,13 +931,38 @@ export default function App() {
                      reconnectMode={tab.reconnectMode}
                      initialError={tab.error}
                      onQuickCommandsChange={handleQuickCommandsChange}
-                     // 工具栏那颗按钮只负责把面板打开，不触发任何请求 ——
-                     // 「分析」是面板里那个按钮的事，得用户再点一次
-                     onOpenAi={() => setAiTabId(tab.id)}
+                      // 工具栏那颗按钮只负责把面板打开，不触发任何请求 ——
+                      // 「分析」是面板里那个按钮的事，得用户再点一次
+                      onOpenAi={() => openAiPanel(tab.id)}
                      onRegisterCommandSink={registerCommandSink(tab.id)}
                      onRegisterExecBridge={registerExecBridge(tab.id)}
-                     onRegisterContextSource={registerContextSource(tab.id)}
-                  />
+                      onRegisterContextSource={registerContextSource(tab.id)}
+                     onBusyChange={(b) => handleBusyChange(tab.id, b)}
+                   />
+                  {/* AI 面板：aiMounted 决定是否挂载（X 只隐藏保活），aiOpen 决定是否可见；
+                      挂终端容器内不盖 SFTP；切 tab 用 hidden 保留历史与流式。
+                      窄屏底部半屏抽屉，保留上面终端可见、能边看边问 */}
+                  {aiMountedTabs.includes(tab.id) && (
+                    <div className={`${aiOpenTabs.includes(tab.id) && showTerminal && !busyTabs.includes(tab.id) ? 'block' : 'hidden'} absolute z-30 overflow-hidden bg-transparent inset-x-0 bottom-0 top-[30%] rounded-t-xl border-t shadow-2xl sm:inset-y-0 sm:left-auto sm:right-0 sm:w-[24rem] sm:max-w-[85%] sm:rounded-l-xl sm:rounded-tr-none sm:border-l sm:border-t-0`}>
+                      <AiPanel
+                        theme={config.theme}
+                        target={{ host: tab.sshInfo?.host, username: tab.sshInfo?.username }}
+                        sessionId={tab.sessionId}
+                        getContext={() => contextSourcesRef.current.get(tab.id)?.() ?? null}
+                        terminalConnected={Boolean(tab.connected)}
+                        onRunCommand={(command, submit) =>
+                          commandSinksRef.current.get(tab.id)?.(command, submit) ?? false}
+                        getExecBridge={() => execBridgesRef.current.get(tab.id) ?? null}
+                        onClose={() => closeAiPanel(tab.id)}
+                        onPanelStateChange={(open) => {
+                          // 服务端同步来的面板开关（另一设备的操作 / 重连回放）：
+                          // 开则打开本地面板，关则关闭。幂等，不会和本地上报形成死循环。
+                          if (open) openAiPanel(tab.id);
+                          else closeAiPanel(tab.id);
+                        }}
+                      />
+                    </div>
+                  )}
                 </div>
 
                 {/* SFTP View */}
@@ -873,25 +980,6 @@ export default function App() {
                     isVisible={isTabActive && showSFTP}
                   />
                 </div>
-
-                {/* AI 面板：只渲染在发起它的 tab 里。tab 容器是 hidden 而不是卸载，
-                    所以切走再切回来流式回答还在。 */}
-                {aiTabId === tab.id && (
-                  <AiPanel
-                    theme={config.theme}
-                    target={{ host: tab.sshInfo?.host, username: tab.sshInfo?.username }}
-                    // Agent 复用这个 tab 的 SSH 会话；面板只拿到 id，连接仍归 /term 管
-                    sessionId={tab.sessionId}
-                    getContext={() => contextSourcesRef.current.get(tab.id)?.() ?? null}
-                    terminalConnected={Boolean(tab.connected)}
-                    onRunCommand={(command, submit) =>
-                      commandSinksRef.current.get(tab.id)?.(command, submit) ?? false}
-                    // 传 getter 而不是当时的值：桥是在子组件 effect 里注册的，
-                    // 而 effect 跑在父组件这次渲染之后 —— 渲染期读 ref 只会拿到 null
-                    getExecBridge={() => execBridgesRef.current.get(tab.id) ?? null}
-                    onClose={() => setAiTabId(null)}
-                  />
-                )}
               </div>
             );
           })

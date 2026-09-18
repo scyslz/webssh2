@@ -26,6 +26,12 @@ export interface GradeHit {
   rule: string;
   label: string;
   level: RiskLevel;
+  /**
+   * 这条命中属于「常规运维」（启停服务、装包、容器/代码删除、改权限、用户/进程改动…）。
+   * 常规运维即使判 caution 也不进复核/审批 —— 真正要拦的是 dangerous。
+   * 未标的（find -delete、xargs rm、sed -i 这类「批量/就地」）保留复核。
+   */
+  routine?: boolean;
 }
 
 export interface GradeSegment {
@@ -62,6 +68,11 @@ export interface GradeResult {
   allAllowlisted: boolean;
   /** 会话登录用户是否为 root */
   rootSession: boolean;
+  /**
+   * 所有命中都是「常规运维」（见 GradeHit.routine），或压根没命中。
+   * 为 true 时表示这次调用没有触及需要人工/模型复核的风险面。
+   */
+  routineOnly: boolean;
   /**
    * 是否允许无人值守自动执行（Agent 模式只对这类放开）。
    *
@@ -119,6 +130,29 @@ interface Rule {
   label: string;
   level: RiskLevel;
   test: (normalized: string) => boolean;
+  /** 常规运维：命中后不触发复核/审批（见 GradeHit.routine） */
+  routine?: boolean;
+}
+
+/** 重定向到这些设备是「丢弃输出」，不是危险写入：/dev/null、标准流、tty、fd */
+const HARMLESS_REDIRECT_TARGETS = /^\/dev\/(null|stdin|stdout|stderr|tty|fd\/\d+)$/;
+
+/**
+ * 命令里是否有「写入关键系统路径」的重定向。
+ *
+ * 只看 `>` / `>>` 的目标，且要排除 `2>/dev/null`、`&>/dev/null` 这类丢弃输出的写法 ——
+ * 它们极其常见，早先的 `/>>?\s*\/(dev)\//` 把 `last -n 15 2>/dev/null` 误判成
+ * 「写入关键系统文件」，把一条纯只读命令拦成 high risk。
+ */
+function writesCriticalPath(segment: string): boolean {
+  const re = />>?\s*([^\s|;&]+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(segment))) {
+    const target = m[1].replace(/^['"]|['"]$/g, '');
+    if (HARMLESS_REDIRECT_TARGETS.test(target)) continue;
+    if (/^\/(etc|boot|dev|proc|sys|var\/lib)(\/|$)/.test(target)) return true;
+  }
+  return false;
 }
 
 const has = (re: RegExp): Rule['test'] => (normalized) => re.test(normalized);
@@ -159,14 +193,48 @@ function rmHitsCriticalTarget(segment: string): boolean {
 
 const ELEVATE_HIT: GradeHit = { rule: 'elevate', label: '提权执行', level: 'caution' };
 
+/** 段的实际二进制名（去掉 sudo/env 等前缀）。让规则只认「段首就是该命令」 */
+const segmentBinary = (s: string): string | null => analyzeSegment(s).binary;
+
+/**
+ * 「常规运维」规则 id。命中的命令即使判 caution，也不触发模型复核 / 人工审批。
+ *
+ * 用户明确归类为不危险的：服务与容器启停重启、包管理安装/更新、容器/代码类删除、
+ * 权限/用户/进程改动。真正的风险面是 dangerous（删根、写盘、格式化、清防火墙、关机…），
+ * 那些不在此列，仍会拦。
+ *
+ * 刻意**不**放进来（保留复核）：find -delete、xargs rm、sed -i、log-destroy、
+ * critical 类 —— 它们是「批量/就地」操作，风险随目标变化大，值得再过一道模型。
+ */
+const ROUTINE_RULE_IDS = new Set([
+  'service-state',        // systemctl/service stop|restart|reload
+  'package-remove',       // 卸载软件包
+  'docker-destructive',   // docker rm/rmi/prune/down
+  'k8s-destructive',      // kubectl delete/scale/apply…
+  'git-destructive',      // git reset --hard / clean -f / push -f
+  'chmod-777',
+  'chown-recursive',
+  'user-delete',
+  'user-mutate',
+  'passwd-change',
+  'mount-mutate',
+  'crontab-edit',
+  'sysctl-mutate',
+  'swap-off',
+  'dd-generic',           // dd 非写盘（写盘的 dd-device 是 dangerous，不在列）
+]);
+
 /** 片段级规则表。test 收到的是**已转小写、空白已折叠**的片段。 */
 const SEGMENT_RULES: Rule[] = [
   // ---- 删除 ----
-  { id: 'rm-any', label: '删除文件', level: 'caution', test: has(/\brm\b/) },
+  // 必须看**段首二进制**，不能用 `\brm\b` 全片段匹配 —— 否则 `docker rm`、`git rm`
+  // 里出现的 `rm` 会被当成文件删除命令误报。
+  { id: 'rm-any', label: '删除文件', level: 'caution',
+    test: (s) => segmentBinary(s) === 'rm' },
   { id: 'rm-recursive', label: '递归删除', level: 'caution',
-    test: (s) => /\brm\b/.test(s) && rmFlags(s).recursive },
+    test: (s) => segmentBinary(s) === 'rm' && rmFlags(s).recursive },
   { id: 'rm-critical-target', label: '删除目标落在系统目录或根目录', level: 'dangerous',
-    test: (s) => /\brm\b/.test(s) && rmHitsCriticalTarget(s) },
+    test: (s) => segmentBinary(s) === 'rm' && rmHitsCriticalTarget(s) },
   { id: 'rm-no-preserve-root', label: '关闭了根目录保护', level: 'dangerous',
     test: has(/--no-preserve-root/) },
 
@@ -212,7 +280,7 @@ const SEGMENT_RULES: Rule[] = [
 
   // ---- 关键文件 ----
   { id: 'critical-file-write', label: '写入关键系统文件', level: 'dangerous',
-    test: has(/>>?\s*\/(etc|boot|dev|proc|sys|var\/lib)\//) },
+    test: (s) => writesCriticalPath(s) },
   { id: 'critical-file-edit', label: '就地修改关键系统文件', level: 'dangerous',
     test: has(/\b(sed|tee|truncate|cp|mv|dd|install)\b[^|;&]*\/(etc\/(fstab|passwd|shadow|sudoers|hosts|resolv\.conf)|boot\/)/) },
   { id: 'credential-read', label: '读取凭据文件', level: 'caution',
@@ -254,12 +322,27 @@ const WHOLE_RULES: Rule[] = [
     test: has(/:\s*\(\s*\)\s*\{[^}]*:\s*\|\s*:/) },
 ];
 
-/** 拆成独立命令片段：尊重引号，按 ; && || | & 与换行切 */
+/**
+ * 拆成独立命令片段：尊重引号，按 `;` `&&` `||` `|` `&` 与换行切。
+ *
+ * `&` 不能像以前那样一律当分隔符：`2>&1`、`>&2`、`&>` 都是**重定向**语法，
+ * 拆开会把 `cmd 2>&1` 切成 `cmd 2>` 和 `1`，判分片段彻底错位。规则：
+ *  - `&&` → 分隔符（逻辑与）
+ *  - `&>` 或以 `&` 结尾的重定向（前一个非空白字符是 `>` 或 `&`）→ 留在片段里
+ *  - 单独的 `&` → 后台分隔符，切断
+ */
 export function splitSegments(input: string): string[] {
   const text = input.replace(/\r/g, '').replace(/\\\n/g, ' ');
   const out: string[] = [];
   let buf = '';
   let quote: '"' | "'" | null = null;
+
+  const lastMeaningful = () => {
+    for (let k = buf.length - 1; k >= 0; k -= 1) {
+      if (!/\s/.test(buf[k])) return buf[k];
+    }
+    return '';
+  };
 
   for (let i = 0; i < text.length; i += 1) {
     const ch = text[i];
@@ -275,7 +358,18 @@ export function splitSegments(input: string): string[] {
     }
     if (ch === '"' || ch === "'") { quote = ch; buf += ch; continue; }
     if (ch === '\\' && i + 1 < text.length) { buf += ch + text[i + 1]; i += 1; continue; }
-    if (ch === '\n' || ch === ';' || ch === '&') { out.push(buf); buf = ''; continue; }
+    if (ch === '\n' || ch === ';') { out.push(buf); buf = ''; continue; }
+    if (ch === '&') {
+      const next = text[i + 1];
+      // `&&` 逻辑与 → 分隔
+      if (next === '&') { out.push(buf); buf = ''; i += 1; continue; }
+      // 重定向：`&>`、`>&`、`2>&1` 里的 `&` 前一个有效字符是 `>` 或 `&`
+      const prev = lastMeaningful();
+      if (next === '>' || prev === '>' || prev === '&') { buf += ch; continue; }
+      // 单独 `&` = 后台执行 → 分隔
+      out.push(buf); buf = '';
+      continue;
+    }
     if (ch === '|') {
       out.push(buf);
       buf = '';
@@ -358,9 +452,17 @@ export function analyzeSegment(segment: string): SegmentAnalysis {
       while (i < tokens.length && tokens[i].startsWith('-')) {
         const opt = tokens[i];
         i += 1;
-        if (opt === '-c') break;   // `su -c 'cmd'` 的 cmd 在引号里，这里就不再往里钻
+        if (opt === '-c') {
+          /**
+           * `su -c 'cmd'` 里的 cmd 会被真正执行，必须像 `bash -c` 一样递归判分，
+           * 否则 `su -c "rm -rf /"` 只会命中「提权」这一条，内层危险命令整个漏报。
+           * 把内层命令塞进 argv，由 extractInnerCommand 提取。
+           */
+          const inner = tokens[i];
+          return { binary: name, argv: inner ? [inner] : [], elevated };
+        }
       }
-      // 剩下的第一个词是用户名
+      // 没有 -c：剩下的第一个词是用户名，之后是登录 shell —— 不递归
       if (i < tokens.length && !isAssignment(tokens[i])) i += 1;
       continue;
     }
@@ -381,12 +483,23 @@ export function extractInnerCommand(analysis: SegmentAnalysis): string | null {
   const { binary, argv } = analysis;
   if (!binary) return null;
   if (binary === 'eval') return argv[0]?.trim() || null;
+  // su -c 'cmd'：analyzeSegment 已把内层命令放进 argv[0]
+  if (binary === 'su') return argv[0]?.trim() || null;
   if (!SHELL_BINARIES.has(binary)) return null;
   // -c / -lc / -ec 这类组合短选项都算
   const index = argv.findIndex((t) => /^-[A-Za-z]*c[A-Za-z]*$/.test(t));
   if (index === -1) return null;
   return argv[index + 1]?.trim() || null;
 }
+
+/**
+ * 无子命令时也视为只读的二进制。
+ *
+ * `systemctl --failed` / `systemctl --no-pager` 这类只带选项、不带子命令的调用，
+ * 默认动作是列出/查询单元，属纯只读；但 `isWhitelisted` 按「第一个 positional
+ * 子命令」判定，选项被过滤后 positional 为空，会误判成非只读 → root 下被拦。
+ */
+const READONLY_WHEN_NO_SUBCOMMAND = new Set(['systemctl']);
 
 function isWhitelisted(analysis: SegmentAnalysis, extra: string[]): boolean {
   const { binary, argv } = analysis;
@@ -396,9 +509,11 @@ function isWhitelisted(analysis: SegmentAnalysis, extra: string[]): boolean {
 
   const subs = READONLY_SUBCOMMANDS[binary];
   if (!subs) return false;
-  const positional = argv.filter((t) => !t.startsWith('-'));
+  // 选项、重定向（`2>/dev/null`、`>/tmp/x`）都不是子命令，不能当 positional 用 ——
+  // 否则 `systemctl --failed 2>/dev/null` 会把 `2>/dev/null` 当成子命令判非只读。
+  const positional = argv.filter((t) => !t.startsWith('-') && !t.includes('>'));
   const first = positional[0];
-  if (!first) return false;
+  if (!first) return READONLY_WHEN_NO_SUBCOMMAND.has(binary);
   if (subs.includes(first)) return true;
 
   const group = READONLY_SUBCOMMAND_GROUPS[first];
@@ -434,7 +549,7 @@ function gradeInternal(command: string, options: GradeOptions, depth: number): G
   const record = (hit: GradeHit) => {
     if (seen.has(hit.rule)) return;
     seen.add(hit.rule);
-    hits.push(hit);
+    hits.push(ROUTINE_RULE_IDS.has(hit.rule) ? { ...hit, routine: true } : hit);
   };
 
   for (const rule of WHOLE_RULES) {
@@ -494,6 +609,8 @@ function gradeInternal(command: string, options: GradeOptions, depth: number): G
   const allWhitelisted = segments.length > 0 && segments.every((s) => s.whitelisted);
   const allAllowlisted = segments.length > 0 && segments.every((s) => s.allowlisted);
   const autoRunnable = level === 'safe' && allAllowlisted && !rootSession;
+  // 没有任何 dangerous 命中，且所有命中都是常规运维 → 不必复核/审批
+  const routineOnly = hits.every((h) => h.level !== 'dangerous' && h.routine === true);
 
   return {
     level,
@@ -503,6 +620,7 @@ function gradeInternal(command: string, options: GradeOptions, depth: number): G
     allWhitelisted,
     allAllowlisted,
     rootSession,
+    routineOnly,
     autoRunnable,
   };
 }

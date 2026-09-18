@@ -2,6 +2,7 @@ import { wsUrl } from './api';
 
 export interface SessionHealth {
   sessionId: string;
+  ownerClientId: string;
   host: string;
   port: number;
   username: string;
@@ -12,6 +13,8 @@ export interface SessionHealth {
   shared: boolean;
   title?: string;
   credentialId?: string;
+  /** 该会话 AI 面板是否开着（会话级状态，接管/重连方据此自动打开面板） */
+  aiPanelOpen?: boolean;
 }
 
 export interface HealthSnapshot {

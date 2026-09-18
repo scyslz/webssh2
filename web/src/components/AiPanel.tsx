@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
-  Bot,
   Check,
   ChevronDown,
   ChevronRight,
@@ -9,12 +8,12 @@ import {
   CornerDownLeft,
   Loader2,
   Play,
-  RefreshCw,
   Settings2,
   ShieldAlert,
   Sparkles,
   Square,
-  Wand2,
+  Trash2,
+  Monitor,
   X,
 } from 'lucide-react';
 import {
@@ -24,38 +23,36 @@ import {
   testAiConfig,
   type AiAgentApproval,
   type AiAgentDone,
-  type AiAgentIdentity,
   type AiConfigView,
   type AiContextStats,
   type AiDoneMeta,
   type AiDraft,
-  type AiGradeResult,
   type AiRiskLevel,
   type TerminalBridge,
+  type AiAgentIdentity,
+  type ChatMessage,
+  type AiHistoryEntry,
 } from '../aiClient';
 import { ConfirmDialog } from './ConfirmDialog';
 import { isLightTheme } from '../theme';
+import { globalGet, globalSet } from '../storage';
 
 /**
- * AI 面板（P0 只读诊断 + P1 命令草稿 + P2 Agent）。
+ * AI 面板：统一对话窗口 + 多会话 + Agent（服务端驱动的工具循环）。
  *
- * 刻意做出来的规矩：
- * 1. 诊断模式里没有「执行」按钮 —— 只解释不操作。
- * 2. 命令草稿的风险等级**以服务端判分显示**，模型自评只在旁边做对照；
- *    两者不一致时，界面显示的是判分结果。
- * 3. 「执行」在界面上永远排在「填入」后面，且高风险命令必须再过一次确认框。
- *    底层不变量没变：命令是写进终端输入行，回车永远是用户按的（除了他显式点执行）。
- * 4. 「Sending」默认展开：用户得能看见到底把什么发出去了，才谈得上信任。
- * 5. 未配置时面板自己承担配置表单，不把 AI 设置塞进全局设置里（自托管场景
- *    大多数人是靠环境变量喂 key 的，UI 只是兜底）。
- * 6. Agent 的循环**不在**这里 —— 它在服务端跑，浏览器只渲染事件流和回答审批。
- *    界面上每一条工具调用都先露面再执行：需要你点头的会停在 `awaiting`，
- *    「Deny」和「Allow」一样显眼 —— 别让人因为找不到「不」而默认放行。
- * 7. **打开面板不发任何请求**，也不预先抓上下文快照。终端文本一律在点
- *    「Explain / Generate / Start」那一刻现取（`getContext`）：
- *    出网的内容得是用户刚确认过的，而不是打开面板时那一屏的旧内容。
+ * 三个旧的入口（解释 / 生成命令 / Agent）合并成一个聊天框：
+ *   - 有终端会话时，每条消息走 Agent（它既能只读解读、也能在审批后执行工具）；
+ *   - 没有会话时，走只读诊断（diagnose）。
+ *   - 「包含终端屏幕」开关控制这一条要不要把当前屏幕内容一起发上去；
+ *     关掉它就只发你的问题 + host/user。
  *
- * 界面文案统一用简洁英文：这个面板是工具，不是说明文档，能一句话说完就不写三句。
+ * 安全边界不变：
+ *   1. 诊断路径永不执行；Agent 里写文件 / 高风险命令仍要人工审批。
+ *   2. 风险等级以服务端判分显示，模型自评只作对照。
+ *   3. 命令写进终端输入行，回车永远用户按（除非显式点 Run）。
+ *   4. 多会话是**纯客户端**的——服务端不存历史，每条消息都从「当前屏幕 + 你的提问」重新开始。
+ *      session 之间的区别只是面板里分开展示的对话。
+ *   5. 审批支持「本次会话放行」：同类工具之后不再每次打断（记忆只活在这一次 runAgent 请求内）。
  */
 
 interface AiPanelProps {
@@ -63,34 +60,24 @@ interface AiPanelProps {
   theme?: string;
   /** 目标机描述（host/user）。面板自己不持有 SSH 凭据 */
   target?: { host?: string; username?: string; cwd?: string };
-  /**
-   * 当前 tab 的 SSH 会话 id。Agent 复用这个会话执行工具。
-   *
-   * 注意面板拿到的是 id 不是连接 —— 它只是告诉服务端「去借那一条」，
-   * 借不到（未连接 / 已回收）服务端会明确报错，面板这里也提前拦一道。
-   */
+  /** 当前 tab 的 SSH 会话 id。Agent 复用这个会话执行工具。 */
   sessionId?: string;
-  /**
-   * 现取终端上下文：有选区取选区，否则取末尾若干行。
-   *
-   * 是函数不是快照：面板打开时并不抓文本。开面板 → 用户决定要问什么 → 点按钮那一刻才取，
-   * 这样既不会「打开就自动出网」，拿到的也不会是打开面板那一刻的旧屏幕。
-   */
+  /** 现取终端上下文：有选区取选区，否则取末尾若干行。是函数不是快照 */
   getContext?: () => { text: string; source: 'selection' | 'tail' } | null;
-  /** 目标终端的 SSH 连接是否就绪；没连上就不能执行命令 */
+  /** 目标终端的 SSH 连接是否就绪；没连上就只能走只读诊断 */
   terminalConnected?: boolean;
   /** 把命令写进终端输入行。submit=false 只填入不回车。返回是否发送成功 */
   onRunCommand?: (command: string, submit: boolean) => boolean;
-  /**
-   * 取当前 tab 的执行桥（结构化采集 + 身份探测）。
-   *
-   * 是 getter 不是值：桥由 TerminalView 在 effect 里注册，晚于父组件渲染，
-   * 渲染期取到的永远是 null。Agent 循环真正开跑时才调用它。
-   */
   getExecBridge?: () => TerminalBridge | null;
+  /**
+   * 会话级面板开关状态变化（来自服务端，可能是别的设备的操作）。
+   * App 据此自动打开/关闭对应 tab 的面板。
+   */
+  onPanelStateChange?: (open: boolean) => void;
 }
 
-/** 风险色带：判分结果是唯一的着色依据 */
+/* ----------------------------- 风险着色 ----------------------------- */
+
 const RISK_STYLE: Record<AiRiskLevel, { badge: string; border: string; text: string }> = {
   safe: { badge: 'bg-emerald-100 text-emerald-700', border: 'border-emerald-300', text: 'text-emerald-600' },
   caution: { badge: 'bg-amber-100 text-amber-700', border: 'border-amber-300', text: 'text-amber-600' },
@@ -103,21 +90,11 @@ const RISK_STYLE_DARK: Record<AiRiskLevel, { badge: string; border: string; text
 };
 const RISK_LABEL: Record<AiRiskLevel, string> = { safe: 'read-only', caution: 'caution', dangerous: 'high risk' };
 
-type Phase = 'idle' | 'streaming' | 'done' | 'error';
-
-type Palette = Record<'panel' | 'header' | 'subtle' | 'card' | 'code' | 'input' | 'button' | 'primary' | 'danger', string>;
-
-/* ------------------------- Agent 模式 ------------------------- */
-
-/** 默认步数上限，与服务端 AGENT_DEFAULT_MAX_STEPS 对齐 */
-const AGENT_MAX_STEPS = 20;
-/** 工具输出在面板里的展示上限，超出掐头去尾留中间，避免长日志把面板撑爆 */
+const AGENT_DEFAULT_STEPS = 20;
 const AGENT_OUTPUT_CLIP_CHARS = 4000;
 
-/** 工具调用的状态。awaiting = 停在审批闸上等人 */
-type ToolStatus = 'pending' | 'awaiting' | 'running' | 'done' | 'denied';
+type ToolStatus = 'pending' | 'awaiting' | 'running' | 'done' | 'denied' | 'auto';
 
-/** Agent 事件流里的一条。服务端推什么我们画什么，本地不做决策 */
 type AgentItem =
   | { kind: 'message'; key: string; text: string }
   | {
@@ -131,15 +108,19 @@ type AgentItem =
       reasons?: string[];
       output?: string;
       truncated?: boolean;
+      /** false = 破坏性命令，不提供「Allow for session」 */
+      rememberable?: boolean;
+      /** 高危：审批只给 Approve / Deny */
+      dangerous?: boolean;
+      /** 是否提供「Approve Session」 */
+      canRemember?: boolean;
     };
 
-/** 把工具的入参画成人看得懂的一行 */
 const describeCall = (item: Extract<AgentItem, { kind: 'tool' }>): string => {
   const args = item.display ? item.display.replace(/\s+/g, ' ').trim() : '';
   return args.length > 300 ? `${args.slice(0, 300)}…` : (args || '(no arguments)');
 };
 
-/** 掐中间：长输出保留头尾，中间用省略号代替 */
 const clipOutput = (text: string) => {
   if (text.length <= AGENT_OUTPUT_CLIP_CHARS) return text;
   const head = Math.floor(AGENT_OUTPUT_CLIP_CHARS * 0.6);
@@ -147,31 +128,208 @@ const clipOutput = (text: string) => {
   return `${text.slice(0, head)}\n… ${text.length - AGENT_OUTPUT_CLIP_CHARS} chars omitted …\n${text.slice(-tail)}`;
 };
 
-const buttonClass = 'flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium border transition cursor-pointer disabled:opacity-40';
+const buttonClass = 'flex items-center gap-1 px-1.5 py-0.5 min-h-[26px] sm:px-2 sm:py-1 sm:min-h-[30px] rounded-md text-[11px] font-medium border transition cursor-pointer disabled:opacity-40';
 
-interface AgentItemRowProps {
+const copyText = (text: string, onOk?: () => void) => {
+  if (!text) return;
+  navigator.clipboard?.writeText(text).then(() => onOk?.()).catch(() => {});
+};
+
+const EMPTY_PROMPTS = [
+  'What just failed here?',
+  'Explain the last error',
+  'What should I check next?',
+  'Summarize this output',
+];
+
+const formatElapsed = (ms: number) => {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  return `${m}m${String(s % 60).padStart(2, '0')}s`;
+};
+
+/** 卡片起始时间的时钟显示（本地时区，HH:MM:SS） */
+const formatClock = (at?: number) => {
+  if (!at) return '';
+  const d = new Date(at);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+};
+
+/** 每张卡片右上角/底部统一的起始时间标记 */
+const StartedAt: React.FC<{ at?: number; palette: Palette; extra?: string }> = ({ at, palette, extra }) => {
+  if (!at) return null;
+  return (
+    <span className={`text-[9px] font-mono ${palette.subtle}`} title={new Date(at).toLocaleString()}>
+      {formatClock(at)}{extra ? ` · ${extra}` : ''}
+    </span>
+  );
+};
+
+type Palette = Record<'panel' | 'header' | 'subtle' | 'card' | 'code' | 'input' | 'button' | 'primary' | 'danger', string>;
+
+/* ----------------------------- 会话 / 消息模型 ----------------------------- */
+
+interface PreparedView {
+  text: string;
+  env: string;
+  question: string;
+  stats: AiContextStats;
+}
+
+interface ChatUserEntry {
+  id: string;
+  kind: 'user';
+  text: string;
+  withScreen: boolean;
+  /** 创建时间（epoch ms）。本机建 = Date.now()；历史回放 = 服务端给的 at */
+  at?: number;
+}
+
+interface ChatTextEntry {
+  id: string;
+  kind: 'text';
+  answer: string;
+  meta?: AiDoneMeta;
+  error?: string;
+  aborted?: boolean;
+  degraded?: boolean;
+  prepared?: PreparedView | null;
+  streaming?: boolean;
+  at?: number;
+}
+
+interface ChatDraftEntry {
+  id: string;
+  kind: 'draft';
+  draft: AiDraft;
+  meta?: AiDoneMeta;
+  prepared?: PreparedView | null;
+  error?: string;
+  at?: number;
+}
+
+interface ChatAgentEntry {
+  id: string;
+  kind: 'agent';
+  goal: string;
+  identity?: AiAgentIdentity | null;
+  items: AgentItem[];
+  final?: string;
+  error?: string;
+  aborted?: boolean;
+  stopReason?: AiAgentDone['stopReason'];
+  steps?: number;
+  prepared?: PreparedView | null;
+  streaming?: boolean;
+  at?: number;
+  /** run 起点（epoch ms，服务端给）。用于卡片内耗时显示，刷新/接管后仍准确 */
+  runStartedAt?: number;
+  /** agent_done 的元信息（含服务端实测总耗时 ms） */
+  meta?: AiDoneMeta;
+}
+
+type ChatEntry = ChatUserEntry | ChatTextEntry | ChatDraftEntry | ChatAgentEntry;
+
+interface AiChatSession {
+  id: string;
+  title: string;
+  messages: ChatEntry[];
+  createdAt: number;
+}
+
+const newSession = (): AiChatSession => ({
+  id: `ai-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+  title: 'New chat',
+  messages: [],
+  createdAt: Date.now(),
+});
+
+/**
+ * 把服务端回放的一条历史记录还原成前端 entry。
+ *
+ * id 按序号生成、加 `h-` 前缀：历史条目是**已定型**的，不会再有流式更新，
+ * 所以不需要稳定 key，只要一轮内唯一即可。
+ */
+const historyToEntry = (e: AiHistoryEntry, index: number): ChatEntry => {
+  const id = `h-${index}`;
+  if (e.kind === 'user') {
+    return { id, kind: 'user', text: e.text || '', withScreen: Boolean(e.withScreen), at: e.at };
+  }
+  if (e.kind === 'text') {
+    return { id, kind: 'text', answer: e.answer || '', error: e.error, aborted: e.aborted, streaming: false, at: e.at };
+  }
+  if (e.kind === 'agent') {
+    const items: AgentItem[] = (e.items || []).map((it, i): AgentItem => {
+      if (it.kind === 'message') return { kind: 'message', key: `h-${index}-m${i}`, text: String(it.text || '') };
+      return {
+        kind: 'tool',
+        key: `h-${index}-t${i}`,
+        callId: String(it.callId || `h-${index}-t${i}`),
+        tool: String(it.tool || ''),
+        display: String(it.display || ''),
+        status: (it.status as ToolStatus) || 'done',
+        level: it.level as AiRiskLevel | undefined,
+        reasons: Array.isArray(it.reasons) ? it.reasons.map(String) : undefined,
+        output: typeof it.output === 'string' ? it.output : undefined,
+        truncated: Boolean(it.truncated),
+        rememberable: it.rememberable !== false,
+        dangerous: it.dangerous === true,
+        canRemember: it.canRemember === true,
+      };
+    });
+    return {
+      id,
+      kind: 'agent',
+      goal: e.goal || '',
+      identity: (e.identity as AiAgentIdentity | null) ?? null,
+      items,
+      final: e.final,
+      error: e.error,
+      aborted: e.aborted,
+      stopReason: e.stopReason as AiAgentDone['stopReason'] | undefined,
+      steps: e.steps,
+      streaming: false,
+      at: e.at,
+      // 历史里这条 run 若已完成，runStartedAt 就是它的起点；未完成时接管方会由
+      // resumed 的 startedAt 覆盖，所以这里统一用 at 兜底。
+      runStartedAt: e.at,
+      meta: e.ms !== undefined ? { ms: e.ms } : undefined,
+    };
+  }
+  // text
+  return { id, kind: 'text', answer: e.answer || '', error: e.error, aborted: e.aborted, streaming: false, at: e.at };
+};
+
+/** 从历史里取第一条用户提问当标题（服务端不存标题） */
+const deriveTitle = (messages: ChatEntry[]): string => {
+  const firstUser = messages.find((m) => m.kind === 'user') as ChatUserEntry | undefined;
+  return firstUser?.text.trim().slice(0, 40) || 'New chat';
+};
+
+const redactionSummary = (stats: AiContextStats) => {
+  if (!stats.redactionTotal) return '';
+  return Object.entries(stats.redactions || {})
+    .filter(([, count]) => count > 0)
+    .map(([key, count]) => `${key}×${count}`)
+    .join(' ');
+};
+
+/* ----------------------------- Agent 工具行 ----------------------------- */
+
+const AgentItemRow: React.FC<{
   item: Extract<AgentItem, { kind: 'tool' }>;
   risk: Record<AiRiskLevel, { badge: string; border: string; text: string }>;
   palette: Palette;
   onAllow: () => void;
+  onAllowSession: () => void;
   onDeny: () => void;
-}
-
-/**
- * Agent 的一次工具调用。
- *
- * 三处刻意的安排：
- * 1. 调用**先露面再执行** —— 工具名和参数渲染出来的时候，它还什么都没做。
- * 2. 要审批的停在 `awaiting`，「Deny」和「Allow」同等显眼：
- *    拒绝这一步和放行一样容易，否则用户会因为在界面上找不到「不」而默认放行。
- * 3. 风险等级来自服务端判分（`level`），不是模型自评。
- */
-const AgentItemRow: React.FC<AgentItemRowProps> = ({ item, risk, palette, onAllow, onDeny }) => {
+}> = ({ item, risk, palette, onAllow, onAllowSession, onDeny }) => {
   const level = item.level;
-
   return (
-    <div className={`rounded border p-2.5 space-y-1.5 ${level ? risk[level].border : palette.card}`}>
-      <div className="flex items-center gap-1.5 flex-wrap">
+    <div className={`rounded-md border p-1.5 sm:p-2.5 space-y-1 sm:space-y-1.5 ${level ? risk[level].border : palette.card}`}>
+      <div className="flex items-center gap-1 sm:gap-1.5 flex-wrap">
         <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${palette.card}`}>{item.tool}</span>
         {level && (
           <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${risk[level].badge}`}>
@@ -179,10 +337,11 @@ const AgentItemRow: React.FC<AgentItemRowProps> = ({ item, risk, palette, onAllo
           </span>
         )}
         {item.status === 'pending' && <Loader2 className="w-3 h-3 animate-spin text-indigo-500" />}
+        {item.status === 'auto' && <span className={`text-[10px] ${palette.subtle}`}>auto-approved</span>}
         {item.status === 'denied' && <span className={`text-[10px] ${palette.subtle}`}>denied</span>}
       </div>
 
-      <pre className={`max-h-24 overflow-auto rounded border p-2 text-[11px] font-mono whitespace-pre-wrap break-all ${palette.code}`}>
+      <pre className={`max-h-24 overflow-auto rounded-md border p-1.5 text-[11px] font-mono whitespace-pre-wrap break-all ${palette.code}`}>
         {describeCall(item)}
       </pre>
 
@@ -198,14 +357,19 @@ const AgentItemRow: React.FC<AgentItemRowProps> = ({ item, risk, palette, onAllo
       )}
 
       {item.status === 'awaiting' && (
-        <div className="flex items-center gap-2 flex-wrap">
-          <button
-            onClick={onAllow}
-            className={`${buttonClass} ${item.level === 'dangerous' ? palette.danger : palette.primary}`}
-          >
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <button onClick={onAllow} className={`${buttonClass} ${item.dangerous || item.level === 'dangerous' ? palette.danger : palette.primary}`}>
             <Play className="w-3 h-3" />
-            <span>Allow</span>
+            <span>Approval</span>
           </button>
+          {/* 常规改动才给「Approve Session」：点了之后本 SSH 会话的常规改动都自动跑。
+              高危命令只给 Approve / Deny，永不提供 session 放行。 */}
+          {item.canRemember && (
+            <button onClick={onAllowSession} className={`${buttonClass} ${palette.button}`} title="Approve this and let routine changes run automatically for the rest of this session">
+              <Check className="w-3 h-3" />
+              <span>Session</span>
+            </button>
+          )}
           <button onClick={onDeny} className={`${buttonClass} ${palette.button}`}>
             <X className="w-3 h-3" />
             <span>Deny</span>
@@ -214,7 +378,7 @@ const AgentItemRow: React.FC<AgentItemRowProps> = ({ item, risk, palette, onAllo
       )}
 
       {item.status === 'done' && item.output !== undefined && (
-        <pre className={`max-h-40 overflow-auto rounded border p-2 text-[10px] leading-relaxed font-mono whitespace-pre-wrap break-all ${palette.code}`}>
+        <pre className={`max-h-40 overflow-auto rounded-md border p-1.5 text-[10px] leading-relaxed font-mono whitespace-pre-wrap break-all ${palette.code}`}>
           {item.output ? clipOutput(item.output) : '(no output)'}
           {item.truncated ? '\n[truncated]' : ''}
         </pre>
@@ -223,20 +387,7 @@ const AgentItemRow: React.FC<AgentItemRowProps> = ({ item, risk, palette, onAllo
   );
 };
 
-interface PreparedView {
-  text: string;
-  env: string;
-  question: string;
-  stats: AiContextStats;
-}
-
-const redactionSummary = (stats: AiContextStats) => {
-  if (!stats.redactionTotal) return '';
-  const parts = Object.entries(stats.redactions || {})
-    .filter(([, count]) => count > 0)
-    .map(([key, count]) => `${key}×${count}`);
-  return parts.join(' ');
-};
+/* ----------------------------- 主组件 ----------------------------- */
 
 export const AiPanel: React.FC<AiPanelProps> = ({
   onClose,
@@ -247,36 +398,26 @@ export const AiPanel: React.FC<AiPanelProps> = ({
   terminalConnected = false,
   onRunCommand,
   getExecBridge,
+  onPanelStateChange,
 }) => {
   const isLight = isLightTheme(theme);
   const risk = isLight ? RISK_STYLE : RISK_STYLE_DARK;
 
   const clientRef = useRef<AiWSClient | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
-  const lastRunRef = useRef<{ text: string; source: 'selection' | 'tail'; question?: string } | null>(null);
-  /** 回调里读 draft 原文用，避免把 draftRaw 塞进 runDraft 的依赖里导致反复重建 */
-  const draftRawRef = useRef('');
-  /** 上下文只在用户点按钮的那一刻取一次，之后追问 / 重新生成都沿用这份，避免答案前后对不上 */
-  const lastContextRef = useRef<{ text: string; source: 'selection' | 'tail' } | null>(null);
+
+  const [sessions, setSessions] = useState<AiChatSession[]>([]);
+  const [activeId, setActiveId] = useState<string>('');
+  const activeIdRef = useRef<string>('');
+  /** 历史比初始会话先到时暂存于此（见初始化 effect） */
+  const pendingHistoryRef = useRef<{ messages: ChatEntry[]; title: string } | null>(null);
+  const [includeScreen, setIncludeScreen] = useState(false);
 
   const [config, setConfig] = useState<AiConfigView | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
-  const [phase, setPhase] = useState<Phase>('idle');
-  const [prepared, setPrepared] = useState<PreparedView | null>(null);
-  const [answer, setAnswer] = useState('');
-  const [meta, setMeta] = useState<AiDoneMeta | null>(null);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [showContext, setShowContext] = useState(true);
-  /**
-   * 打开面板时瞄一眼上下文，只为把「Explain」按钮写清楚（选区还是末尾若干行）。
-   * 纯本地读取、不发请求；真正发的时候再取一次，取的是那一刻的屏幕内容。
-   */
-  const [peek] = useState<{ source: 'selection' | 'tail' }>(() => ({
-    source: getContext?.()?.source ?? 'tail',
-  }));
-  const [followUp, setFollowUp] = useState('');
-  const [copied, setCopied] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
 
+  // 表单
   const [formBaseUrl, setFormBaseUrl] = useState('');
   const [formModel, setFormModel] = useState('');
   const [formApiKey, setFormApiKey] = useState('');
@@ -285,43 +426,80 @@ export const AiPanel: React.FC<AiPanelProps> = ({
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
-  /**
-   * 配置表单默认只在「未就绪」时出现，但就绪之后用户仍然可能要改模型/地址 ——
-   * 没有这个开关，保存过一次就再也进不去表单了。
-   */
-  const [showSettings, setShowSettings] = useState(false);
 
-  // ---- P1 命令草稿 ----
-  /** 当前流的是哪种请求，决定 delta 往哪写、底部按钮显示什么 */
-  const [mode, setMode] = useState<'diagnose' | 'draft' | 'agent'>('diagnose');
-  const [askText, setAskText] = useState('');
-  const [draft, setDraft] = useState<AiDraft | null>(null);
-  /** draft 模式流下来的原文（JSON）。只在解析失败降级时才会展示给人看 */
-  const [draftRaw, setDraftRaw] = useState('');
-  const [degraded, setDegraded] = useState(false);
-  const [confirmRunOpen, setConfirmRunOpen] = useState(false);
-  const [runNotice, setRunNotice] = useState<string | null>(null);
-  const lastDraftRef = useRef<{ text: string; source: 'selection' | 'tail'; question: string } | null>(null);
+  // 输入 / 运行态
+  const [input, setInput] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [lastRunNotice, setRunNotice] = useState<string | null>(null);
+  const [maxSteps, setMaxSteps] = useState(() => {
+    try {
+      const v = Number(globalGet('webssh_ai_maxsteps'));
+      return [5, 10, 20, 30, 50].includes(v) ? v : AGENT_DEFAULT_STEPS;
+    } catch {
+      return AGENT_DEFAULT_STEPS;
+    }
+  });
+  const changeMaxSteps = useCallback((n: number) => {
+    const v = [5, 10, 20, 30, 50].includes(n) ? n : AGENT_DEFAULT_STEPS;
+    setMaxSteps(v);
+    try { globalSet('webssh_ai_maxsteps', String(v)); } catch {}
+  }, []);
 
-  // ---- Agent 模式 ----
-  const [agentGoal, setAgentGoal] = useState('');
-  /** 服务端推过来的事件流，按到达顺序渲染 */
-  const [agentItems, setAgentItems] = useState<AgentItem[]>([]);
-  const [agentFinal, setAgentFinal] = useState('');
-  const [agentError, setAgentError] = useState<string | null>(null);
-  const [agentIdentity, setAgentIdentity] = useState<AiAgentIdentity | null>(null);
-  const [agentStep, setAgentStep] = useState(0);
-  const [agentDone, setAgentDone] = useState<AiAgentDone | null>(null);
-  const [agentRunning, setAgentRunning] = useState(false);
-  /**
-   * 审批闸的 resolve。存 ref 而不是 state：它是给 await 用的，不是给渲染用的。
-   * 服务端在等这个应答，界面上对应的那条会停在 `awaiting`。
-   */
-  const approvalRef = useRef<((allow: boolean) => void) | null>(null);
-  /** 每次开跑 +1；迟到的事件一律丢弃 */
+  // draft 的高风险二次确认
+  const [confirmRun, setConfirmRun] = useState<{ sessionId: string; entryId: string } | null>(null);
+
+  // 运行计时：起点由**服务端**给（run 的真实开始时间），前端只按墙钟算差值。
+  // 这样刷新 / 接管后不会从 0 重新计；拿不到服务端时间才退回本机 Date.now()。
+  const busyStartRef = useRef<number | null>(null);
+  const [runElapsedMs, setRunElapsedMs] = useState(0);
+  const [runStep, setRunStep] = useState(0);
+  const beginRun = (startedAt?: number) => {
+    busyStartRef.current = startedAt ?? Date.now();
+    setRunElapsedMs(Math.max(0, Date.now() - busyStartRef.current));
+    setRunStep(0);
+    setBusy(true);
+    busyRef.current = true;
+    setRunNotice(null);
+  };
+  const endRun = () => {
+    busyStartRef.current = null;
+    setBusy(false);
+    busyRef.current = false;
+  };
+
+  // Agent 审批闸 resolve（非 state，给 await 用）
+  const approvalRef = useRef<((allow: boolean, remember: boolean) => void) | null>(null);
   const agentRunIdRef = useRef(0);
-  /** 上一次的目标，给「重新生成」用 */
-  const lastAgentGoalRef = useRef('');
+  /**
+   * 重连接回时要继续写入的 entry id。
+   *
+   * 断线前那条 agent entry 还在本地（页面没刷新）：重连后**接着往它里面追加**，
+   * 不另开一条 —— 对用户而言就是同一次会话在继续，没必要区别「断线前/后」。
+   * 若本地已经没有那条 entry（页面刷新过），才新建。
+   */
+  const resumedEntryRef = useRef<string | null>(null);
+  /** 最近一条 agent entry 的 id，供重连时找回 */
+  const lastAgentEntryRef = useRef<string | null>(null);
+  /**
+   * 被动跟随一条 diagnose/draft 流时承接 delta 的 text entry。
+   *
+   * agent run 靠 `agent_start{resumed}` 认回 entry；diagnose/draft 没有这个信号，
+   * 只能从 `ready.resumed(+/Kind)` 得知。delta 本身不进服务端缓冲，所以中途接管
+   * 只能从「此刻起」继续渲染 —— 已吐出的部分由 `ai_history` 里的 finalized 文本补。
+   */
+  const followedRunRef = useRef<{ id: string; kind: 'diagnose' | 'draft' } | null>(null);
+  /** 跟随流已落地的 text entry id（首个 delta 到达时惰性创建） */
+  const followedTextEntryRef = useRef<string | null>(null);
+  /** 供 client 初始化 effect 调用（effect 早于下面的 useCallback 定义跑） */
+  const appendEntryRef = useRef<(entry: ChatEntry) => void>(() => {});
+  const patchEntryRef = useRef<(entryId: string, patch: Partial<ChatEntry>) => void>(() => {});
+  const beginRunRef = useRef<(startedAt?: number) => void>(() => {});
+  const endRunRef = useRef<() => void>(() => {});
+  const appendAgentItemRef = useRef<(entryId: string, item: AgentItem) => void>(() => {});
+  const patchAgentItemRef = useRef<(entryId: string, callId: string, patch: Partial<Extract<AgentItem, { kind: 'tool' }>>) => void>(() => {});
+  const busyRef = useRef(false);
+  const activeIdRefSet = (id: string) => { activeIdRef.current = id; };
 
   const palette = useMemo<Palette>(() => (isLight ? {
     panel: 'bg-white border-slate-200 text-slate-800',
@@ -345,358 +523,554 @@ export const AiPanel: React.FC<AiPanelProps> = ({
     danger: 'bg-slate-800 hover:bg-rose-950 text-rose-300 border-rose-800',
   }), [isLight]);
 
-  const applyConfig = useCallback((next: AiConfigView) => {
-    setConfig(next);
-    setFormBaseUrl((prev) => (prev ? prev : next.baseUrl));
-    setFormModel((prev) => (prev ? prev : next.model));
-    setFormRedactIp(next.redactPrivateIp);
-    setFormWhitelist((prev) => (prev ? prev : (next.commandWhitelist || []).join(', ')));
+  // 初始化：建会话、拉配置、建长连接。这是**唯一**创建初始会话的地方，
+  // 保证 activeId / activeIdRef 一定被设上（否则 appendEntry 会找不到目标）。
+  useEffect(() => {
+    const first = newSession();
+    setSessions([first]);
+    setActiveId(first.id);
+    activeIdRefSet(first.id);
+    // 历史若在会话建好前就到了，这里补填进去
+    const pending = pendingHistoryRef.current;
+    if (pending) {
+      pendingHistoryRef.current = null;
+      setSessions([{ ...first, messages: pending.messages, title: pending.title }]);
+    }
   }, []);
 
-  // 初始化：拉配置 + 建长连接（长连接本身不发请求，只在有任务时用）
+  const applyConfig = useCallback((next: AiConfigView) => {
+    setConfig(next);
+    setFormBaseUrl(next.baseUrl);
+    setFormModel(next.model);
+    setFormRedactIp(next.redactPrivateIp);
+    setFormWhitelist((next.commandWhitelist || []).join(', '));
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     const client = new AiWSClient();
     client.onConfig = (next) => { if (!cancelled) applyConfig(next); };
+    /**
+     * 会话历史快照：重连 / 别的设备接管同一 SSH 会话时，服务端回放整段对话。
+     *
+     * 收到就把本地列表替换成这份历史 —— 因为对端（服务端会话）才是真相来源，
+     * 本地可能压根没有这段（接管设备）或者已经过期。
+     */
+    client.onHistory = (entries) => {
+      if (cancelled) return;
+      const messages = entries.map((e, i) => historyToEntry(e, i));
+      const title = deriveTitle(messages);
+      /*
+       * 服务端发历史时，若恰好有一条 run 正在跑，那条 record 也在这份快照里
+       *（runAgent 创建 record 即入 history，边跑边填 items），特征是 final/error 都还没落。
+       * 把它记成 lastAgentEntry，紧接着的 `agent_start{resumed}` 就会**接进这张卡片**继续追，
+       * 而不是另起一张空卡片 —— 后者会让接管方看到两张卡：一张冻结的历史、一张空白。
+       */
+      const last = messages[messages.length - 1];
+      lastAgentEntryRef.current =
+        last && last.kind === 'agent' && !last.final && !last.error ? last.id : null;
+      resumedEntryRef.current = null;
+      followedTextEntryRef.current = null;
+      const active = activeIdRef.current;
+      if (!active) {
+        // 会话还没建好（初始化 effect 尚未跑）：暂存，等它建好再填
+        pendingHistoryRef.current = { messages, title };
+        return;
+      }
+      setSessions((prev) => prev.map((s) => (s.id === active ? { ...s, messages, title } : s)));
+    };
+    /**
+     * 重连接回一条**已在跑**的会话。
+     *
+     * 服务端在重连后先发 `agent_start{resumed}`，紧接着重放断开期间缓冲的事件。
+     * 断线前那条 entry 通常还在（页面没刷新），直接复用它继续追加 —— 同一次会话，
+     * 不做「断线前/后」的区分。只有本地已无那条 entry 时才新建一条承接。
+     */
+    client.onResumed = (payload) => {
+      if (cancelled) return;
+      const prior = lastAgentEntryRef.current;
+      if (prior) {
+        resumedEntryRef.current = prior;
+        patchEntryRef.current(prior, { streaming: true, runStartedAt: payload.startedAt });
+      } else {
+        const entryId = `a-${Date.now()}`;
+        resumedEntryRef.current = entryId;
+        appendEntryRef.current({
+          id: entryId, kind: 'agent', goal: '', items: [], prepared: null,
+          streaming: true, at: payload.startedAt ?? Date.now(), runStartedAt: payload.startedAt,
+        });
+      }
+      beginRunRef.current(payload.startedAt);
+    };
+    /**
+     * 面板开关状态（会话级）：服务端在 ready 里带当前状态，之后别的设备切换时广播。
+     * 转发给 App —— App 是「面板开在哪」的持有者，由它决定自动开/关。
+     */
+    client.onPanelState = (open) => {
+      if (!cancelled) onPanelStateChange?.(open);
+    };
+    /**
+     * 跟随一条**非 agent** 的 run（diagnose/draft）：只记下来，entry 等第一个 delta 再惰性创建。
+     *
+     * 不在 ready 里直接建 entry，是因为 ready 之后紧跟着 `ai_history` 会把消息列表整体替换，
+     * 此刻建的 entry 会被冲掉。等 delta 到时历史早已落地，再建就稳了。
+     */
+    client.onFollowedRun = (payload) => {
+      if (cancelled) return;
+      followedRunRef.current = payload;
+      followedTextEntryRef.current = null;
+      beginRunRef.current(payload.startedAt);
+    };
+    client.onCleared = () => {
+      if (cancelled) return;
+      const active = activeIdRef.current;
+      if (active) setSessions((prev) => prev.map((s) => (s.id === active ? { ...s, messages: [], title: 'New chat' } : s)));
+    };
+    /**
+     * 被动跟随 handlers：本地没发过请求（接管 / 围观）时，属于对端 run 的
+     * 回放与实时事件全走这里 —— 不装的话它们会被 client 直接丢掉，表现为
+     * 「接管后没有输出，必须刷新才拿得到静态历史」。
+     *
+     * 用 ref 读目标 entry，不闭包捕获 state：这些回调跨渲染长期有效。
+     */
+    client.setPassiveHandlers({
+      onPrepared: (payload) => {
+        const target = resumedEntryRef.current;
+        if (target) patchEntryRef.current(target, { prepared: payload });
+      },
+      onDelta: (chunk) => {
+        const followed = followedRunRef.current;
+        if (!followed) return;
+        let target = followedTextEntryRef.current;
+        if (!target) {
+          target = `t-${Date.now()}`;
+          followedTextEntryRef.current = target;
+          appendEntryRef.current({ id: target, kind: 'text', answer: '', streaming: true, at: followed.startedAt ?? Date.now() });
+        }
+        // 增量累在 entry.answer 上；patchEntry 是浅合并，先读旧值再拼
+        setSessions((prev) => prev.map((s) => {
+          if (s.id !== activeIdRef.current) return s;
+          return {
+            ...s,
+            messages: s.messages.map((m) => {
+              if (m.id !== target || m.kind !== 'text') return m;
+              return { ...m, answer: (m.answer || '') + chunk };
+            }),
+          };
+        }));
+      },
+      onDone: (meta) => {
+        const target = followedTextEntryRef.current;
+        followedRunRef.current = null;
+        followedTextEntryRef.current = null;
+        if (target) patchEntryRef.current(target, { meta, streaming: false });
+        endRunRef.current();
+      },
+      onDraft: (draft, meta) => {
+        const target = followedTextEntryRef.current;
+        followedRunRef.current = null;
+        followedTextEntryRef.current = null;
+        // 跟随 draft 时 entry 是以 text 形态惰性建的（delta 流的是原始 JSON），
+        // 结构化结果到达后连 kind 一起改成 draft，渲染器才会切成命令卡片。
+        if (target && draft) patchEntryRef.current(target, { kind: 'draft', draft, meta } as Partial<ChatEntry>);
+        endRunRef.current();
+      },
+      onError: (msg, aborted) => {
+        const target = followedTextEntryRef.current;
+        followedRunRef.current = null;
+        followedTextEntryRef.current = null;
+        if (target) patchEntryRef.current(target, { error: msg, aborted, streaming: false });
+        endRunRef.current();
+      },
+      onAgentStart: () => {
+        // entry 的创建/认回由 onResumed 负责，这里只确保运行态
+        beginRunRef.current();
+      },
+      onAgentIdentity: (identity) => {
+        const target = resumedEntryRef.current;
+        if (target) patchEntryRef.current(target, { identity });
+      },
+      onAgentStep: (step) => setRunStep(step),
+      onAgentMessage: (content) => {
+        if (!content.trim()) return;
+        const target = resumedEntryRef.current;
+        if (!target) return;
+        appendAgentItemRef.current(target, { kind: 'message', key: `msg-${Date.now()}-${Math.random()}`, text: content });
+      },
+      onAgentToolCall: (call) => {
+        const target = resumedEntryRef.current;
+        if (!target) return;
+        appendAgentItemRef.current(target, {
+          kind: 'tool', key: call.callId, callId: call.callId, tool: call.tool, display: call.display, status: 'running',
+        });
+      },
+      onAgentToolResult: (result) => {
+        const target = resumedEntryRef.current;
+        if (!target) return;
+        patchAgentItemRef.current(target, result.callId, { status: 'done', output: result.output, truncated: result.truncated });
+      },
+      onAgentToolApproved: (payload) => {
+        const target = resumedEntryRef.current;
+        if (!target) return;
+        patchAgentItemRef.current(target, payload.callId, { status: 'auto' });
+      },
+      onAgentApproval: (request) => new Promise<{ allow: boolean; remember: boolean }>((resolve) => {
+        const target = resumedEntryRef.current;
+        if (!target) { resolve({ allow: false, remember: false }); return; }
+        approvalRef.current = (allow, remember) => { approvalRef.current = null; resolve({ allow, remember }); };
+        const id = activeIdRef.current;
+        setSessions((prev) => prev.map((s) => {
+          if (s.id !== id) return s;
+          return {
+            ...s,
+            messages: s.messages.map((m) => {
+              if (m.id !== target || m.kind !== 'agent') return m;
+              return { ...m, items: m.items.map((it) => (it.kind === 'tool' && it.callId === request.callId ? { ...it, status: 'awaiting', level: request.level, reasons: request.reasons, dangerous: request.dangerous, canRemember: request.canRemember } : it)) };
+            }),
+          };
+        }));
+      }),
+      onAgentDone: (payload) => {
+        const target = resumedEntryRef.current;
+        resumedEntryRef.current = null;
+        lastAgentEntryRef.current = null;
+        if (target) patchEntryRef.current(target, {
+          final: payload.answer, stopReason: payload.stopReason, steps: payload.steps, streaming: false,
+          meta: { ms: payload.ms },
+        });
+        endRunRef.current();
+      },
+      onAgentError: (msg, aborted) => {
+        const target = resumedEntryRef.current;
+        resumedEntryRef.current = null;
+        lastAgentEntryRef.current = null;
+        if (target) patchEntryRef.current(target, { error: msg, aborted, streaming: false });
+        endRunRef.current();
+      },
+    });
+    // 绑定当前 tab 的 SSH 会话：/ai 连接据此 attach 到对应 AI 会话，
+    // 服务端断连期间继续跑、缓冲事件，这里重连后自动接回（同一条会话）。
+    client.setSession(sessionId);
     clientRef.current = client;
 
     fetchAiConfig()
       .then((next) => { if (!cancelled) applyConfig(next); })
       .catch((err) => { if (!cancelled) setConfigError(err.message || 'Failed to load config'); });
 
+    // 本组件挂载 = 面板打开：连上后上报（服务端广播给其它设备）。
+    // 断开时在 cleanup 上报 close —— 但要注意仅当连接已建立，否则发不出去也无所谓。
+    const reportOpen = () => client.setPanelOpen(true);
+    if (client.isOpen()) reportOpen();
+    else void client.connect().then(reportOpen).catch(() => {});
+
     return () => {
       cancelled = true;
+      // 注意：卸载**不**上报 close。终端断开会被动卸载面板，那不代表用户想关；
+      // 服务端保留 panelOpen，重连后据此自动恢复。用户主动关闭走 handleClose。
       client.close();
       clientRef.current = null;
     };
   }, [applyConfig]);
 
-  /**
-   * 现取上下文。取不到（终端还没内容）就返回 null，由调用方决定怎么提示 ——
-   * 这里不替用户兜底成「那就发空的吧」：拿空上下文问出来的答案没有意义，
-   * 而静默发一份空的上去，用户只会以为是模型不行。
-   */
-  const takeContext = useCallback(() => {
-    const ctx = getContext?.() ?? null;
-    if (!ctx || !ctx.text.trim()) return null;
-    lastContextRef.current = ctx;
-    return ctx;
-  }, [getContext]);
+  // 会话切换（重连/新开）时把绑定更新到新 sessionId
+  useEffect(() => {
+    clientRef.current?.setSession(sessionId);
+  }, [sessionId]);
 
-  const runDiagnose = useCallback(async (input: { text: string; source: 'selection' | 'tail'; question?: string }) => {
-    const client = clientRef.current;
-    if (!client) return;
+  const activeSession = sessions.find((s) => s.id === activeId) ?? sessions[0];
 
-    lastRunRef.current = input;
-    setMode('diagnose');
-    setDraft(null);
-    setDraftRaw('');
-    setDegraded(false);
-    setRunNotice(null);
-    setPhase('streaming');
-    setAnswer('');
-    setPrepared(null);
-    setMeta(null);
-    setErrorMsg(null);
+  /* ----------------- 会话级消息写入 ----------------- */
 
-    try {
-      await client.diagnose(
-        {
-          text: input.text,
-          source: input.source,
-          question: input.question,
-          host: target?.host,
-          username: target?.username,
-          cwd: target?.cwd,
-        },
-        {
-          onPrepared: (payload) => setPrepared(payload),
-          onDelta: (text) => setAnswer((prev) => prev + text),
-          onDone: (result) => { setMeta(result); setPhase('done'); },
-          onError: (msg, aborted) => {
-            setErrorMsg(msg);
-            setPhase(aborted ? 'done' : 'error');
-          },
-        },
-      );
-    } catch (err: any) {
-      setErrorMsg(err?.message || 'Request failed');
-      setPhase('error');
-    }
-  }, [target?.host, target?.username, target?.cwd]);
+  const appendEntry = useCallback((entry: ChatEntry) => {
+    const id = activeIdRef.current;
+    setSessions((prev) => prev.map((s) =>
+      s.id === id ? { ...s, messages: [...s.messages, entry] } : s,
+    ));
+  }, []);
+  appendEntryRef.current = appendEntry;
+  beginRunRef.current = beginRun;
+  endRunRef.current = endRun;
 
-  /**
-   * 生成命令草稿。
-   *
-   * delta 不写进「回答」区 —— 那里流出来的是 JSON，给人看没意义；
-   * 只攒进 draftRaw，供解析失败降级时原样展示。
-   */
-  const runDraft = useCallback(async (question: string) => {
-    const client = clientRef.current;
-    if (!client || !question.trim()) return;
+  const patchEntry = useCallback((entryId: string, patch: Partial<ChatEntry>) => {
+    const id = activeIdRef.current;
+    setSessions((prev) => prev.map((s) =>
+      s.id === id ? { ...s, messages: s.messages.map((m) => (m.id === entryId ? { ...m, ...patch } as ChatEntry : m)) } : s,
+    ));
+  }, []);
+  patchEntryRef.current = patchEntry;
 
-    // 生成命令不要求必须有终端内容：很多时候用户只是想问「怎么查某某」。
-    // 但**有**内容时要用当下的那份，所以这里也是现取，不是用打开面板时的快照。
-    const ctx = getContext?.() ?? null;
-    const text = ctx?.text ?? lastContextRef.current?.text ?? '';
-    const source = ctx?.source ?? lastContextRef.current?.source ?? 'tail';
-    lastDraftRef.current = { text, source, question };
+  const patchAgentItem = useCallback((entryId: string, callId: string, patch: Partial<Extract<AgentItem, { kind: 'tool' }>>) => {
+    const id = activeIdRef.current;
+    setSessions((prev) => prev.map((s) => {
+      if (s.id !== id) return s;
+      return {
+        ...s,
+        messages: s.messages.map((m) => {
+          if (m.id !== entryId || m.kind !== 'agent') return m;
+          return { ...m, items: m.items.map((it) => (it.kind === 'tool' && it.callId === callId ? { ...it, ...patch } : it)) };
+        }),
+      };
+    }));
+  }, []);
 
-    setMode('draft');
-    setPhase('streaming');
-    setAnswer('');
-    setDraft(null);
-    setDraftRaw('');
-    draftRawRef.current = '';
-    setDegraded(false);
-    setRunNotice(null);
-    setPrepared(null);
-    setMeta(null);
-    setErrorMsg(null);
+  const appendAgentItem = useCallback((entryId: string, item: AgentItem) => {
+    const id = activeIdRef.current;
+    setSessions((prev) => prev.map((s) => {
+      if (s.id !== id) return s;
+      return {
+        ...s,
+        messages: s.messages.map((m) => {
+          if (m.id !== entryId || m.kind !== 'agent') return m;
+          return { ...m, items: [...m.items, item] };
+        }),
+      };
+    }));
+  }, []);
+  patchAgentItemRef.current = patchAgentItem;
+  appendAgentItemRef.current = appendAgentItem;
 
-    try {
-      await client.draft(
-        { text, source, question, host: target?.host, username: target?.username, cwd: target?.cwd },
-        {
-          onPrepared: (payload) => setPrepared(payload),
-          onDelta: (chunk) => {
-            draftRawRef.current += chunk;
-            setDraftRaw((prev) => prev + chunk);
-          },
-          onDraft: (result, resultMeta) => {
-            setDraft(result);
-            setMeta(resultMeta);
-            setPhase('done');
-          },
-          onError: (msg, aborted, info) => {
-            setErrorMsg(msg);
-            if (info?.fallback === 'readonly') {
-              // 服务端没能解析出结构 → 把原文当只读回答展示，不提供任何执行入口
-              setAnswer(draftRawRef.current);
-              setDegraded(true);
-              setPhase('done');
-            } else {
-              setPhase(aborted ? 'done' : 'error');
-            }
-          },
-        },
-      );
-    } catch (err: any) {
-      setErrorMsg(err?.message || 'Request failed');
-      setPhase('error');
-    }
-  }, [getContext, target?.host, target?.username, target?.cwd]);
-
-  /* ------------------------- Agent 循环（服务端驱动） ------------------------- */
-
-  /** 按 callId 局部刷新一条工具记录 */
-  const patchTool = useCallback((callId: string, patch: Partial<Extract<AgentItem, { kind: 'tool' }>>) => {
-    setAgentItems((prev) => prev.map((item) => (
-      item.kind === 'tool' && item.callId === callId ? { ...item, ...patch } : item
-    )));
+  const setSessionTitleFromText = useCallback((entryId: string, text: string) => {
+    const id = activeIdRef.current;
+    setSessions((prev) => prev.map((s) => {
+      if (s.id !== id || s.title !== 'New chat') return s;
+      const title = text.trim().slice(0, 40) || 'New chat';
+      return { ...s, title };
+    }));
   }, []);
 
   /**
-   * 起跑一次 Agent。
-   *
-   * 循环在服务端，这里只做三件事：发一个 `agent` 请求、把事件流画出来、
-   * 以及在被问到的时候回答「允许 / 拒绝」。
-   *
-   * 没有会话 id 就直接拒绝 —— Agent 复用当前终端那条 SSH 连接。
-   * 让它跑起来再在第一步失败，不如现在就说清楚为什么跑不了。
+   * 把当前会话里**之前的**问答整理成模型可读的历史，让新一轮 Agent 延续上下文。
+   * 只取文字：用户提问、文本回答、Agent 的结论与中间消息、draft 的命令与说明。
+   * 不重放工具调用结果 —— 那些必须来自本次会话实测，否则模型会把过期输出当事实。
    */
-  const runAgent = useCallback((goal: string) => {
-    const client = clientRef.current;
-    if (!client) return;
+  const buildHistory = useCallback((): ChatMessage[] => {
+    const id = activeIdRef.current;
+    const session = sessions.find((s) => s.id === id);
+    if (!session) return [];
+    const out: ChatMessage[] = [];
+    for (const m of session.messages) {
+      if (m.id.startsWith('a-') || m.id.startsWith('t-')) {
+        // 跳过当前正在生成的那条（它的内容还没定型）
+        if (m.streaming) continue;
+      }
+      if (m.kind === 'user') out.push({ role: 'user', content: m.text });
+      else if (m.kind === 'text' && m.answer) out.push({ role: 'assistant', content: m.answer });
+      else if (m.kind === 'draft') out.push({ role: 'assistant', content: `${m.draft.command}\n${m.draft.explain || ''}`.trim() });
+      else if (m.kind === 'agent') {
+        if (m.goal) out.push({ role: 'user', content: m.goal });
+        for (const it of m.items) {
+          if (it.kind === 'message') out.push({ role: 'assistant', content: it.text });
+        }
+        if (m.final) out.push({ role: 'assistant', content: m.final });
+      }
+    }
+    return out;
+  }, [sessions]);
 
+  /* ----------------- 发送一条消息 ----------------- */
+
+  const stopRun = useCallback(() => {
+    agentRunIdRef.current += 1;
+    const resolve = approvalRef.current;
+    approvalRef.current = null;
+    resolve?.(false, false);
+    clientRef.current?.cancel();
+    setBusy(false);
+    busyRef.current = false;
+  }, []);
+
+  /**
+   * 终端断开 → **本地**停掉正在跑的 Agent 的 UI 状态，但**不向服务端发 cancel**。
+   *
+   * 断开有两种：网络抖动（会话还在）和被别的设备接管（会话易主）。
+   * 两种都不该由这里发 cancel：
+   *  - 网络抖动：服务端 run 本来就要继续跑、输出进缓冲，cancel 会把它误杀；
+   *  - 被接管：会话已归别人，cancel 会杀掉**接管方**正在跑的 run。
+   * 真正的停止只能由用户点 Stop（那才走 stopRun → client.cancel）。
+   * 这里只把本地 busy/审批闸收掉，避免 UI 停在「等待审批」的假象。
+   */
+  useEffect(() => {
+    if (terminalConnected || !busyRef.current) return;
+    agentRunIdRef.current += 1;
+    const resolve = approvalRef.current;
+    approvalRef.current = null;
+    resolve?.(false, false);
+    setBusy(false);
+    busyRef.current = false;
+  }, [terminalConnected]);
+
+  const clearActiveSession = useCallback(() => {
+    const id = activeIdRef.current;
+    setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, messages: [], title: 'New chat' } : s)));
+    // 服务端也存着这条会话的历史（供接管设备重建），不清的话下次挂载又会被回放回来
+    clientRef.current?.clearHistory();
+  }, []);
+
+  const sendMessage = useCallback((rawText: string) => {
+    const text = rawText.trim();
+    if (!text) return;
+
+    // `/clear` 清掉当前会话的全部上下文（对话历史 + 标题），不发给模型
+    if (text === '/clear') {
+      if (busyRef.current) stopRun();
+      clearActiveSession();
+      setInput('');
+      return;
+    }
+
+    if (busyRef.current) return;
+
+    const withScreen = includeScreen;
+    const ctx = withScreen ? (getContext?.() ?? null) : null;
+    const textToSend = ctx?.text ?? '';
+    const sourceToSend = ctx?.source ?? 'tail';
+
+    const userEntry: ChatUserEntry = { id: `u-${Date.now()}`, kind: 'user', text, withScreen, at: Date.now() };
+    appendEntry(userEntry);
+    setSessionTitleFromText(userEntry.id, text);
+    setInput('');
+    beginRun();
+
+    const client = clientRef.current;
+    if (!client) { endRun(); return; }
+
+    // 没有活跃会话 → 只读诊断；有会话 → Agent（它涵盖只读解读与命令执行）
+    const useAgent = Boolean(sessionId && terminalConnected);
+
+    if (!useAgent) {
+      const entryId = `t-${Date.now()}`;
+      let acc = '';
+      // 本机发起 = owned，跟随态一律让位，避免被动 handlers 又往同一 entry 里塞
+      followedRunRef.current = null;
+      followedTextEntryRef.current = null;
+      appendEntry({ id: entryId, kind: 'text', answer: '', streaming: true, at: Date.now() });
+      client.diagnose(
+        { text: textToSend, source: sourceToSend, question: text, host: target?.host, username: target?.username, cwd: target?.cwd },
+        {
+          onPrepared: (payload) => patchEntry(entryId, { prepared: payload }),
+          onDelta: (chunk) => { acc += chunk; patchEntry(entryId, { answer: acc }); },
+          onDone: (meta) => { patchEntry(entryId, { meta, streaming: false }); endRun(); },
+          onError: (msg, aborted) => {
+            patchEntry(entryId, { error: msg, aborted, streaming: false });
+            endRun();
+          },
+        },
+      ).catch((err: any) => {
+        patchEntry(entryId, { error: err?.message || 'Request failed', streaming: false });
+        endRun();
+      });
+      return;
+    }
+
+    // Agent 路径
     const runId = ++agentRunIdRef.current;
     const alive = () => agentRunIdRef.current === runId;
     approvalRef.current = null;
 
-    setMode('agent');
-    setPhase('streaming');
-    setAnswer('');
-    setDraft(null);
-    setDraftRaw('');
-    draftRawRef.current = '';
-    setDegraded(false);
-    setPrepared(null);
-    setMeta(null);
-    setErrorMsg(null);
-    setRunNotice(null);
-    setAgentError(null);
-    setAgentFinal('');
-    setAgentItems([]);
-    setAgentIdentity(null);
-    setAgentStep(0);
-    setAgentDone(null);
-    setAgentRunning(true);
+    const history = buildHistory();
 
-    if (!sessionId || !terminalConnected) {
-      setAgentRunning(false);
-      setPhase('error');
-      setAgentError('No live terminal session. The Agent reuses the current SSH connection.');
-      return;
-    }
-
-    // Agent 也现取上下文：它要拿终端当前状态当起点，用旧快照会答非所问
-    const ctx = getContext?.() ?? lastContextRef.current;
+    const entryId = `a-${Date.now()}`;
+    appendEntry({ id: entryId, kind: 'agent', goal: text, items: [], prepared: null, streaming: true, at: Date.now() });
+    lastAgentEntryRef.current = entryId;
+    resumedEntryRef.current = null;
+    followedRunRef.current = null;
+    followedTextEntryRef.current = null;
 
     client.agent(
+      { text: textToSend, source: sourceToSend, question: text, host: target?.host, username: target?.username, cwd: target?.cwd },
+      { sessionId: sessionId!, maxSteps, history },
       {
-        text: ctx?.text ?? '',
-        source: ctx?.source ?? 'tail',
-        question: goal,
-        host: target?.host,
-        username: target?.username,
-        cwd: target?.cwd,
-      },
-      { sessionId, maxSteps: AGENT_MAX_STEPS },
-      {
-        onPrepared: (payload) => { if (alive()) setPrepared(payload); },
-        onAgentIdentity: (identity) => { if (alive()) setAgentIdentity(identity); },
-        onAgentStep: (step) => { if (alive()) setAgentStep(step); },
+        onPrepared: (payload) => { if (alive()) patchEntry(entryId, { prepared: payload }); },
+        onAgentIdentity: (identity) => { if (alive()) patchEntry(entryId, { identity }); },
+        onAgentStep: (step) => { if (alive()) setRunStep(step); },
         onAgentMessage: (content) => {
-          if (!alive() || !content.trim()) return;
-          setAgentItems((prev) => [...prev, { kind: 'message', key: `msg-${prev.length}`, text: content }]);
+          if (!content.trim()) return;
+          const target = resumedEntryRef.current ?? entryId;
+          if (!alive() && !resumedEntryRef.current) return;
+          appendAgentItem(target, { kind: 'message', key: `msg-${Date.now()}-${Math.random()}`, text: content });
         },
         onAgentToolCall: (call) => {
-          if (!alive()) return;
-          setAgentItems((prev) => [...prev, {
-            kind: 'tool',
-            key: call.callId,
-            callId: call.callId,
-            tool: call.tool,
-            display: call.display,
-            status: 'running',
-          }]);
+          const target = resumedEntryRef.current ?? entryId;
+          if (!alive() && !resumedEntryRef.current) return;
+          appendAgentItem(target, { kind: 'tool', key: call.callId, callId: call.callId, tool: call.tool, display: call.display, status: 'running' });
         },
         onAgentToolResult: (result) => {
-          if (!alive()) return;
-          patchTool(result.callId, { status: 'done', output: result.output, truncated: result.truncated });
+          const target = resumedEntryRef.current ?? entryId;
+          if (!alive() && !resumedEntryRef.current) return;
+          patchAgentItem(target, result.callId, { status: 'done', output: result.output, truncated: result.truncated });
         },
-        onAgentApproval: (request: AiAgentApproval) => new Promise<boolean>((resolve) => {
-          // 已被取消或重开：立刻拒绝，别让服务端继续等一个永远不会来的应答
-          if (!alive()) {
-            resolve(false);
-            return;
-          }
-          approvalRef.current = resolve;
-          patchTool(request.callId, { status: 'awaiting', level: request.level, reasons: request.reasons });
+        onAgentToolApproved: (payload) => {
+          const target = resumedEntryRef.current ?? entryId;
+          if (!alive() && !resumedEntryRef.current) return;
+          patchAgentItem(target, payload.callId, { status: 'auto' });
+        },
+        onAgentApproval: (request: AiAgentApproval) => new Promise<{ allow: boolean; remember: boolean }>((resolve) => {
+          const target = resumedEntryRef.current ?? entryId;
+          if (!alive() && !resumedEntryRef.current) { resolve({ allow: false, remember: false }); return; }
+          approvalRef.current = (allow, remember) => { approvalRef.current = null; resolve({ allow, remember }); };
+          const id = activeIdRef.current;
+          setSessions((prev) => prev.map((s) => {
+            if (s.id !== id) return s;
+            return {
+              ...s,
+              messages: s.messages.map((m) => {
+                if (m.id !== target || m.kind !== 'agent') return m;
+                return { ...m, items: m.items.map((it) => (it.kind === 'tool' && it.callId === request.callId ? { ...it, status: 'awaiting', level: request.level, reasons: request.reasons, dangerous: request.dangerous, canRemember: request.canRemember } : it)) };
+              }),
+            };
+          }));
         }),
         onAgentDone: (payload) => {
-          if (!alive()) return;
-          setAgentFinal(payload.answer);
-          setAgentDone(payload);
-          setAgentRunning(false);
-          setPhase('done');
+          const target = resumedEntryRef.current ?? entryId;
+          if (!alive() && !resumedEntryRef.current) return;
+          resumedEntryRef.current = null;
+          lastAgentEntryRef.current = null;
+          patchEntry(target, {
+            final: payload.answer, stopReason: payload.stopReason, steps: payload.steps, streaming: false,
+            meta: { ms: payload.ms },
+          });
+          endRun();
         },
         onAgentError: (msg, aborted) => {
-          if (!alive()) return;
-          setAgentRunning(false);
-          setPhase('done');
-          // 用户自己取消的不算错误，不拿红字吓他
-          if (!aborted) setAgentError(msg);
+          const target = resumedEntryRef.current ?? entryId;
+          if (!alive() && !resumedEntryRef.current) return;
+          resumedEntryRef.current = null;
+          lastAgentEntryRef.current = null;
+          patchEntry(target, { error: msg, aborted, streaming: false });
+          endRun();
         },
       },
     ).catch((err: any) => {
       if (!alive()) return;
-      setAgentRunning(false);
-      setPhase('error');
-      setAgentError(err?.message || 'Agent failed to start');
+      patchEntry(entryId, { error: err?.message || 'Agent failed to start', streaming: false });
+      endRun();
     });
-  }, [getContext, patchTool, sessionId, target?.cwd, target?.host, target?.username, terminalConnected]);
+  }, [appendEntry, appendAgentItem, includeScreen, getContext, target?.host, target?.username, target?.cwd, sessionId, terminalConnected, patchEntry, patchAgentItem, setSessionTitleFromText, buildHistory, clearActiveSession, stopRun, maxSteps]);
 
-  const handleStartAgent = () => {
-    const goal = agentGoal.trim();
-    if (!goal) return;
-    setAgentGoal('');
-    lastAgentGoalRef.current = goal;
-    runAgent(goal);
-  };
+  /* ----------------- draft 命令执行 ----------------- */
 
-  /** 允许 / 拒绝一次审批。resolve 之后服务端那边的循环继续往下走 */
-  const decideApproval = useCallback((allow: boolean) => {
-    const resolve = approvalRef.current;
-    approvalRef.current = null;
-    resolve?.(allow);
-  }, []);
+  const dispatchCommand = useCallback((entry: ChatDraftEntry, submit: boolean) => {
+    if (!onRunCommand) return;
+    const ok = onRunCommand(entry.draft.command, submit);
+    setRunNotice(ok ? (submit ? 'Sent to terminal' : 'Filled in — press Enter to run') : 'Terminal offline, nothing sent');
+  }, [onRunCommand]);
 
-  /** 停：先让迟到事件失配，再把挂着的审批以「拒绝」收掉，最后通知服务端取消 */
-  const handleStopAgent = () => {
-    agentRunIdRef.current += 1;
-    decideApproval(false);
-    clientRef.current?.cancel();
-    setAgentRunning(false);
-    setPhase('done');
-  };
-
-  /**
-   * 面板打开时**不自动发任何请求**。
-   *
-   * 之前的行为是：点开就抓一份上下文直接开跑。问题有三个 —— 出网内容用户还没看过、
-   * 慢模型下开个面板就得等、以及用户往往只是想打开面板再决定问什么。
-   * 现在一律等用户点「Explain / Generate / Start」。
-   */
-  const handleExplain = () => {
-    const ctx = takeContext();
-    if (!ctx) {
-      setErrorMsg('Nothing to analyze yet — the terminal has no output.');
+  const handleRunClick = (entry: ChatDraftEntry) => {
+    if (entry.draft.grade.level === 'dangerous') {
+      setConfirmRun({ sessionId: activeId, entryId: entry.id });
       return;
     }
-    void runDiagnose({ text: ctx.text, source: ctx.source });
+    dispatchCommand(entry, true);
   };
 
-  // 流式过程中自动滚到底部，但用户主动上滚后不要抢滚动条
-  const stickToBottomRef = useRef(true);
-  useEffect(() => {
-    const el = bodyRef.current;
-    if (!el || !stickToBottomRef.current) return;
-    el.scrollTop = el.scrollHeight;
-  }, [answer, prepared, draft, degraded, agentItems, agentFinal, agentError]);
-
-  const handleScroll = () => {
-    const el = bodyRef.current;
-    if (!el) return;
-    stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-  };
-
-  /** 贴底。聚焦输入框时也调一次：键盘弹出后可视区只剩一半，盯着被顶上去的旧消息没意义 */
-  const stickToBottomNow = () => {
-    stickToBottomRef.current = true;
-    const el = bodyRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  };
-
-  /**
-   * 软键盘弹出/收起会改变可视高度，滚动容器跟着变矮 ——
-   * 这时 scrollTop 不变、底部内容会掉到看不见的地方，所以贴底状态要重新贴一次。
-   */
-  useEffect(() => {
-    const vv = window.visualViewport;
-    if (!vv) return;
-    const onResize = () => {
-      if (!stickToBottomRef.current) return;
-      const el = bodyRef.current;
-      if (el) el.scrollTop = el.scrollHeight;
-    };
-    vv.addEventListener('resize', onResize);
-    return () => vv.removeEventListener('resize', onResize);
-  }, []);
+  /* ----------------- 配置保存 / 测试 ----------------- */
 
   const handleSave = async () => {
     setSaving(true);
     setTestResult(null);
     try {
       const next = await saveAiConfig(
-        {
-          baseUrl: formBaseUrl,
-          model: formModel,
-          redactPrivateIp: formRedactIp,
-          // 逗号 / 换行分隔；服务端还会再清洗一遍（只收命令名）
-          commandWhitelist: formWhitelist.split(/[,\n]/).map((s) => s.trim()).filter(Boolean),
-        },
-        // 留空表示不动密钥：避免「改个模型名」把 key 清掉
+        { baseUrl: formBaseUrl, model: formModel, redactPrivateIp: formRedactIp, commandWhitelist: formWhitelist.split(/[,\n]/).map((s) => s.trim()).filter(Boolean) },
         formApiKey.trim() ? formApiKey.trim() : undefined,
       );
       setConfig(next);
@@ -721,597 +1095,305 @@ export const AiPanel: React.FC<AiPanelProps> = ({
     }
   };
 
-  const handleCopy = () => {
-    const text = mode === 'draft' && draft ? draft.command : answer;
-    if (!text) return;
-    navigator.clipboard?.writeText(text).then(() => {
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1600);
-    }).catch(() => {});
-  };
-
-  const handleRegenerate = () => {
-    if (mode === 'agent') {
-      // 重新生成沿用同一个目标，但上下文要现取 —— 屏幕上的东西已经变了
-      if (lastAgentGoalRef.current) runAgent(lastAgentGoalRef.current);
-      return;
-    }
-    if (mode === 'draft') {
-      if (lastDraftRef.current) void runDraft(lastDraftRef.current.question);
-      return;
-    }
-    if (!lastRunRef.current) return;
-    // 重新生成要拿**当下**的上下文：用户想的是「换个说法再问一遍屏幕上的东西」，
-    // 沿用旧快照会让「重新生成」看起来像没生效。追问则相反，见 handleFollowUp。
-    const fresh = takeContext();
-    void runDiagnose({
-      text: fresh?.text ?? lastRunRef.current.text,
-      source: fresh?.source ?? lastRunRef.current.source,
-      question: lastRunRef.current.question,
+  const handleCopyEntry = useCallback((entryId: string, text: string) => {
+    copyText(text, () => {
+      setCopiedId(entryId);
+      window.setTimeout(() => setCopiedId((prev) => (prev === entryId ? null : prev)), 1600);
     });
+  }, []);
+
+  /* ----------------- 滚动 ----------------- */
+
+  const stickToBottomRef = useRef(true);
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (!el || !stickToBottomRef.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [sessions, activeId]);
+
+  const handleScroll = () => {
+    const el = bodyRef.current;
+    if (!el) return;
+    stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+  };
+  const stickToBottomNow = () => {
+    stickToBottomRef.current = true;
+    const el = bodyRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
   };
 
-  const handleFollowUp = () => {
-    const question = followUp.trim();
-    // 追问沿用本次会话的上下文快照：对话前后看的是同一份输出，答案才接得上
-    if (!question || !lastRunRef.current) return;
-    setFollowUp('');
-    void runDiagnose({ ...lastRunRef.current, question });
-  };
-
-  const handleGenerate = () => {
-    const question = askText.trim();
-    if (!question) return;
-    setAskText('');
-    void runDraft(question);
-  };
-
-  /** 从诊断结果追问式地要命令，省得用户再打一遍需求。
-   *  这是给模型的提示词，跟界面语言一致走英文。 */
-  const handleDraftFromAnswer = () => {
-    void runDraft('Based on the output above, give the next command to run.');
-  };
-
-  /** submit=false：只把命令写进输入行；submit=true：连回车一起发出去 */
-  const dispatchCommand = (submit: boolean) => {
-    if (!draft || !onRunCommand) return;
-    const ok = onRunCommand(draft.command, submit);
-    setRunNotice(
-      ok
-        ? (submit ? 'Sent to terminal' : 'Filled in — press Enter to run')
-        : 'Terminal offline, nothing sent',
-    );
-  };
-
-  const handleRunClick = () => {
-    if (!draft) return;
-    // 高风险必须再确认一次；其余等级也走一次确认，避免误触
-    if (draft.grade.level === 'dangerous') {
-      setConfirmRunOpen(true);
-      return;
+  useEffect(() => {
+    if (busy && busyStartRef.current) {
+      const tick = () => setRunElapsedMs(Date.now() - busyStartRef.current!);
+      tick();
+      const id = window.setInterval(tick, 500);
+      return () => window.clearInterval(id);
     }
-    dispatchCommand(true);
-  };
+    // busy 结束：停表并归零
+    busyStartRef.current = null;
+    setRunElapsedMs(0);
+    setRunStep(0);
+    return undefined;
+  }, [busy]);
 
-  const streaming = phase === 'streaming';
-  /** 有活儿在跑：底部按钮、输入框禁用都看这个，别让用户在流式过程中插队 */
-  const busy = streaming || agentRunning;
-  const redactions = prepared ? redactionSummary(prepared.stats) : '';
+  // 从设置视图切回对话时，滚到最底（最新消息）
+  useEffect(() => {
+    if (!showSettings) stickToBottomNow();
+  }, [showSettings]);
+
+  useEffect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const onResize = () => {
+      if (!stickToBottomRef.current) return;
+      const el = bodyRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+    };
+    vv.addEventListener('resize', onResize);
+    return () => vv.removeEventListener('resize', onResize);
+  }, []);
 
   return (
-    <div className={`absolute right-0 top-0 z-30 h-full w-full sm:w-[26rem] flex flex-col border-l ${palette.panel}`}>
-      {/* shrink-0：可视区被软键盘压到只剩一半时，头尾两栏不能被挤扁 */}
-      <div className={`flex items-center justify-between gap-2 px-3 py-2 border-b shrink-0 ${palette.header}`}>
-        <div className="flex items-center gap-2 min-w-0">
+    <div className={`h-full w-full flex flex-col overflow-hidden border-l text-[11px] sm:text-xs ${palette.panel}`}>
+      {/* 头部 */}
+      <div className={`flex items-center justify-between gap-2 px-2 py-1.5 sm:px-3 sm:py-2 border-b shrink-0 ${palette.header}`}>
+        <div className="flex items-center gap-1.5 min-w-0">
           <Sparkles className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
-          <span className="text-xs font-medium truncate">AI</span>
-          {config?.ready && (
-            <span className={`text-[10px] font-mono truncate ${palette.subtle}`}>{config.model}</span>
-          )}
+          <span className="text-[11px] sm:text-xs font-medium truncate">AI</span>
+          {config?.ready && <span className={`text-[10px] font-mono truncate max-w-28 sm:max-w-none ${palette.subtle}`}>{config.model}</span>}
         </div>
         <div className="flex items-center gap-1">
-          {config?.ready && (
-            <button
-              onClick={() => setShowSettings((prev) => !prev)}
-              className={`p-1 rounded cursor-pointer ${showSettings ? palette.primary : palette.button}`}
-              title="Settings"
-            >
-              <Settings2 className="w-3.5 h-3.5" />
-            </button>
-          )}
-          <button onClick={onClose} className={`p-1 rounded cursor-pointer ${palette.button}`} title="Close">
+          <button onClick={() => setShowSettings((prev) => !prev)} className={`p-1.5 sm:p-1 rounded-md cursor-pointer ${showSettings ? palette.primary : palette.button}`} title="Settings">
+            <Settings2 className="w-3.5 h-3.5" />
+          </button>
+          <button
+            onClick={() => { clientRef.current?.setPanelOpen(false); onClose(); }}
+            className={`p-1.5 sm:p-1 rounded-md cursor-pointer ${palette.button}`}
+            title="Close"
+          >
             <X className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
 
-      <div ref={bodyRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-3 py-2 space-y-3 text-xs">
-        {configError && (
-          <div className="flex items-start gap-2 text-rose-500">
-            <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
-            <span>{configError}</span>
-          </div>
-        )}
+      {/* 单会话：显示当前对话标题 + 清空。多 chat 已移除（服务端按 SSH 会话只存一条） */}
+      {!showSettings && (
+      <div className={`flex items-center gap-1.5 px-2 py-1 border-b shrink-0 ${palette.header}`}>
+        <span className={`flex-1 min-w-0 truncate text-[10px] font-mono ${palette.subtle}`} title={activeSession?.title || 'New chat'}>
+          {activeSession?.title || 'New chat'}
+        </span>
+        <button
+          onClick={() => { if (busyRef.current) stopRun(); clearActiveSession(); }}
+          className={`p-1 min-w-[26px] min-h-[26px] sm:min-w-[30px] sm:min-h-[30px] flex items-center justify-center rounded-md border cursor-pointer shrink-0 ${palette.button}`}
+          title="Clear conversation"
+        >
+          <Trash2 className="w-3 h-3" />
+        </button>
+      </div>
+      )}
 
-        {/* 未就绪时自动展开；就绪后靠齿轮手动打开 */}
-        {(!config?.ready || !config || showSettings) && (
-          <div className={`rounded border p-2.5 space-y-2 ${palette.card}`}>
-            <div className="flex items-center gap-1.5 font-medium">
-              <Settings2 className="w-3.5 h-3.5" />
-              <span>Model</span>
-            </div>
-
-            <label className="block space-y-1">
-              <span className={palette.subtle}>Base URL</span>
-              <input
-                value={formBaseUrl}
-                onChange={(e) => setFormBaseUrl(e.target.value)}
-                placeholder="https://api.example.com/v1"
-                className={`w-full rounded border px-2 py-1 text-[11px] font-mono focus:outline-none ${palette.input}`}
-              />
-            </label>
-
-            <label className="block space-y-1">
-              <span className={palette.subtle}>Model</span>
-              <input
-                value={formModel}
-                onChange={(e) => setFormModel(e.target.value)}
-                placeholder="gpt-4o-mini"
-                className={`w-full rounded border px-2 py-1 text-[11px] font-mono focus:outline-none ${palette.input}`}
-              />
-            </label>
-
-            <label className="block space-y-1">
-              <span className={palette.subtle}>API Key</span>
-              <input
-                type="password"
-                value={formApiKey}
-                onChange={(e) => setFormApiKey(e.target.value)}
-                disabled={config?.keyFromEnv}
-                placeholder={config?.keyFromEnv ? 'from env' : config?.hasKey ? 'saved' : 'optional'}
-                className={`w-full rounded border px-2 py-1 text-[11px] font-mono focus:outline-none disabled:opacity-50 ${palette.input}`}
-              />
-            </label>
-
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={formRedactIp}
-                onChange={(e) => setFormRedactIp(e.target.checked)}
-              />
-              <span className={palette.subtle}>Redact private IPs</span>
-            </label>
-
-            <label className="block space-y-1">
-              <span className={palette.subtle}>Auto-run allowlist</span>
-              <input
-                value={formWhitelist}
-                onChange={(e) => setFormWhitelist(e.target.value)}
-                placeholder="myctl, deploy"
-                className={`w-full rounded border px-2 py-1 text-[11px] font-mono focus:outline-none ${palette.input}`}
-              />
-            </label>
-
-            <div className="flex items-center gap-2">
-              <button onClick={handleSave} disabled={saving} className={`${buttonClass} ${palette.primary}`}>
-                {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
-                <span>Save</span>
-              </button>
-              <button onClick={handleTest} disabled={testing || !config?.ready} className={`${buttonClass} ${palette.button}`}>
-                {testing ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
-                <span>Test</span>
-              </button>
-            </div>
-
-            {testResult && (
-              <div className={testResult.ok ? 'text-emerald-500' : 'text-rose-500'}>
-                {testResult.ok ? 'Connected' : testResult.message}
-                {testResult.model ? ` (${testResult.model})` : ''}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* 分析的入口。按钮上写清楚将要分析的是选区还是末尾若干行 ——
-            用户点之前就该知道要发出去的是什么 */}
-        {config?.ready && (
-          <div className={`rounded border p-2.5 space-y-2 ${palette.card}`}>
-            <button
-              onClick={handleExplain}
-              disabled={busy}
-              className={`${buttonClass} ${palette.primary} w-full justify-center`}
-            >
-              <Sparkles className="w-3 h-3" />
-              <span>{peek.source === 'selection' ? 'Explain selection' : 'Explain recent output'}</span>
-            </button>
-            <p className={`text-[10px] leading-relaxed ${palette.subtle}`}>
-              Read-only. Nothing runs.
-            </p>
-          </div>
-        )}
-
-        {/* 出网可见性：默认展开，让用户先看清发的是什么 */}
-        {prepared && (
-          <div className={`rounded border ${palette.card}`}>
-            <button
-              onClick={() => setShowContext((prev) => !prev)}
-              className="w-full flex items-center gap-1.5 px-2.5 py-2 text-left cursor-pointer"
-            >
-              {showContext ? <ChevronDown className="w-3 h-3 shrink-0" /> : <ChevronRight className="w-3 h-3 shrink-0" />}
-              <span className="font-medium shrink-0">Sending</span>
-              <span className={`text-[10px] font-mono truncate ${palette.subtle}`}>
-                {prepared.stats.rawLines > 0
-                  ? `${prepared.stats.rawLines}→${prepared.stats.lines} lines · ~${prepared.stats.estTokens} tokens`
-                  : 'no terminal content'}
-                {prepared.stats.redactionTotal ? ` · ${prepared.stats.redactionTotal} redacted` : ''}
-              </span>
-            </button>
-
-            {showContext && (
-              <div className="px-2.5 pb-2.5 space-y-2">
-                <div className={`text-[10px] font-mono break-all ${palette.subtle}`}>{prepared.env}</div>
-                {(redactions || prepared.stats.omittedLines > 0) && (
-                  <div className={`text-[10px] font-mono ${palette.subtle}`}>
-                    {redactions ? `redacted: ${redactions}` : ''}
-                    {redactions && prepared.stats.omittedLines ? ' · ' : ''}
-                    {prepared.stats.omittedLines ? `${prepared.stats.omittedLines} lines omitted` : ''}
-                  </div>
-                )}
-                {prepared.text ? (
-                  <pre className={`max-h-56 overflow-auto rounded border p-2 text-[10px] leading-relaxed font-mono whitespace-pre-wrap break-all ${palette.code}`}>
-                    {prepared.text}
-                  </pre>
-                ) : (
-                  // 纯「生成命令」时没有终端内容可发，别摆一个空代码框看着像坏了
-                  <p className={`text-[10px] leading-relaxed ${palette.subtle}`}>
-                    No terminal content. Only your request, host and user are sent.
-                  </p>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* 自然语言 → 命令。生成物一律先过服务端判分再露面 */}
-        {config?.ready && (
-          <div className={`rounded border p-2.5 space-y-2 ${palette.card}`}>
-            <div className="flex items-center gap-1.5 font-medium">
-              <Wand2 className="w-3.5 h-3.5 text-indigo-500" />
-              <span>Generate command</span>
-            </div>
-            <p className={`text-[10px] leading-relaxed ${palette.subtle}`}>
-              Describe a task. You confirm before it runs.
-            </p>
-            <div className="flex items-center gap-1.5">
-              <input
-                value={askText}
-                onChange={(e) => setAskText(e.target.value)}
-                onFocus={stickToBottomNow}
-                onKeyDown={(e) => { if (e.key === 'Enter') handleGenerate(); }}
-                disabled={streaming}
-                placeholder="show docker container status"
-                className={`flex-1 min-w-0 rounded border px-2 py-1 text-[11px] focus:outline-none disabled:opacity-50 ${palette.input}`}
-              />
-              <button
-                onClick={handleGenerate}
-                disabled={!askText.trim() || streaming}
-                className={`${buttonClass} ${palette.primary}`}
-              >
-                <span>Generate</span>
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* Agent：多步。判分过关且身份实测过的步骤自己跑，其余停下来等人 */}
-        {config?.ready && (
-          <div className={`rounded border p-2.5 space-y-2 ${palette.card}`}>
-            <div className="flex items-center gap-1.5 font-medium">
-              <Bot className="w-3.5 h-3.5 text-indigo-500" />
-              <span>Agent</span>
-              <span className={`ml-auto text-[10px] font-mono ${palette.subtle}`}>max {AGENT_MAX_STEPS} steps</span>
-            </div>
-            <p className={`text-[10px] leading-relaxed ${palette.subtle}`}>
-              Runs read-only steps on its own. Writes and risky commands wait for you.
-            </p>
-            <div className="flex items-center gap-1.5">
-              <input
-                value={agentGoal}
-                onChange={(e) => setAgentGoal(e.target.value)}
-                onFocus={stickToBottomNow}
-                onKeyDown={(e) => { if (e.key === 'Enter') handleStartAgent(); }}
-                disabled={busy}
-                placeholder="why is nginx slow here?"
-                className={`flex-1 min-w-0 rounded border px-2 py-1 text-[11px] focus:outline-none disabled:opacity-50 ${palette.input}`}
-              />
-              <button
-                onClick={handleStartAgent}
-                disabled={!agentGoal.trim() || busy || !terminalConnected || !sessionId}
-                className={`${buttonClass} ${palette.primary}`}
-              >
-                <Play className="w-3 h-3" />
-                <span>Start</span>
-              </button>
-            </div>
-            {!(terminalConnected && sessionId) && (
-              <div className={`text-[10px] ${palette.subtle}`}>needs a live terminal</div>
-            )}
-          </div>
-        )}
-
-        {/* Agent 事件流：服务端推什么画什么，需要表态的那条停在审批闸上 */}
-        {mode === 'agent' && (agentItems.length > 0 || agentFinal || agentError) && (
-          <div className="space-y-2">
-            {agentIdentity && (
-              <div className={`text-[10px] font-mono ${palette.subtle}`}>
-                {agentIdentity.user
-                  ? `remote user: ${agentIdentity.user}${agentIdentity.isRoot ? ' (root)' : ''}${agentIdentity.isRoot ? ' — every step needs approval' : ''}`
-                  : 'remote user: unknown — every step needs approval'}
-                {agentStep ? ` · step ${agentStep}` : ''}
-              </div>
-            )}
-
-            {agentItems.map((item) => (
-              item.kind === 'message' ? (
-                <p key={item.key} className="leading-relaxed whitespace-pre-wrap break-words">{item.text}</p>
-              ) : (
-                <AgentItemRow
-                  key={item.key}
-                  item={item}
-                  risk={risk}
-                  palette={palette}
-                  onAllow={() => decideApproval(true)}
-                  onDeny={() => decideApproval(false)}
-                />
-              )
-            ))}
-
-            {agentRunning && agentItems.length > 0 && (
-              <div className={`flex items-center gap-1.5 text-[10px] ${palette.subtle}`}>
-                <Loader2 className="w-3 h-3 animate-spin" />
-                <span>working…</span>
-              </div>
-            )}
-
-            {agentFinal && (
-              <div className={`rounded border p-2.5 space-y-1 ${palette.card}`}>
-                <div className="flex items-center gap-1.5 font-medium">
-                  <Check className="w-3.5 h-3.5 text-emerald-500" />
-                  <span>Conclusion</span>
-                </div>
-                <div className="leading-relaxed whitespace-pre-wrap break-words">{agentFinal}</div>
-              </div>
-            )}
-
-            {/* 撞到步数上限要说清楚，否则用户会以为它已经查完了 */}
-            {agentDone?.stopReason === 'max-steps' && (
-              <div className={`text-[10px] ${palette.subtle}`}>
-                Stopped at the step limit ({agentDone.steps}). Raise the limit to continue.
-              </div>
-            )}
-
-            {agentError && (
+      {/* 滚动容器：全局 body 是 touch-action:none（防终端手势冲突），
+          这里必须显式恢复 pan-y，否则移动端历史列表滑不动。 */}
+      <div
+        ref={bodyRef}
+        onScroll={handleScroll}
+        style={{ touchAction: 'pan-y', overscrollBehavior: 'contain' }}
+        className="thin-scrollbar flex-1 min-h-0 overflow-y-auto px-2 py-1.5 sm:px-3 sm:py-2 space-y-2 sm:space-y-3"
+      >
+        {!showSettings && (
+          <>
+            {configError && (
               <div className="flex items-start gap-2 text-rose-500">
                 <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
-                <span className="leading-relaxed">{agentError}</span>
+                <span>{configError}</span>
               </div>
             )}
-          </div>
-        )}
 
-        {/* 命令草稿：风险等级只认服务端判分，模型自评仅作对照 */}
-        {mode === 'draft' && (draft || streaming) && (
-          <div className={`rounded border space-y-2 p-2.5 ${draft ? risk[draft.grade.level].border : palette.card}`}>
-            {draft ? (
-              <>
-                <div className="flex items-center gap-1.5 flex-wrap">
-                  <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${risk[draft.grade.level].badge}`}>
-                    {RISK_LABEL[draft.grade.level]}
-                  </span>
-                  <span className={`text-[10px] font-mono ${palette.subtle}`}>server grade</span>
-                  {draft.selfRisk && draft.selfRisk !== draft.grade.level && (
-                    <span className={`text-[10px] font-mono ${risk[draft.selfRisk].text}`}>
-                      model said {RISK_LABEL[draft.selfRisk]} (overridden)
-                    </span>
-                  )}
-                  {(draft.grade.allWhitelisted || draft.grade.allAllowlisted) && (
-                    <span className={`text-[10px] font-mono ${palette.subtle}`}>
-                      {draft.grade.allAllowlisted ? 'all allowlisted' : 'all read-only'}
-                    </span>
-                  )}
+            {!config?.ready && (
+              <p className={`text-[10px] leading-relaxed ${palette.subtle}`}>
+                Add a model endpoint in Settings to start. No key is sent anywhere except your configured provider.
+              </p>
+            )}
+
+            {config?.ready && !activeSession?.messages.length && (
+              <div className="space-y-2">
+                <p className={`text-[10px] leading-relaxed ${palette.subtle}`}>
+                  {sessionId && terminalConnected ? 'Describe what broke or what you want done — risky steps ask first.' : 'Ask about the terminal output — read-only until a terminal is connected.'}
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {EMPTY_PROMPTS.map((p) => (
+                    <button key={p} onClick={() => sendMessage(p)} disabled={busy} className={`${buttonClass} ${palette.button}`}>
+                      <span>{p}</span>
+                    </button>
+                  ))}
                 </div>
-
-                {draft.explain && <p className="leading-relaxed">{draft.explain}</p>}
-
-                <pre className={`max-h-40 overflow-auto rounded border p-2 text-[11px] leading-relaxed font-mono whitespace-pre-wrap break-all ${palette.code}`}>
-                  {draft.command}
-                </pre>
-
-                {draft.grade.reasons.length > 0 && (
-                  <ul className={`space-y-0.5 ${risk[draft.grade.level].text}`}>
-                    {draft.grade.reasons.map((reason) => (
-                      <li key={reason} className="flex items-start gap-1.5">
-                        <ShieldAlert className="w-3 h-3 mt-0.5 shrink-0" />
-                        <span>{reason}</span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-
-                {draft.grade.segments.length > 1 && (
-                  <div className={`text-[10px] font-mono space-y-0.5 ${palette.subtle}`}>
-                    {draft.grade.segments.map((seg, index) => (
-                      <div key={`${index}-${seg.raw}`} className="truncate" title={seg.raw}>
-                        {RISK_LABEL[seg.level]} · {seg.binary || '?'} · {seg.raw}
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {draft.prerequisites.length > 0 && (
-                  <div className={`text-[10px] leading-relaxed ${palette.subtle}`}>
-                    Requires: {draft.prerequisites.join('; ')}
-                  </div>
-                )}
-
-                {draft.grade.rootSession && (
-                  <div className={`text-[10px] ${palette.subtle}`}>
-                    Root session — auto-run disabled (manual run still available)
-                  </div>
-                )}
-
-                <div className="flex items-center gap-2 flex-wrap">
-                  <button
-                    onClick={() => dispatchCommand(false)}
-                    disabled={!terminalConnected || !onRunCommand}
-                    className={`${buttonClass} ${palette.button}`}
-                    title="Write to the input line without pressing Enter"
-                  >
-                    <CornerDownLeft className="w-3 h-3" />
-                    <span>Fill</span>
-                  </button>
-                  <button
-                    onClick={handleRunClick}
-                    disabled={!terminalConnected || !onRunCommand}
-                    className={`${buttonClass} ${draft.grade.level === 'dangerous' ? palette.danger : palette.primary}`}
-                    title="Fill and press Enter"
-                  >
-                    <Play className="w-3 h-3" />
-                    <span>Run</span>
-                  </button>
-                  <button onClick={handleCopy} className={`${buttonClass} ${palette.button}`}>
-                    {copied ? <Check className="w-3 h-3 text-emerald-500" /> : <Copy className="w-3 h-3" />}
-                    <span>Copy</span>
-                  </button>
-                  {!terminalConnected && (
-                    <span className={`text-[10px] ${palette.subtle}`}>terminal offline</span>
-                  )}
-                </div>
-
-                {runNotice && (
-                  <div className={`text-[10px] leading-relaxed ${palette.subtle}`}>{runNotice}</div>
-                )}
-              </>
-            ) : (
-              <div className="flex items-center gap-1.5 text-[11px]">
-                <Loader2 className="w-3 h-3 animate-spin text-indigo-500" />
-                <span className={palette.subtle}>Generating…</span>
               </div>
             )}
-          </div>
+
+            {/* 对话流 */}
+            {activeSession?.messages.map((entry) => (
+              <ChatEntryView
+                key={entry.id}
+                entry={entry}
+                risk={risk}
+                palette={palette}
+                copiedId={copiedId}
+                includeScreenDefault={includeScreen}
+                onRun={(e) => handleRunClick(e as ChatDraftEntry)}
+                onFill={(e) => dispatchCommand(e as ChatDraftEntry, false)}
+                onCopyEntry={(id, text) => handleCopyEntry(id, text)}
+                onApprove={(e, allow, remember) => {
+                  // 乐观更新：先落状态再等服务端，避免点完按钮还挂在「等待审批」。
+                  const item = e as unknown as Extract<AgentItem, { kind: 'tool' }>;
+                  const target = resumedEntryRef.current ?? lastAgentEntryRef.current;
+                  if (target && item.callId) {
+                    patchAgentItemRef.current(target, item.callId, {
+                      status: allow ? (remember && item.canRemember ? 'auto' : 'running') : 'denied',
+                    });
+                  }
+                  const resolve = approvalRef.current;
+                  approvalRef.current = null;
+                  resolve?.(allow, remember);
+                }}
+              />
+            ))}
+
+            {lastRunNotice && <div className={`text-[10px] leading-relaxed ${palette.subtle}`}>{lastRunNotice}</div>}
+          </>
         )}
 
-        {/* 降级：模型没给出可解析的结构，只展示原文，不给任何执行入口 */}
-        {degraded && (
-          <div className={`rounded border p-2 text-[11px] leading-relaxed ${risk.caution.border} ${risk.caution.text}`}>
-            No usable command structure came back. Raw output below, read-only.
-          </div>
-        )}
-
-        {/* 回答：诊断模式，或草稿降级后展示模型原文 */}
-        {(mode === 'diagnose' || degraded) && (answer || streaming) && (
-          <div className="space-y-1">
-            <div className="flex items-center gap-1.5">
-              <span className="font-medium">Answer</span>
-              {streaming && <Loader2 className="w-3 h-3 animate-spin text-indigo-500" />}
+        {/* 设置视图：切换 tab 的形式，独立于对话流 */}
+        {showSettings && (
+          <>
+            {/* 未配置时的提示，已配置时由表单内 Save 处理 */}
+            <div className={`rounded-md border p-2 sm:p-2.5 space-y-3 text-[12px] sm:text-[11px] leading-snug ${palette.card}`}>
+              <div className="space-y-1.5">
+                <div className={`text-[10px] font-semibold uppercase tracking-wider ${palette.subtle}`}>Model</div>
+                <label className="block space-y-1">
+                  <span className="font-medium">Base URL</span>
+                  <input value={formBaseUrl} onChange={(e) => setFormBaseUrl(e.target.value)} placeholder="https://api.example.com/v1" spellCheck={false} autoCapitalize="off" autoCorrect="off" className={`h-9 sm:h-[30px] w-full rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none ${palette.input}`} />
+                </label>
+                <label className="block space-y-1">
+                  <span className="font-medium">Model</span>
+                  <input value={formModel} onChange={(e) => setFormModel(e.target.value)} placeholder="gpt-4o-mini" spellCheck={false} autoCapitalize="off" autoCorrect="off" className={`h-9 sm:h-[30px] w-full rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none ${palette.input}`} />
+                </label>
+                <label className="block space-y-1">
+                  <span className="font-medium">API Key</span>
+                  <input type="password" value={formApiKey} onChange={(e) => setFormApiKey(e.target.value)} disabled={config?.keyFromEnv} placeholder={config?.keyFromEnv ? 'from env' : config?.hasKey ? 'saved' : 'optional'} autoComplete="off" className={`h-9 sm:h-[30px] w-full rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none disabled:opacity-50 ${palette.input}`} />
+                </label>
+              </div>
+              <div className="space-y-1.5 border-t pt-2 border-inherit">
+                <div className={`text-[10px] font-semibold uppercase tracking-wider ${palette.subtle}`}>Behavior</div>
+                <label className="flex items-center gap-2 min-h-[36px] sm:min-h-[30px]">
+                  <input type="checkbox" checked={formRedactIp} onChange={(e) => setFormRedactIp(e.target.checked)} className="w-4 h-4 shrink-0" />
+                  <span>Redact private IPs</span>
+                </label>
+                <label className="block space-y-1">
+                  <span className="font-medium">Auto-run allowlist</span>
+                  <input value={formWhitelist} onChange={(e) => setFormWhitelist(e.target.value)} placeholder="myctl, deploy" spellCheck={false} autoCapitalize="off" autoCorrect="off" className={`h-9 sm:h-[30px] w-full rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none ${palette.input}`} />
+                </label>
+              </div>
+              <div className="space-y-1.5 border-t pt-2 border-inherit">
+                <div className={`text-[10px] font-semibold uppercase tracking-wider ${palette.subtle}`}>Agent</div>
+                <label className="flex items-center gap-1.5">
+                  <select
+                    value={maxSteps}
+                    onChange={(e) => changeMaxSteps(Number(e.target.value))}
+                    disabled={busy}
+                    className={`h-9 sm:h-[30px] rounded-md border px-1.5 text-[16px] sm:text-[11px] font-mono focus:outline-none disabled:opacity-50 ${palette.input}`}
+                  >
+                    {[5, 10, 20, 30, 50].map((n) => (
+                      <option key={n} value={n}>max {n} steps</option>
+                    ))}
+                  </select>
+                  <span className={`text-[10px] ${palette.subtle}`}>per request</span>
+                </label>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <button onClick={handleSave} disabled={saving} className={`${buttonClass} ${palette.primary}`}>
+                  {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
+                  <span>Save</span>
+                </button>
+                <button onClick={handleTest} disabled={testing || !config?.ready} className={`${buttonClass} ${palette.button}`}>
+                  {testing ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+                  <span>Test</span>
+                </button>
+              </div>
+              {testResult && (
+                <div className={`text-[11px] leading-snug break-words ${testResult.ok ? 'text-emerald-500' : 'text-rose-500'}`}>
+                  {testResult.ok ? 'Connected' : testResult.message}
+                  {testResult.ok && testResult.message ? ` (${testResult.message})` : ''}
+                </div>
+              )}
             </div>
-            <div className="leading-relaxed whitespace-pre-wrap break-words">
-              {answer || <span className={palette.subtle}>Waiting for first token…</span>}
-            </div>
-          </div>
-        )}
-
-        {/* 诊断完给一个「往下走」的入口：省得用户把需求再打一遍 */}
-        {mode === 'diagnose' && phase === 'done' && !streaming && config?.ready && answer && (
-          <button
-            onClick={handleDraftFromAnswer}
-            className={`${buttonClass} ${palette.primary} w-full justify-center`}
-          >
-            <Play className="w-3 h-3" />
-            <span>Turn this into a command</span>
-          </button>
-        )}
-
-        {errorMsg && (
-          <div className={`flex items-start gap-2 ${phase === 'error' ? 'text-rose-500' : palette.subtle}`}>
-            <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
-            <span className="leading-relaxed">{errorMsg}</span>
-          </div>
-        )}
-
-        {meta && (
-          <div className={`text-[10px] font-mono ${palette.subtle}`}>
-            {meta.firstTokenMs !== undefined ? `first ${meta.firstTokenMs}ms · ` : ''}
-            {meta.ms !== undefined ? `${meta.ms}ms total · ` : ''}
-            {`${meta.chars || 0} chars`}
-            {meta.usage?.total_tokens ? ` · ${meta.usage.total_tokens} tokens` : ''}
-            {meta.finishReason === 'length' ? ' · truncated by max_tokens' : ''}
-          </div>
+          </>
         )}
       </div>
 
-      {/* 底部操作区 */}
-      <div className={`border-t px-3 py-2 space-y-2 shrink-0 ${palette.header}`}>
-        <div className="flex items-center gap-2">
+      {/* 底部输入：设置视图下不显示，单行：Screen 开关 + 输入 + 发送 */}
+      {!showSettings && (
+      <div className={`border-t px-2 py-1.5 sm:px-3 sm:py-2 space-y-1 shrink-0 ${palette.header}`}>
+        {busy && (
+          <div className="flex items-center gap-1.5">
+            <span className={`text-[10px] font-mono truncate ${palette.subtle}`}>
+              {formatElapsed(runElapsedMs)}{runStep > 0 ? ` · ${runStep}/${maxSteps}` : ''}
+              {/* 只有真有工具卡在 awaiting 时才提示 approval —— 之前只要有 agent 在 streaming
+                  就显示，正常跑动中也会误报，用户以为一直在等审批。 */}
+              {activeSession?.messages.some((m) => m.kind === 'agent' && m.items.some((it) => it.kind === 'tool' && it.status === 'awaiting'))
+                ? ' · waiting approval'
+                : ' · …'}
+            </span>
+          </div>
+        )}
+
+        <div className="flex items-stretch gap-1.5">
+          <button
+            onClick={() => setIncludeScreen((prev) => !prev)}
+            className={`${buttonClass} shrink-0 !px-1.5 justify-center ${includeScreen
+              ? isLight ? 'bg-slate-200 border-slate-300 text-slate-700' : 'bg-slate-700 border-slate-600 text-slate-100'
+              : palette.button}`}
+            title={includeScreen ? 'Screen on — terminal screen is sent with your message' : 'Screen off — only your message is sent'}
+          >
+            <Monitor className="w-3.5 h-3.5" />
+          </button>
+          <textarea
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onFocus={stickToBottomNow}
+            onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); sendMessage(input); } }}
+            disabled={busy || !config?.ready}
+            rows={1}
+            placeholder={sessionId && terminalConnected ? 'Ask or tell it what to do…' : 'Ask about the terminal…'}
+            className={`flex-1 min-w-0 rounded-md border px-2 py-1 text-[11px] leading-[18px] focus:outline-none disabled:opacity-50 resize-none max-h-24 ${palette.input}`}
+          />
           {busy ? (
             <button
-              onClick={() => (agentRunning ? handleStopAgent() : clientRef.current?.cancel())}
-              className={`${buttonClass} ${palette.danger}`}
+              onClick={stopRun}
+              className={`${buttonClass} ${palette.danger} shrink-0 !px-0 w-[30px] justify-center`}
+              title="Stop"
             >
-              <Square className="w-3 h-3" />
-              <span>Stop</span>
+              <Square className="w-3.5 h-3.5" />
             </button>
           ) : (
             <button
-              onClick={handleRegenerate}
-              disabled={mode === 'agent'
-                ? !lastAgentGoalRef.current
-                : (mode === 'draft' ? !lastDraftRef.current : !lastRunRef.current)}
-              className={`${buttonClass} ${palette.button}`}
+              onClick={() => sendMessage(input)}
+              disabled={!input.trim() || !config?.ready}
+              className={`${buttonClass} ${palette.primary} shrink-0 !px-0 w-[30px] justify-center`}
+              title="Send"
             >
-              <RefreshCw className="w-3 h-3" />
-              <span>Regenerate</span>
+              <Play className="w-3.5 h-3.5" />
             </button>
           )}
-          <button
-            onClick={handleCopy}
-            disabled={!(mode === 'draft' ? draft : answer)}
-            className={`${buttonClass} ${palette.button}`}
-          >
-            {copied ? <Check className="w-3 h-3 text-emerald-500" /> : <Copy className="w-3 h-3" />}
-            <span>Copy</span>
-          </button>
-          {/* 这句话在三种模式下含义不同，别让它说谎 */}
-          <span className={`ml-auto text-[10px] font-mono ${palette.subtle}`}>
-            {mode === 'agent'
-              ? 'you approve risky steps'
-              : (mode === 'draft' ? 'you confirm after grading' : 'read-only, never runs')}
-          </span>
         </div>
-
-        <div className="flex items-center gap-1.5">
-          <input
-            value={followUp}
-            onChange={(e) => setFollowUp(e.target.value)}
-            onFocus={stickToBottomNow}
-            onKeyDown={(e) => { if (e.key === 'Enter') handleFollowUp(); }}
-            disabled={!config?.ready || busy}
-            placeholder="Ask a follow-up…"
-            className={`flex-1 min-w-0 rounded border px-2 py-1 text-[11px] focus:outline-none disabled:opacity-50 ${palette.input}`}
-          />
-          <button
-            onClick={handleFollowUp}
-            disabled={!followUp.trim() || !config?.ready || busy}
-            className={`${buttonClass} ${palette.primary}`}
-          >
-            Ask
-          </button>
-        </div>
+        {!(terminalConnected && sessionId) && config?.ready && (
+          <div className={`text-[10px] ${palette.subtle}`}>No live terminal — read-only answers only. Connect a terminal to let the agent run steps.</div>
+        )}
       </div>
+      )}
 
-      {/* 高风险命令的二次确认。复用项目里已有的危险操作确认对话框 */}
+      {/* 高风险命令二次确认 */}
       <ConfirmDialog
-        isOpen={confirmRunOpen}
+        isOpen={Boolean(confirmRun)}
         theme={theme}
         title="Run high-risk command?"
         confirmLabel="Run anyway"
@@ -1319,26 +1401,216 @@ export const AiPanel: React.FC<AiPanelProps> = ({
         message={
           <span className="block space-y-1.5">
             <span className="block">The server graded this command as high risk. It may be irreversible:</span>
-            {draft && (
-              <span className="block">
-                {draft.grade.reasons.map((reason) => (
-                  <span key={reason} className="block">· {reason}</span>
-                ))}
-              </span>
-            )}
-            {draft && (
-              <code className="block mt-1 rounded bg-black/10 px-2 py-1 font-mono text-[11px] break-all whitespace-pre-wrap">
-                {draft.command}
-              </code>
-            )}
+            {(() => {
+              const e = sessions.find((s) => s.id === confirmRun?.sessionId)?.messages.find((m) => m.id === confirmRun?.entryId);
+              if (e && e.kind === 'draft') {
+                return (
+                  <span className="block">
+                    {e.draft.grade.reasons.map((reason) => (<span key={reason} className="block">· {reason}</span>))}
+                    <code className="block mt-1 rounded bg-black/10 px-2 py-1 font-mono text-[11px] break-all whitespace-pre-wrap">{e.draft.command}</code>
+                  </span>
+                );
+              }
+              return null;
+            })()}
           </span>
         }
         onConfirm={() => {
-          setConfirmRunOpen(false);
-          dispatchCommand(true);
+          const e = sessions.find((s) => s.id === confirmRun?.sessionId)?.messages.find((m) => m.id === confirmRun?.entryId);
+          setConfirmRun(null);
+          if (e && e.kind === 'draft') dispatchCommand(e, true);
         }}
-        onCancel={() => setConfirmRunOpen(false)}
+        onCancel={() => setConfirmRun(null)}
       />
+    </div>
+  );
+};
+
+/* ----------------------------- 消息渲染 ----------------------------- */
+
+const PreparedBlock: React.FC<{ prepared: PreparedView | null | undefined; risk: any; palette: Palette }> = ({ prepared, risk, palette }) => {
+  if (!prepared) return null;
+  const redactions = prepared.stats.redactionTotal ? redactionSummary(prepared.stats) : '';
+  const [open, setOpen] = useState(false);
+  return (
+    <div className={`rounded border ${palette.card}`}>
+      <button onClick={() => setOpen((v) => !v)} className="w-full flex items-center gap-1.5 px-2.5 py-2 text-left cursor-pointer">
+        {open ? <ChevronDown className="w-3 h-3 shrink-0" /> : <ChevronRight className="w-3 h-3 shrink-0" />}
+        <span className="font-medium shrink-0">Sent</span>
+        <span className={`text-[10px] font-mono truncate ${palette.subtle}`}>
+          {prepared.stats.rawLines > 0 ? `${prepared.stats.rawLines}→${prepared.stats.lines} lines · ~${prepared.stats.estTokens} tokens` : 'no terminal content'}
+          {prepared.stats.redactionTotal ? ` · ${prepared.stats.redactionTotal} redacted` : ''}
+        </span>
+      </button>
+      {open && (
+        <div className="px-2.5 pb-2.5 space-y-2">
+          <div className={`text-[10px] font-mono break-all ${palette.subtle}`}>{prepared.env}</div>
+          {(redactions || prepared.stats.omittedLines > 0) && (
+            <div className={`text-[10px] font-mono ${palette.subtle}`}>
+              {redactions ? `redacted: ${redactions}` : ''}
+              {redactions && prepared.stats.omittedLines ? ' · ' : ''}
+              {prepared.stats.omittedLines ? `${prepared.stats.omittedLines} lines omitted` : ''}
+            </div>
+          )}
+          {prepared.text ? (
+            <pre className={`max-h-56 overflow-auto rounded border p-2 text-[10px] leading-relaxed font-mono whitespace-pre-wrap break-all ${palette.code}`}>{prepared.text}</pre>
+          ) : (
+            <p className={`text-[10px] leading-relaxed ${palette.subtle}`}>No terminal content. Only your request, host and user are sent.</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const ChatEntryView: React.FC<{
+  entry: ChatEntry;
+  risk: Record<AiRiskLevel, { badge: string; border: string; text: string }>;
+  palette: Palette;
+  copiedId: string | null;
+  includeScreenDefault: boolean;
+  onRun: (e: ChatDraftEntry) => void;
+  onFill: (e: ChatDraftEntry) => void;
+  onCopyEntry: (id: string, text: string) => void;
+  onApprove: (e: ChatDraftEntry, allow: boolean, remember: boolean) => void;
+}> = ({ entry, risk, palette, copiedId, onRun, onFill, onCopyEntry, onApprove }) => {
+  const copyBtn = (id: string, text: string) => (
+    <button onClick={() => onCopyEntry(id, text)} className={`${buttonClass} ${palette.button}`} title="Copy">
+      {copiedId === id ? <Check className="w-3 h-3 text-emerald-500" /> : <Copy className="w-3 h-3" />}
+      <span>{copiedId === id ? 'Copied' : 'Copy'}</span>
+    </button>
+  );
+  if (entry.kind === 'user') {
+    return (
+      <div className="flex justify-end">
+        <div className={`max-w-[88%] rounded-lg border px-2 py-1 sm:px-2.5 sm:py-1.5 ${palette.primary} text-white`}>
+          <div className="whitespace-pre-wrap break-words leading-snug sm:leading-relaxed">{entry.text}</div>
+          <div className="text-[9px] opacity-70 mt-0.5">
+            {entry.withScreen ? 'with screen' : 'no screen'}{entry.at ? ` · ${formatClock(entry.at)}` : ''}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (entry.kind === 'text') {
+    return (
+      <div className="space-y-1">
+        <div className="flex items-center justify-end"><StartedAt at={entry.at} palette={palette} /></div>
+        <PreparedBlock prepared={entry.prepared} risk={risk} palette={palette} />
+        {entry.streaming && !entry.answer && (
+          <div className="flex items-center gap-1.5 text-[11px]"><Loader2 className="w-3 h-3 animate-spin text-indigo-500" /><span className={palette.subtle}>Thinking…</span></div>
+        )}
+        {entry.answer && <div className="leading-relaxed whitespace-pre-wrap break-words">{entry.answer}</div>}
+        {entry.error && (
+          <div className={`flex items-start gap-2 ${entry.aborted ? palette.subtle : 'text-rose-500'}`}>
+            <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /><span className="leading-relaxed">{entry.error}</span>
+          </div>
+        )}
+        {(entry.answer || entry.meta) && (
+          <div className="flex items-center gap-2 flex-wrap">
+            {entry.answer && copyBtn(entry.id, entry.answer)}
+            {entry.meta && (
+              <span className={`text-[10px] font-mono ${palette.subtle}`}>
+                {entry.meta.ms !== undefined ? `${entry.meta.ms}ms · ` : ''}{`${entry.meta.chars || 0} chars`}
+                {entry.meta.usage?.total_tokens ? ` · ${entry.meta.usage.total_tokens} tokens` : ''}
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (entry.kind === 'draft') {
+    const d = entry.draft;
+    return (
+      <div className="space-y-1.5 sm:space-y-2">
+        <div className="flex items-center justify-end"><StartedAt at={entry.at} palette={palette} /></div>
+        <PreparedBlock prepared={entry.prepared} risk={risk} palette={palette} />
+        <div className={`rounded-md border space-y-1.5 sm:space-y-2 p-1.5 sm:p-2.5 ${risk[d.grade.level].border}`}>
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${risk[d.grade.level].badge}`}>{RISK_LABEL[d.grade.level]}</span>
+            <span className={`text-[10px] font-mono ${palette.subtle}`}>server grade</span>
+            {d.selfRisk && d.selfRisk !== d.grade.level && (
+              <span className={`text-[10px] font-mono ${risk[d.selfRisk].text}`}>model said {RISK_LABEL[d.selfRisk]} (overridden)</span>
+            )}
+          </div>
+          {d.explain && <p className="leading-snug sm:leading-relaxed">{d.explain}</p>}
+          <pre className={`max-h-40 overflow-auto rounded-md border p-1.5 text-[11px] leading-relaxed font-mono whitespace-pre-wrap break-all ${palette.code}`}>{d.command}</pre>
+          {d.grade.reasons.length > 0 && (
+            <ul className={`space-y-0.5 ${risk[d.grade.level].text}`}>
+              {d.grade.reasons.map((reason) => (<li key={reason} className="flex items-start gap-1.5"><ShieldAlert className="w-3 h-3 mt-0.5 shrink-0" /><span>{reason}</span></li>))}
+            </ul>
+          )}
+          {entry.error && (
+            <div className="flex items-start gap-2 text-rose-500">
+              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /><span className="leading-relaxed">{entry.error}</span>
+            </div>
+          )}
+          <div className="flex items-center gap-2 flex-wrap">
+            <button onClick={() => onFill(entry)} disabled={!d} className={`${buttonClass} ${palette.button}`}><CornerDownLeft className="w-3 h-3" /><span>Fill</span></button>
+            <button onClick={() => onRun(entry)} className={`${buttonClass} ${d.grade.level === 'dangerous' ? palette.danger : palette.primary}`}><Play className="w-3 h-3" /><span>Run</span></button>
+            {copyBtn(entry.id, d.command)}
+          </div>
+          {entry.meta && (
+            <div className={`text-[10px] font-mono ${palette.subtle}`}>
+              {entry.meta.ms !== undefined ? `${entry.meta.ms}ms · ` : ''}{`${entry.meta.chars || 0} chars`}
+              {entry.meta.usage?.total_tokens ? ` · ${entry.meta.usage.total_tokens} tokens` : ''}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // agent
+  return (
+    <div className="space-y-1.5 sm:space-y-2">
+      <div className="flex items-center justify-end gap-2">
+        <StartedAt
+          at={entry.at ?? entry.runStartedAt}
+          palette={palette}
+          extra={!entry.streaming && entry.meta?.ms !== undefined ? `took ${formatElapsed(entry.meta.ms)}` : undefined}
+        />
+      </div>
+      <PreparedBlock prepared={entry.prepared} risk={risk} palette={palette} />
+      {entry.identity && entry.identity.user && (
+        <div className={`text-[10px] font-mono ${palette.subtle}`}>
+          {`remote user: ${entry.identity.user}${entry.identity.isRoot ? ' (root)' : ''}`}
+        </div>
+      )}
+      {entry.items.map((item) =>
+        item.kind === 'message' ? (
+          <p key={item.key} className="leading-relaxed whitespace-pre-wrap break-words">{item.text}</p>
+        ) : (
+          <AgentItemRow
+            key={item.key}
+            item={item}
+            risk={risk}
+            palette={palette}
+            onAllow={() => onApprove(item as ChatDraftEntry, true, false)}
+            onAllowSession={() => onApprove(item as ChatDraftEntry, true, true)}
+            onDeny={() => onApprove(item as ChatDraftEntry, false, false)}
+          />
+        ),
+      )}
+      {entry.streaming && entry.items.length > 0 && (
+        <div className={`flex items-center gap-1.5 text-[10px] ${palette.subtle}`}><Loader2 className="w-3 h-3 animate-spin" /><span>working…</span></div>
+      )}
+      {entry.final && (
+        <div className={`rounded-md border p-1.5 sm:p-2.5 space-y-1 ${palette.card}`}>
+          <div className="flex items-center gap-1.5 font-medium"><Check className="w-3.5 h-3.5 text-emerald-500" /><span>Conclusion</span></div>
+          <div className="leading-snug sm:leading-relaxed whitespace-pre-wrap break-words">{entry.final}</div>
+          <div>{copyBtn(`${entry.id}-final`, entry.final)}</div>
+        </div>
+      )}
+      {entry.stopReason === 'max-steps' && (
+        <div className={`text-[10px] ${palette.subtle}`}>Stopped at the step limit. Raise steps in Settings and ask again.</div>
+      )}
+      {entry.error && (
+        <div className="flex items-start gap-2 text-rose-500"><AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /><span className="leading-relaxed">{entry.error}</span></div>
+      )}
     </div>
   );
 };
