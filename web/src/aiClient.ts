@@ -1,4 +1,4 @@
-import { apiFetch, wsUrl } from './api';
+import { apiFetch, apiUrl, wsUrl } from './api';
 
 /**
  * `/ai` 通道的客户端。与 sftpClient 不同，这里是**流式**的：
@@ -772,7 +772,7 @@ async function describeFailure(res: Response): Promise<string> {
 }
 
 export async function fetchAiConfig(): Promise<AiConfigView> {
-  const res = await apiFetch('/ai/config');
+  const res = await apiFetch(apiUrl('/ai/config'));
   if (!res.ok) throw new Error(`Failed to load AI config (${await describeFailure(res)})`);
   return res.json();
 }
@@ -783,7 +783,7 @@ export async function saveAiConfig(
 ): Promise<AiConfigView> {
   const body: Record<string, unknown> = { ...patch };
   if (apiKey !== undefined) body.apiKey = apiKey;
-  const res = await apiFetch('/ai/config', {
+  const res = await apiFetch(apiUrl('/ai/config'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -793,7 +793,7 @@ export async function saveAiConfig(
 }
 
 export async function testAiConfig(): Promise<{ ok: boolean; message: string; model?: string }> {
-  const res = await apiFetch('/ai/test', { method: 'POST' });
+  const res = await apiFetch(apiUrl('/ai/test'), { method: 'POST' });
   if (!res.ok) return { ok: false, message: await describeFailure(res) };
   return res.json();
 }
@@ -806,7 +806,7 @@ export async function testAiConfig(): Promise<{ ok: boolean; message: string; mo
  */
 export async function fetchAiPanelOpen(sessionId: string): Promise<boolean> {
   try {
-    const res = await apiFetch(`/ai/panel-state?sessionId=${encodeURIComponent(sessionId)}`);
+    const res = await apiFetch(apiUrl(`/ai/panel-state?sessionId=${encodeURIComponent(sessionId)}`));
     if (!res.ok) return false;
     const data = await res.json();
     return data?.open === true;
