@@ -1,7 +1,6 @@
 import express from 'express';
 import http from 'http';
 import path from 'path';
-import { createServer as createViteServer } from 'vite';
 import { HOST, PORT, sshLog } from './server/lib.ts';
 import { registerRoutes } from './server/register-routes.ts';
 import { createSessionManager } from './server/session-manager.ts';
@@ -66,6 +65,7 @@ sessionManager.attachServer(server);
 
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
   } else {

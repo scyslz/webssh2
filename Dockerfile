@@ -6,7 +6,7 @@ COPY package.json package-lock.json ./
 RUN npm ci
 
 COPY . .
-RUN npm run build
+RUN npm run build && npm prune --omit=dev
 
 FROM node:22-alpine AS runner
 
@@ -15,12 +15,7 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3000
 
-COPY package.json package-lock.json ./
 COPY --from=builder /app/node_modules ./node_modules
-RUN npm prune --omit=dev && \
-    npm cache clean --force && \
-    rm -rf /usr/local/lib/node_modules/npm /usr/local/share/man /root/.npm /tmp/*
-
 COPY --from=builder /app/dist ./dist
 COPY conf/webssh_config.json ./defaults/webssh_config.json
 COPY docker-entrypoint.sh ./docker-entrypoint.sh

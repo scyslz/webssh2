@@ -1,11 +1,16 @@
 node_modules
 dist
 .git
+.github
 .gitignore
 *.md
 .DS_Store
 *.log
 .env*
 ssh_secrets.json
+ai_secrets.json
 .webssh_master_key
 assets
+Dockerfile
+docker-compose.yaml
+coverage
