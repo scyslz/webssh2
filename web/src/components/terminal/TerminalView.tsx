@@ -1741,7 +1741,6 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
                   ? 'bg-slate-50 border-slate-200 text-slate-700 focus:border-slate-400'
                   : 'bg-slate-950 border-slate-800 text-slate-200 focus:border-slate-700'
               }`}
-              onClick={(e) => (e.target as HTMLTextAreaElement).select()}
             />
 
             <div className="flex items-center justify-between gap-2 shrink-0 pt-0.5">
