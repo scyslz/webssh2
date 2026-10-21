@@ -19,6 +19,7 @@ import {
 import {
   AiWSClient,
   fetchAiConfig,
+  fetchAiModels,
   saveAiConfig,
   testAiConfig,
   type AiAgentApproval,
@@ -90,7 +91,9 @@ const RISK_STYLE_DARK: Record<AiRiskLevel, { badge: string; border: string; text
 };
 const RISK_LABEL: Record<AiRiskLevel, string> = { safe: 'read-only', caution: 'caution', dangerous: 'high risk' };
 
-const AGENT_DEFAULT_STEPS = 20;
+const AGENT_DEFAULT_STEPS = 50;
+const AGENT_MIN_STEPS = 1;
+const AGENT_MAX_STEPS = 200;
 const AGENT_OUTPUT_CLIP_CHARS = 4000;
 
 type ToolStatus = 'pending' | 'awaiting' | 'running' | 'done' | 'denied' | 'auto';
@@ -435,16 +438,19 @@ export const AiPanel: React.FC<AiPanelProps> = ({
   const [maxSteps, setMaxSteps] = useState(() => {
     try {
       const v = Number(globalGet('webssh_ai_maxsteps'));
-      return [5, 10, 20, 30, 50].includes(v) ? v : AGENT_DEFAULT_STEPS;
+      return Number.isFinite(v) && v >= AGENT_MIN_STEPS && v <= AGENT_MAX_STEPS ? Math.floor(v) : AGENT_DEFAULT_STEPS;
     } catch {
       return AGENT_DEFAULT_STEPS;
     }
   });
   const changeMaxSteps = useCallback((n: number) => {
-    const v = [5, 10, 20, 30, 50].includes(n) ? n : AGENT_DEFAULT_STEPS;
+    const v = Number.isFinite(n) ? Math.min(AGENT_MAX_STEPS, Math.max(AGENT_MIN_STEPS, Math.floor(n))) : AGENT_DEFAULT_STEPS;
     setMaxSteps(v);
     try { globalSet('webssh_ai_maxsteps', String(v)); } catch {}
   }, []);
+  const [modelOptions, setModelOptions] = useState<string[]>([]);
+  const [fetchingModels, setFetchingModels] = useState(false);
+  const [modelsError, setModelsError] = useState<string | null>(null);
 
   // draft 的高风险二次确认
   const [confirmRun, setConfirmRun] = useState<{ sessionId: string; entryId: string } | null>(null);
@@ -1095,6 +1101,29 @@ export const AiPanel: React.FC<AiPanelProps> = ({
     }
   };
 
+  const handleFetchModels = async () => {
+    setFetchingModels(true);
+    setModelsError(null);
+    try {
+      const result = await fetchAiModels({
+        baseUrl: formBaseUrl,
+        apiKey: formApiKey.trim() || undefined,
+      });
+      if (!result.ok || !result.models?.length) {
+        setModelsError(result.message || 'No models returned');
+        return;
+      }
+      setModelOptions(result.models);
+      if (!formModel || !result.models.includes(formModel)) {
+        setFormModel(result.models[0]);
+      }
+    } catch (err: any) {
+      setModelsError(err?.message || 'Fetch failed');
+    } finally {
+      setFetchingModels(false);
+    }
+  };
+
   const handleCopyEntry = useCallback((entryId: string, text: string) => {
     copyText(text, () => {
       setCopiedId(entryId);
@@ -1274,12 +1303,43 @@ export const AiPanel: React.FC<AiPanelProps> = ({
                   <input value={formBaseUrl} onChange={(e) => setFormBaseUrl(e.target.value)} placeholder="https://api.example.com/v1" spellCheck={false} autoCapitalize="off" autoCorrect="off" className={`h-9 sm:h-[30px] w-full rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none ${palette.input}`} />
                 </label>
                 <label className="block space-y-1">
-                  <span className="font-medium">Model</span>
-                  <input value={formModel} onChange={(e) => setFormModel(e.target.value)} placeholder="gpt-4o-mini" spellCheck={false} autoCapitalize="off" autoCorrect="off" className={`h-9 sm:h-[30px] w-full rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none ${palette.input}`} />
-                </label>
-                <label className="block space-y-1">
                   <span className="font-medium">API Key</span>
                   <input type="password" value={formApiKey} onChange={(e) => setFormApiKey(e.target.value)} disabled={config?.keyFromEnv} placeholder={config?.keyFromEnv ? 'from env' : config?.hasKey ? 'saved' : 'optional'} autoComplete="off" className={`h-9 sm:h-[30px] w-full rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none disabled:opacity-50 ${palette.input}`} />
+                </label>
+                <label className="block space-y-1">
+                  <span className="font-medium">Model</span>
+                  <div className="flex items-center gap-1.5">
+                    {modelOptions.length > 0 ? (
+                      <select
+                        value={formModel}
+                        onChange={(e) => setFormModel(e.target.value)}
+                        className={`h-9 sm:h-[30px] min-w-0 flex-1 rounded-md border px-1.5 text-[16px] sm:text-[11px] font-mono focus:outline-none ${palette.input}`}
+                      >
+                        {formModel && !modelOptions.includes(formModel) ? (
+                          <option value={formModel}>{formModel}</option>
+                        ) : null}
+                        {modelOptions.map((id) => (
+                          <option key={id} value={id}>{id}</option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input value={formModel} onChange={(e) => setFormModel(e.target.value)} placeholder="gpt-4o-mini" spellCheck={false} autoCapitalize="off" autoCorrect="off" className={`h-9 sm:h-[30px] min-w-0 flex-1 rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none ${palette.input}`} />
+                    )}
+                    <button
+                      type="button"
+                      onClick={handleFetchModels}
+                      disabled={fetchingModels || !formBaseUrl.trim()}
+                      className={`${buttonClass} ${palette.button} shrink-0`}
+                      title="Fetch models"
+                    >
+                      {fetchingModels ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+                      <span>Fetch</span>
+                    </button>
+                  </div>
+                  {modelOptions.length > 0 && (
+                    <input value={formModel} onChange={(e) => setFormModel(e.target.value)} placeholder="or type a model id" spellCheck={false} autoCapitalize="off" autoCorrect="off" className={`h-9 sm:h-[30px] w-full rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none ${palette.input}`} />
+                  )}
+                  {modelsError && <span className="text-rose-500">{modelsError}</span>}
                 </label>
               </div>
               <div className="space-y-1.5 border-t pt-2 border-inherit">
@@ -1296,17 +1356,17 @@ export const AiPanel: React.FC<AiPanelProps> = ({
               <div className="space-y-1.5 border-t pt-2 border-inherit">
                 <div className={`text-[10px] font-semibold uppercase tracking-wider ${palette.subtle}`}>Agent</div>
                 <label className="flex items-center gap-1.5">
-                  <select
+                  <span className="font-medium shrink-0">Max steps</span>
+                  <input
+                    type="number"
+                    min={AGENT_MIN_STEPS}
+                    max={AGENT_MAX_STEPS}
                     value={maxSteps}
                     onChange={(e) => changeMaxSteps(Number(e.target.value))}
                     disabled={busy}
-                    className={`h-9 sm:h-[30px] rounded-md border px-1.5 text-[16px] sm:text-[11px] font-mono focus:outline-none disabled:opacity-50 ${palette.input}`}
-                  >
-                    {[5, 10, 20, 30, 50].map((n) => (
-                      <option key={n} value={n}>max {n} steps</option>
-                    ))}
-                  </select>
-                  <span className={`text-[10px] ${palette.subtle}`}>per request</span>
+                    className={`h-9 sm:h-[30px] w-20 rounded-md border px-2 text-[16px] sm:text-[11px] font-mono focus:outline-none disabled:opacity-50 ${palette.input}`}
+                  />
+                  <span className={`text-[10px] ${palette.subtle}`}>per request (1–{AGENT_MAX_STEPS})</span>
                 </label>
               </div>
               <div className="flex items-center gap-1.5">

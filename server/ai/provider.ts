@@ -1,4 +1,4 @@
-import { resolveChatEndpoint, type ResolvedAiConfig } from './config.ts';
+import { resolveChatEndpoint, resolveModelsEndpoint, type ResolvedAiConfig } from './config.ts';
 import type { ChatMessage } from './prompts.ts';
 
 /**
@@ -350,6 +350,50 @@ export async function verifyAiConfig(config: ResolvedAiConfig): Promise<{ ok: bo
     return { ok: true, message: 'Connected', model };
   } catch (err: any) {
     return { ok: false, message: err?.name === 'AbortError' ? 'Timed out' : `Connection failed: ${err?.message || err}` };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function parseModelIds(body: string): string[] {
+  try {
+    const parsed = JSON.parse(body);
+    const rows = Array.isArray(parsed?.data) ? parsed.data : Array.isArray(parsed?.models) ? parsed.models : [];
+    const ids: string[] = [];
+    for (const row of rows) {
+      const id = typeof row === 'string' ? row : (row?.id || row?.name || row?.model);
+      if (typeof id === 'string' && id.trim() && !ids.includes(id.trim())) ids.push(id.trim());
+    }
+    return ids.sort((a, b) => a.localeCompare(b));
+  } catch {
+    return [];
+  }
+}
+
+export async function listAiModels(
+  config: ResolvedAiConfig,
+  override?: { baseUrl?: string; apiKey?: string },
+): Promise<{ ok: boolean; models?: string[]; message?: string }> {
+  const baseUrl = (override?.baseUrl ?? config.baseUrl).trim();
+  const apiKey = override?.apiKey !== undefined ? override.apiKey : config.apiKey;
+  const endpoint = resolveModelsEndpoint(baseUrl);
+  if (!endpoint) return { ok: false, message: 'Base URL not set' };
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+  try {
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+    const response = await fetch(endpoint, { method: 'GET', headers, signal: controller.signal });
+    const body = await response.text();
+    if (!response.ok) {
+      return { ok: false, message: `HTTP ${response.status}: ${extractErrorMessage(body)}` };
+    }
+    const models = parseModelIds(body);
+    if (!models.length) return { ok: false, message: 'No models returned' };
+    return { ok: true, models };
+  } catch (err: any) {
+    return { ok: false, message: err?.name === 'AbortError' ? 'Timed out' : `Fetch failed: ${err?.message || err}` };
   } finally {
     clearTimeout(timer);
   }

@@ -40,9 +40,9 @@ import {
 import type { RiskLevel } from './grade.ts';
 
 /** 默认步数上限 */
-export const AGENT_DEFAULT_MAX_STEPS = 20;
+export const AGENT_DEFAULT_MAX_STEPS = 50;
 /** 硬顶：前端传更大的值也压回来 */
-export const AGENT_MAX_STEPS_HARD_LIMIT = 40;
+export const AGENT_MAX_STEPS_HARD_LIMIT = 200;
 /** 一轮里最多接受的工具调用数，防止模型一口气吐几十个 */
 const MAX_TOOL_CALLS_PER_TURN = 8;
 /**

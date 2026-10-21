@@ -101,6 +101,15 @@ export function resolveChatEndpoint(baseUrl: string): string {
   return `${trimmed}/v1/chat/completions`;
 }
 
+export function resolveModelsEndpoint(baseUrl: string): string {
+  const trimmed = (baseUrl || '').trim().replace(/\/+$/, '');
+  if (!trimmed) return '';
+  if (/\/chat\/completions$/.test(trimmed)) return trimmed.replace(/\/chat\/completions$/, '/models');
+  if (/\/models$/.test(trimmed)) return trimmed;
+  if (/\/v\d+$/.test(trimmed)) return `${trimmed}/models`;
+  return `${trimmed}/v1/models`;
+}
+
 export function resolveAiConfig(): ResolvedAiConfig {
   const settings: AiSettings = readAppConfig().ai || {};
   const secret = readSecret();

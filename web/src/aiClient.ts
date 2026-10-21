@@ -531,7 +531,7 @@ export class AiWSClient {
         );
         return;
       case 'agent_start':
-        h.onAgentStart?.({ maxSteps: Number(message.maxSteps) || 20, resumed: Boolean(message.resumed) });
+        h.onAgentStart?.({ maxSteps: Number(message.maxSteps) || 50, resumed: Boolean(message.resumed) });
         return;
       case 'agent_identity':
         h.onAgentIdentity?.({
@@ -794,6 +794,16 @@ export async function saveAiConfig(
 
 export async function testAiConfig(): Promise<{ ok: boolean; message: string; model?: string }> {
   const res = await apiFetch(apiUrl('/ai/test'), { method: 'POST' });
+  if (!res.ok) return { ok: false, message: await describeFailure(res) };
+  return res.json();
+}
+
+export async function fetchAiModels(opts?: { baseUrl?: string; apiKey?: string }): Promise<{ ok: boolean; models?: string[]; message?: string }> {
+  const res = await apiFetch(apiUrl('/ai/models'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(opts || {}),
+  });
   if (!res.ok) return { ok: false, message: await describeFailure(res) };
   return res.json();
 }

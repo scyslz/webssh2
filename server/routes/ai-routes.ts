@@ -1,7 +1,7 @@
 import express from 'express';
 import { safeJson } from '../lib.ts';
 import { publicAiConfig, resolveAiConfig, saveAiSettings } from '../ai/config.ts';
-import { verifyAiConfig } from '../ai/provider.ts';
+import { listAiModels, verifyAiConfig } from '../ai/provider.ts';
 import type { AiSettings } from '../lib.ts';
 
 /**
@@ -42,6 +42,17 @@ export function registerAiRoutes(app: express.Express) {
 
   app.post('/ai/test', async (_req, res) => {
     const result = await verifyAiConfig(resolveAiConfig());
+    safeJson(res, result);
+  });
+
+  app.post('/ai/models', async (req, res) => {
+    const body: any = req.body || {};
+    const override: { baseUrl?: string; apiKey?: string } = {};
+    if (body.baseUrl !== undefined) override.baseUrl = String(body.baseUrl);
+    if ('apiKey' in body && body.apiKey != null && String(body.apiKey).trim()) {
+      override.apiKey = String(body.apiKey);
+    }
+    const result = await listAiModels(resolveAiConfig(), override);
     safeJson(res, result);
   });
 }
