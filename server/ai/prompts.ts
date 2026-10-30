@@ -1,4 +1,4 @@
-import type { PreparedContext } from './context.ts';
+import { CHARS_PER_TOKEN, type PreparedContext } from './context.ts';
 
 /**
  * P0 只做「读」：解释输出、定位问题、给排查方向。
@@ -118,13 +118,185 @@ Rules:
 5. When the goal is answered, reply with plain text and no tool call. Summarise what you found
    and cite the evidence you actually observed.
 6. If a tool returns an error, a denial or a permission failure, diagnose it from the message.
-   Do not retry the exact same call in a loop.`;
+   Do not retry the exact same call in a loop.
+7. Finish the deliverable before you stop. If the task is to create, update, replace or run
+   something, you must successfully call the tool that does it. Never end with intent statements
+   such as "I will create...", "about to write...", "封装中" or "已摸清参数，正在封装" unless
+   the corresponding ssh_write / ssh_exec call has already succeeded. A plan is not a result.
+8. Earlier turns may contain truncated tool results (messages starting with "earlier tool call").
+   Those are facts you already gathered in this conversation. Do not re-read the same file or
+   re-run the same command unless you have a concrete reason to expect it changed; if freshness
+   matters, verify cheaply (stat, head -n 20) instead of restarting full exploration.
+9. Explore with a budget. Stop reconnaissance as soon as you have the facts needed to act —
+   remaining steps are for the action itself, not for more reading.`;
 
-/** Agent 首轮消息：目标 + 可选的终端上下文 + 环境信息 */export function buildAgentToolMessages(input: {
+/**
+ * 把会话历史（含工具记录）压成可回灌的 ChatMessage 列表。
+ *
+ * 以前跨轮只带文字：agent 被打断后「失忆」，同一批文件会再读一遍，
+ * 还容易把「正在封装」当成完成。工具摘要以 assistant 文本注入，
+ * 前缀 `earlier tool call` 与系统提示词规则 8 对应 —— 模型知道这是
+ * **本次会话早先实测**、可能被截断的线索，而不是本轮新鲜输出。
+ */
+const PRIOR_TOOL_OUTPUT_CHARS = 1600;
+const PRIOR_HISTORY_CHAR_BUDGET = 72_000;
+/**
+ * 触发裁剪后一次性收到预算的这个比例。
+ *
+ * 如果每次只裁到「刚好不超预算」，下一轮新增几条工具输出就又超了 —— 前缀每轮
+ * 都在变，prompt cache 从裁剪点之后全部作废。留出余量后，同一个前缀能稳定
+ * 复用好几轮，命中率才起得来。
+ */
+const PRIOR_HISTORY_TRIM_TARGET = 0.8;
+
+/**
+ * 按「模型上下文窗口」算出 agent 的两档历史预算（字符）。
+ *
+ * - 先扣掉 terminal_tail、max_tokens 和 system/tools 的固定开销；
+ * - prior 给跨轮历史的初始预算，loop 给单轮里工具输出累积后的上限；
+ * - 都保留了旧版的硬下限（24k / 48k 字符），避免用户把 contextWindow 设小后
+ *   agent 突然失忆 —— 小窗口下宁可略超，也不要一上来就裁掉刚读到的结果。
+ */
+export function agentHistoryBudgets(config: {
+  contextWindowTokens: number;
+  maxInputTokens: number;
+  maxOutputTokens: number;
+}): { priorChars: number; loopChars: number } {
+  const overheadTokens = 2_000; // system prompt + tool schemas + task skeleton
+  const availableTokens = Math.max(
+    4_000,
+    config.contextWindowTokens - config.maxInputTokens - config.maxOutputTokens - overheadTokens,
+  );
+  return {
+    priorChars: Math.max(24_000, Math.floor(availableTokens * 0.35 * CHARS_PER_TOKEN)),
+    loopChars: Math.max(48_000, Math.floor(availableTokens * 0.85 * CHARS_PER_TOKEN)),
+  };
+}
+
+/** 与服务端 AiHistoryEntry / 前端 ChatEntry 松耦合的结构化历史 */
+export interface PriorHistoryEntry {
+  kind: 'user' | 'text' | 'agent';
+  text?: string;
+  answer?: string;
+  error?: string;
+  aborted?: boolean;
+  goal?: string;
+  items?: Array<Record<string, unknown>>;
+  final?: string;
+  stopReason?: string;
+}
+
+function toolSummaryForHistory(item: Record<string, unknown>): string | null {
+  const status = String(item.status ?? '');
+  // 未执行/还在等审批的不算「已发生」，别让模型以为跑过了
+  if (status === 'awaiting' || status === 'pending' || status === 'running') return null;
+  const output = typeof item.output === 'string' ? item.output : '';
+  if (!output) return null;
+  const tool = String(item.tool || 'tool');
+  const display = String(item.display || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+  const snippet = output.length > PRIOR_TOOL_OUTPUT_CHARS
+    ? `${output.slice(0, PRIOR_TOOL_OUTPUT_CHARS)}\n…[truncated in history; re-read the source if you need the rest]…`
+    : output;
+  return `earlier tool call: ${tool} ${display}\n${snippet}`;
+}
+
+function clipHistoryFromFront(messages: ChatMessage[], budget: number): ChatMessage[] {
+  const cost = (message: ChatMessage) => message.content.length + 40;
+  let total = 0;
+  for (const message of messages) total += cost(message);
+  if (total <= budget) return messages;
+
+  const target = Math.floor(budget * PRIOR_HISTORY_TRIM_TARGET);
+  let start = 0;
+  while (total > target && start < messages.length - 1) {
+    total -= cost(messages[start]);
+    start += 1;
+  }
+
+  // 一条 assistant 打头的历史在多数端点上是合法的，但语义很奇怪（像是系统在自问自答），
+  // 而且裁剪点落在 assistant 上会让前缀更难稳定。对齐到最近的 user 边界。
+  while (start < messages.length - 1 && messages[start].role !== 'user') start += 1;
+  return start > 0 ? messages.slice(start) : messages;
+}
+
+/** 历史必须从 user 开始：裁剪后若只剩 assistant，补一条稳定的占位 user */
+function alignHistoryStart(messages: ChatMessage[]): ChatMessage[] {
+  if (messages.length === 0) return messages;
+  if (messages[0].role === 'user') return messages;
+  return [
+    { role: 'user', content: '(continued session — earlier turns were trimmed from the context window)' },
+    ...messages,
+  ];
+}
+
+export function buildPriorHistoryMessages(
+  entries: PriorHistoryEntry[],
+  budgetChars = PRIOR_HISTORY_CHAR_BUDGET,
+): ChatMessage[] {
+  const out: ChatMessage[] = [];
+
+  for (const entry of entries) {
+    if (entry.kind === 'user') {
+      const text = (entry.text || '').trim();
+      if (text) out.push({ role: 'user', content: text });
+      continue;
+    }
+
+    if (entry.kind === 'text') {
+      if (entry.answer) out.push({ role: 'assistant', content: entry.answer });
+      else if (entry.error) out.push({ role: 'assistant', content: `[stopped: ${entry.error}]` });
+      continue;
+    }
+
+    // agent
+    // pushHistory 已经在 record 前记过一条 user（同一个 question），这里再补 goal
+    // 会变成连续两条一模一样的 user —— 白烧 token，也容易让模型以为用户催了一遍。
+    if (entry.goal) {
+      const goal = entry.goal.trim();
+      const last = out[out.length - 1];
+      if (goal && !(last?.role === 'user' && last.content === goal)) {
+        out.push({ role: 'user', content: goal });
+      }
+    }
+    for (const item of entry.items || []) {
+      if (item.kind === 'message') {
+        const text = String(item.text || '').trim();
+        if (text) out.push({ role: 'assistant', content: text });
+      } else if (item.kind === 'tool') {
+        const summary = toolSummaryForHistory(item);
+        if (summary) out.push({ role: 'assistant', content: summary });
+      }
+    }
+    if (entry.final) out.push({ role: 'assistant', content: entry.final });
+    else if (entry.error) {
+      out.push({ role: 'assistant', content: `[previous run did not finish: ${entry.error}]` });
+    }
+  }
+
+  return clipHistoryFromFront(out, budgetChars);
+}
+
+/**
+ * Agent 首轮消息：系统提示词 → 历史 → 本轮目标（+ 可选终端上下文）。
+ *
+ * **顺序很关键，别把本轮目标插到历史前面。** 之前的顺序是
+ * `[system, 本轮目标, ...历史]`，而本轮目标（含 terminal_tail）每轮都不同，
+ * 等于在位置 1 就把前缀改掉 —— 网关上一轮缓存的整段历史全部作废，
+ * 只有 system + tools 能命中。把变化的部分放到**最后**，历史才是稳定的
+ * 前缀，多轮会话的缓存命中率会随轮次上升（DSH / opencode 就是这个形状）。
+ *
+ * 历史本身由 `buildPriorHistoryMessages` 生成，工具结果以 `earlier tool call`
+ * 摘要注入，前缀 `earlier tool call` 与系统提示词规则 8 对应。
+ */
+export function buildAgentToolMessages(input: {
   goal: string;
   prepared?: { env?: string; text?: string } | null;
   maxSteps: number;
-  /** 同一条对话里前几轮（diagnose/agent）的问答，用于让模型延续上下文。只带文字，不重放工具调用 */
+  /**
+   * 同一条 SSH 会话里前几轮的上下文（含截断后的工具摘要）。
+   * 优先由服务端 `buildPriorHistoryMessages(state.history, budget)` 生成，
+   * 预算来自 `agentHistoryBudgets(config)`；客户端传入的纯文字 history 仅作兜底。
+   */
   history?: ChatMessage[];
 }): ChatMessage[] {
   const sections: string[] = [];
@@ -138,18 +310,16 @@ Rules:
   sections.push(`<task>\n${input.goal}\n</task>`);
   sections.push(`You have at most ${input.maxSteps} steps. Finish as soon as the task is answered.`);
 
-  const seed: ChatMessage[] = [
-    { role: 'system', content: AGENT_TOOL_SYSTEM_PROMPT },
-    { role: 'user', content: sections.join('\n\n') },
-  ];
+  const task: ChatMessage = { role: 'user', content: sections.join('\n\n') };
+  const history = input.history && input.history.length > 0
+    ? alignHistoryStart(input.history)
+    : [];
 
-  // 历史接在首轮 user 之后、模型第一次回复之前：模型能看到前因，但系统提示词始终在最前。
-  // 注意：这里只放文字对话，不重放任何 tool 调用 —— 工具结果必须来自本次会话实测，
-  // 否则模型会拿过期/虚构的输出当事实（见 AGENT_TOOL_SYSTEM_PROMPT 规则 2）。
-  if (input.history && input.history.length > 0) {
-    return [...seed, ...input.history];
-  }
-  return seed;
+  return [
+    { role: 'system', content: AGENT_TOOL_SYSTEM_PROMPT },
+    ...history,
+    task,
+  ];
 }
 
 /**

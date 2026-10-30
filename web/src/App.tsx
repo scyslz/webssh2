@@ -9,6 +9,7 @@ import { TerminalView } from './components/terminal/TerminalView';
 import { SFTPView } from './components/SFTPView';
 import { AiPanel } from './components/AiPanel';
 import type { TerminalBridge } from './aiClient';
+import { fetchAiPanelOpen } from './aiClient';
 import { ConnectionModal } from './components/ConnectionModal';
 import { SavedHostsModal } from './components/SavedHostsModal';
 import { SettingsModal } from './components/SettingsModal';
@@ -208,8 +209,9 @@ export default function App() {
     const unsubscribe = sysClient.subscribe((snapshot) => {
       setSessions(snapshot.sessions);
       setActiveSessionCount(snapshot.sessions.length);
-      // 服务端（会话）是面板开关状态的权威来源：有会话开着面板、而本地对应 tab 没开，
-      // 就补开 —— 覆盖「另一设备打开」「接管后恢复」两种情况。
+      // 服务端记着面板状态，但它是**客户端级**的：只有 owner（打开面板的那个 tab）
+      // 对得上才补开。这样同一个 tab 刷新/重连能恢复，而别的设备接管时不会
+      // 因为服务端还记着 open 就把本机面板硬拉起来。
       // 只补开、不主动关：关闭由 ai_panel_state 广播 / 用户操作处理，避免网络抖动时来回切。
       // 关键：**终端不可用的 tab 不补开**。被别的设备接管后，本机 tab 还挂着同一个
       // sessionId，若照常补开，面板会在刚被卸载后又被拉回来（表现为「接管后面板不收」）。
@@ -217,6 +219,11 @@ export default function App() {
         if (!sess.aiPanelOpen) continue;
         const tab = tabsRef.current.find((t) => t.sessionId === sess.sessionId);
         if (!tab || aiOpenRef.current.includes(tab.id)) continue;
+        // 本机用户明确关过（且之后没主动 open）→ 不拿服务端的陈旧 open 补开。
+        // 页面刷新后 intent 是空 Map，不拦，所以服务端说 open 就恢复。
+        if (aiIntentRef.current.get(tab.id) === false) continue;
+        // 其它情况以服务端为准：接管/恢复时服务端说 open，就补开；
+        // 说 false 就不开。panelClientId 只用于日志归属，不再作为过滤条件。
         // 只有「本机就是这个会话的 owner」才补开。被别的设备接管后 owner 变成对方，
         // 本机 tab 虽仍持同一 sessionId，也不该再把面板拉回来。
         const owned = !sess.ownerClientId || sess.ownerClientId === tab.id;
@@ -738,10 +745,17 @@ export default function App() {
 
     setTabs((prev) => [...prev, newTab]);
     setActiveTabId(newTabId);
-    // 与 term 同帧打开 AI 面板：不能等 /sys 快照的 aiPanelOpen —— 那是下一次推送，
-    // 会让面板比终端晚半拍出现。先乐观打开，若服务端状态是关，随后的
-    // ai_panel_state / /sys 校正会把它关掉。
-    openAiPanel(newTabId);
+    /**
+     * 接管/新开 tab 仍然**读服务端的 panelOpen**：老设备确实开着，恢复是合理的；
+     * 老设备其实关着，panelOpen 现在会被 close 队列/可见性 effect 正确写成 false，
+     * 这里就不会弹。以前的问题是 close 丢失导致服务端残留 true，不是「读状态」本身。
+     *
+     * 关键：不能用 `sessions` 里的 `/sys` 快照 —— 它是周期性推送的，接管时可能还
+     * 停留在关闭前的 true。现查 `/ai/panel-state`，以服务端当前值为准。
+     */
+    void fetchAiPanelOpen(sess.sessionId).then((open) => {
+      if (open) openAiPanel(newTabId);
+    });
   }, [tabs, handleRecoverSession, generateTabId, openAiPanel]);
 
   const handleSessionKilled = useCallback((sessionId: string) => {
@@ -948,6 +962,8 @@ export default function App() {
                         theme={config.theme}
                         target={{ host: tab.sshInfo?.host, username: tab.sshInfo?.username }}
                         sessionId={tab.sessionId}
+                        clientId={tab.id}
+                        open={aiOpenTabs.includes(tab.id)}
                         getContext={() => contextSourcesRef.current.get(tab.id)?.() ?? null}
                         terminalConnected={Boolean(tab.connected)}
                         onRunCommand={(command, submit) =>
@@ -955,8 +971,9 @@ export default function App() {
                         getExecBridge={() => execBridgesRef.current.get(tab.id) ?? null}
                         onClose={() => closeAiPanel(tab.id)}
                         onPanelStateChange={(open) => {
-                          // 服务端同步来的面板开关（另一设备的操作 / 重连回放）：
-                          // 开则打开本地面板，关则关闭。幂等，不会和本地上报形成死循环。
+                          // 服务端同步来的面板开关（同一个客户端 tab 的重连/多 socket）：
+                          // 开则打开本地面板，关则关闭。别的设备的帧已被 aiClient 按
+                          // clientId 过滤掉，不会把本机关着的面板拉起来。
                           if (open) openAiPanel(tab.id);
                           else closeAiPanel(tab.id);
                         }}

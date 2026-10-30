@@ -28,7 +28,15 @@
  */
 
 import type { ResolvedAiConfig } from './config.ts';
-import { chatCompletion, type LLMessage, type ToolCallSpec } from './provider.ts';
+import {
+  cachedTokens,
+  chatCompletion,
+  promptTokens,
+  reasoningTokens,
+  type LLMessage,
+  type StreamUsage,
+  type ToolCallSpec,
+} from './provider.ts';
 import {
   AGENT_TOOLS,
   createToolContext,
@@ -46,10 +54,10 @@ export const AGENT_MAX_STEPS_HARD_LIMIT = 200;
 /** 一轮里最多接受的工具调用数，防止模型一口气吐几十个 */
 const MAX_TOOL_CALLS_PER_TURN = 8;
 /**
- * 消息历史的总字符预算。超出后从**最老的 tool 消息**开始清内容。
+ * 消息历史的默认总字符预算。超出后从**最老的 tool 消息**开始清内容。
  *
- * 第一版不做摘要式压缩（那是 spec 里明确的「预留接口」），只做这件事：
- * 保证最近几步的完整输出还在 —— 它们才是下一步决策的依据。
+ * 实际预算由 `contextWindowTokens` 推导后通过 `historyCharBudget` 传入；
+ * 这个常量是没传时的兜底，保持旧行为。
  */
 const HISTORY_CHAR_BUDGET = 120_000;
 /** 单次工具调用展示给界面的参数长度上限 */
@@ -117,6 +125,11 @@ export interface AgentRunResult {
   /** 走过的工具调用次数 */
   toolCalls: number;
   modelCalls: number;
+  /**
+   * 这一轮所有模型调用的 usage 汇总（含缓存命中）。
+   * 单步 usage 没意义 —— 用户要看的是「这轮 agent 花了多少、命中了多少」。
+   */
+  usage?: StreamUsage;
 }
 
 /**
@@ -159,23 +172,54 @@ export interface AgentRunArgs {
   modelTimeoutMs?: number;
   /** 审批记忆：命中即跳过人工审批。不传则每次都问人 */
   approvalMemory?: ApprovalMemory;
+  /** 稳定的会话级 prompt cache 路由键（见 provider.ts 的 postChat） */
+  cacheKey?: string;
+  /** 单轮工具输出累积后的历史字符预算，由 contextWindowTokens 推导 */
+  historyCharBudget?: number;
 }
 
 /** 把古老的工具输出清掉，给最近几步腾地方 */
-function trimHistory(messages: LLMessage[]): void {
+function trimHistory(messages: LLMessage[], budget = HISTORY_CHAR_BUDGET): void {
   let total = 0;
   for (const message of messages) total += (message.content?.length ?? 0) + 200;
 
-  if (total <= HISTORY_CHAR_BUDGET) return;
+  if (total <= budget) return;
 
   // 从最老的开始清，但永不删 system，也保留最后 4 条消息（当前轮正在用的）
-  for (let i = 1; i < messages.length - 4 && total > HISTORY_CHAR_BUDGET; i += 1) {
+  for (let i = 1; i < messages.length - 4 && total > budget; i += 1) {
     const message = messages[i] as any;
     if (message.role === 'tool' && typeof message.content === 'string' && message.content) {
       total -= message.content.length;
       message.content = '[trimmed from history]';
     }
   }
+}
+
+/** 把一次模型调用的 usage 累加进总计（兼容 prompt_tokens / input_tokens 两种字段） */
+function mergeUsage(total: StreamUsage | undefined, usage: StreamUsage | undefined): StreamUsage | undefined {
+  if (!usage) return total;
+  const next: StreamUsage = total ?? {
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    total_tokens: 0,
+    prompt_cache_hit_tokens: 0,
+    completion_tokens_details: { reasoning_tokens: 0 },
+  };
+  const prompt = promptTokens(usage) ?? 0;
+  const completion = usage.completion_tokens ?? usage.output_tokens ?? 0;
+  const cached = cachedTokens(usage) ?? 0;
+  const reasoning = reasoningTokens(usage) ?? 0;
+
+  next.prompt_tokens = (next.prompt_tokens ?? 0) + prompt;
+  next.completion_tokens = (next.completion_tokens ?? 0) + completion;
+  next.total_tokens = (next.total_tokens ?? 0)
+    + (usage.total_tokens && usage.total_tokens > 0 ? usage.total_tokens : prompt + completion);
+  next.prompt_cache_hit_tokens = (next.prompt_cache_hit_tokens ?? 0) + cached;
+  next.completion_tokens_details = {
+    ...next.completion_tokens_details,
+    reasoning_tokens: (next.completion_tokens_details?.reasoning_tokens ?? 0) + reasoning,
+  };
+  return next;
 }
 
 export async function runAgentLoop(args: AgentRunArgs): Promise<AgentRunResult> {
@@ -190,15 +234,19 @@ export async function runAgentLoop(args: AgentRunArgs): Promise<AgentRunResult> 
 
   const ctx: ToolContext = createToolContext({ client, whitelist, identity });
   const history: LLMessage[] = [...seed];
+  const historyCharBudget = args.historyCharBudget ?? HISTORY_CHAR_BUDGET;
 
   let steps = 0;
   let toolCalls = 0;
   let modelCalls = 0;
   let lastText = '';
+  let usageTotal: StreamUsage | undefined;
 
   try {
     while (steps < maxSteps) {
-      if (signal.aborted) return { answer: lastText, steps, stopReason: 'cancelled', toolCalls, modelCalls };
+      if (signal.aborted) {
+        return { answer: lastText, steps, stopReason: 'cancelled', toolCalls, modelCalls, usage: usageTotal };
+      }
 
       steps += 1;
       events.onStep?.(steps);
@@ -209,8 +257,10 @@ export async function runAgentLoop(args: AgentRunArgs): Promise<AgentRunResult> 
         tools: AGENT_TOOLS as any,
         signal,
         ...(args.modelTimeoutMs ? { timeoutMs: args.modelTimeoutMs } : {}),
+        ...(args.cacheKey ? { cacheKey: args.cacheKey } : {}),
       });
       modelCalls += 1;
+      usageTotal = mergeUsage(usageTotal, result.usage);
 
       const { content, tool_calls: calls } = result.message;
       if (content) {
@@ -226,6 +276,7 @@ export async function runAgentLoop(args: AgentRunArgs): Promise<AgentRunResult> 
           stopReason: 'final',
           toolCalls,
           modelCalls,
+          usage: usageTotal,
         };
       }
 
@@ -234,13 +285,13 @@ export async function runAgentLoop(args: AgentRunArgs): Promise<AgentRunResult> 
 
        for (const call of calls.slice(0, MAX_TOOL_CALLS_PER_TURN)) {
         if (signal.aborted) {
-          return { answer: lastText, steps, stopReason: 'cancelled', toolCalls, modelCalls };
+          return { answer: lastText, steps, stopReason: 'cancelled', toolCalls, modelCalls, usage: usageTotal };
         }
         toolCalls += 1;
         await runOneCall(call, ctx, history, events, signal, args.approvalMemory);
       }
 
-      trimHistory(history);
+      trimHistory(history, historyCharBudget);
     }
 
     return {
@@ -250,6 +301,7 @@ export async function runAgentLoop(args: AgentRunArgs): Promise<AgentRunResult> 
       stopReason: 'max-steps',
       toolCalls,
       modelCalls,
+      usage: usageTotal,
     };
   } finally {
     ctx.dispose();

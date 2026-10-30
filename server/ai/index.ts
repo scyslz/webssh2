@@ -1,4 +1,5 @@
 import { WebSocket } from 'ws';
+import { createHash, randomUUID } from 'node:crypto';
 import { sshLog } from '../lib.ts';
 import { execCapture } from '../remote-exec.ts';
 import { publicAiConfig, resolveAiConfig } from './config.ts';
@@ -11,8 +12,14 @@ import {
   createApprovalMemory,
   runAgentLoop,
 } from './agent-loop.ts';
-import { buildAgentToolMessages, buildDiagnoseMessages, buildDraftMessages } from './prompts.ts';
-import { AiProviderError, streamChatCompletion } from './provider.ts';
+import {
+  agentHistoryBudgets,
+  buildAgentToolMessages,
+  buildDiagnoseMessages,
+  buildDraftMessages,
+  buildPriorHistoryMessages,
+} from './prompts.ts';
+import { AiProviderError, cachedTokens, promptTokens, reasoningTokens, streamChatCompletion, type StreamUsage } from './provider.ts';
 import type { AgentIdentity } from './tools.ts';
 
 /**
@@ -75,7 +82,7 @@ interface ActiveRequest {
  */
 type AiHistoryEntry =
   | { kind: 'user'; text: string; withScreen: boolean; at: number }
-  | { kind: 'text'; answer: string; error?: string; aborted?: boolean; at: number }
+  | { kind: 'text'; answer: string; error?: string; aborted?: boolean; usage?: StreamUsage; model?: string; chars?: number; at: number }
   | {
       kind: 'agent';
       goal: string;
@@ -86,6 +93,8 @@ type AiHistoryEntry =
       aborted?: boolean;
       stopReason?: string;
       steps?: number;
+      /** 整轮 agent 的 usage 汇总（含 prompt cache 命中数） */
+      usage?: StreamUsage;
       /** run 开始时间（epoch ms）。卡片据此显示起始时间，刷新/接管后也算得出耗时 */
       at: number;
       /** 服务端实测总耗时（完成后才有）。历史回放时用来显示「took Xs」 */
@@ -107,6 +116,14 @@ type AiHistoryEntry =
  */
 interface AiSession {
   sessionId: string;
+  /**
+   * 稳定的 prompt-cache 路由键，跟着 SSH 会话走。
+   *
+   * 同一个会话的 diagnose / draft / agent 全部复用它 —— 网关据此把请求
+   * 路由到同一份前缀缓存；用 sessionId 哈希而不是原值，避免把会话标识
+   * 直接写进上游日志。
+   */
+  cacheKey: string;
   sockets: Set<WebSocket>;
   active: ActiveRequest | null;
   /**
@@ -132,12 +149,20 @@ interface AiSession {
   /** 单会话的对话历史，新连接 attach 时回放 */
   history: AiHistoryEntry[];
   /**
-   * AI 面板是否处于打开状态（会话级，跨连接）。
+   * AI 面板是否处于打开状态（会话级，服务端权威）。
    *
-   * 前端开关面板时上报，服务端记住。新连接（重连 / 别的设备接管）attach 时回放这个
-   * 状态：接管方据此自动打开面板 —— 不用去猜「原设备刚才开没开」。
+   * 前端开关面板时上报，服务端记住。网络断开/接管/刷新时都以这里为准：
+   * true 就恢复面板，false 就不开。只有明确 close（AI 面板 X / 终端 tab 关闭）
+   * 才会在置 false 的同时清空 history。
    */
   panelOpen: boolean;
+  /**
+   * 最近一次把面板打开的那个客户端（前端 tab.id），仅用于归属记录/日志。
+   *
+   * 面板开关本身是**服务端权威**的：接管/恢复按 `panelOpen` 决定；不要用这个字段
+   * 去阻止别的客户端恢复（之前就是因为拿它当过滤条件，导致接管不恢复）。
+   */
+  panelClientId?: string;
 }
 
 const AI_BUFFER_MAX_BYTES = 512 * 1024;
@@ -166,8 +191,11 @@ function pushHistory(session: AiSession, entry: AiHistoryEntry): void {
 }
 
 export function createAiSession(sessionId: string): AiSession {
+  // 没有 SSH 会话的只读连接拿一个随机 key，避免所有匿名连接共享同一条缓存路径。
+  const cacheSeed = sessionId || `anon-${randomUUID()}`;
   return {
     sessionId,
+    cacheKey: `webssh2-${createHash('sha256').update(cacheSeed).digest('hex').slice(0, 32)}`,
     sockets: new Set(),
     active: null,
     respondApproval: null,
@@ -346,6 +374,7 @@ export function handleAiConnection(ws: WebSocket, hooks?: AiSshHooks, sessionIdF
     resumedKind: session.active?.kind ?? null,
     resumedStartedAt: session.active?.startedAt ?? null,
     panelOpen: session.panelOpen,
+    panelClientId: session.panelClientId || '',
   }));
   if (session.history.length) {
     // 历史先于 resumed 发：接管方先拿到完整快照，再据 agent_start 认回「正在跑」的那条，
@@ -388,6 +417,10 @@ export function handleAiConnection(ws: WebSocket, hooks?: AiSshHooks, sessionIdF
  * 拆出来是为了「有 sessionId」和「无 sessionId 的临时连接」两条路径共用同一套消息处理。
  */
 function attachSocket(session: AiSession, ws: WebSocket, hooks?: AiSshHooks) {
+  // 临时会话（没有 sessionId，例如没连终端时只用只读诊断）也要登记自己：
+  // makeSessionSend 是按 session.sockets 广播的，不登记就只会收到 ready，
+  // prepared/delta/done 全都发不出去。
+  session.sockets.add(ws);
   const send = makeSessionSend(session);
 
   ws.on('message', (raw: Buffer | string) => {
@@ -416,29 +449,98 @@ function attachSocket(session: AiSession, ws: WebSocket, hooks?: AiSshHooks) {
 
       case 'ai_panel_open':
       case 'ai_panel_close': {
-        // 面板开关是会话级状态：一个设备打开/关闭，要同步给其它设备（含之后接入的）。
+        /**
+         * 面板开关是**服务端权威**的会话状态。
+         *
+         * - open：记 panelOpen=true，并记录最后打开它的 clientId（仅归属/日志）。
+         * - close：任何客户端都可以明确关闭（AI 面板 X / 终端 tab 关闭）；服务端
+         *   置 false 并广播，所有观察者一起收敛。
+         * - close 带 `clearHistory: true` 时**同时清空历史**；网络断开、组件被动卸载、
+         *   重连时的状态同步 close 都不带这个标志，历史必须留着等恢复/接管回放。
+         * - 之前的 bug 不是「广播」本身，而是 close 在 socket 未连上时被丢掉，
+         *   服务端残留 open=true，接管方读到了假状态。前端现在会排队补发 close。
+         */
+        const clientId = typeof message.clientId === 'string'
+          ? message.clientId.trim().slice(0, 128)
+          : '';
         const open = message.type === 'ai_panel_open';
-        sshLog('ai panel state', { sessionId: session.sessionId, open });
-        if (session.panelOpen !== open) {
+
+        const ownerChanged = open && Boolean(clientId) && session.panelClientId !== clientId;
+        // close 的广播带「谁关的」，方便排查；前端不再按它过滤。
+        const closedBy = open ? '' : (clientId || session.panelClientId || '');
+        if (open && clientId) session.panelClientId = clientId;
+
+        if (session.panelOpen !== open || ownerChanged) {
           session.panelOpen = open;
-          // 广播给所有观察者；发送方自己收到也无妨（幂等）
+          if (!open) session.panelClientId = undefined;
+          sshLog('ai panel state', {
+            sessionId: session.sessionId,
+            open,
+            clientId: open ? (session.panelClientId || '') : closedBy,
+            ownerChanged,
+          });
+          // 广播带 clientId：前端按自己的 clientId 过滤，不属于自己的直接丢弃。
+          const frame = JSON.stringify({
+            type: 'ai_panel_state',
+            open,
+            clientId: open ? (session.panelClientId || '') : closedBy,
+          });
           for (const socket of session.sockets) {
-            if (socket.readyState === WebSocket.OPEN) {
-              socket.send(JSON.stringify({ type: 'ai_panel_state', open }));
-            }
+            if (socket.readyState === WebSocket.OPEN) socket.send(frame);
           }
+        }
+
+        /**
+         * 明确关闭（AI 面板的 X）才清历史；网络断开、组件被动卸载、状态同步的 close
+         * 都不带 clearHistory，服务端必须保留历史，等下次恢复/接管回放。
+         *
+         * 有正在跑的 run 时先 abort：否则 run 会继续往 record/history 里写，
+         * 刚清空的历史马上又被填回来。
+         */
+        if (!open && message.clearHistory === true) {
+          const autoApproveCleared = Boolean(session.approvalMemory);
+          session.active?.controller.abort();
+          session.active = null;
+          session.respondApproval?.('', false);
+          session.respondApproval = null;
+          session.pendingApprovalInfo = null;
+          // 清上下文同时撤销「Approve Session」的自动放行记忆：
+          // 新对话不应继承上一段对话攒下来的免审批授权。
+          session.approvalMemory = null;
+          session.history = [];
+          session.buffer = [];
+          session.bufferBytes = 0;
+          send({ type: 'cleared' });
+          sshLog('ai panel closed with history cleared', {
+            sessionId: session.sessionId,
+            clientId,
+            autoApproveCleared,
+          });
         }
         return;
       }
 
-      case 'clear':
-        // 清空这条 AI 会话的对话历史与事件缓冲。历史按 SSH 会话存，
-        // 不清的话接管设备还会看到刚被「清空」的内容。
+      case 'clear': {
+        /**
+         * Reset 语义：清空这条 AI 会话的上下文（历史 + 事件缓冲），但**不关面板**。
+         * 有正在跑的 run 先 abort，否则 run 会继续往刚清空的 history 里写。
+         * 同时撤销 approvalMemory（Approve Session 的自动放行）——新上下文不应
+         * 继承上一段对话攒下来的免审批授权。
+         */
+        const autoApproveCleared = Boolean(session.approvalMemory);
+        session.active?.controller.abort();
+        session.active = null;
+        session.respondApproval?.('', false);
+        session.respondApproval = null;
+        session.pendingApprovalInfo = null;
+        session.approvalMemory = null;
         session.history = [];
         session.buffer = [];
         session.bufferBytes = 0;
         send({ type: 'cleared' });
+        sshLog('ai context reset', { sessionId: session.sessionId, autoApproveCleared });
         return;
+      }
 
       case 'cancel':
         if (session.active && (!message.id || session.active.id === message.id)) {
@@ -527,6 +629,7 @@ async function runDiagnose(
       messages: buildDiagnoseMessages(prepared),
       signal: controller.signal,
       onDelta: pushDelta,
+      cacheKey: state.cacheKey,
     });
 
     buffer.stop();
@@ -542,7 +645,14 @@ async function runDiagnose(
       ms: Date.now() - startedAt,
       chars: outcome.chars,
     });
-    pushHistory(state, { kind: 'text', answer: answerText, at: startedAt });
+    pushHistory(state, {
+      kind: 'text',
+      answer: answerText,
+      usage: outcome.usage,
+      model: outcome.model || config.model,
+      chars: answerText.length,
+      at: startedAt,
+    });
 
     // 只记元信息，绝不记内容
     sshLog('ai diagnose done', {
@@ -555,6 +665,9 @@ async function runDiagnose(
       firstTokenMs: outcome.firstTokenMs,
       ms: Date.now() - startedAt,
       chars: outcome.chars,
+      promptTokens: promptTokens(outcome.usage),
+      cachedTokens: cachedTokens(outcome.usage),
+      reasoningEffort: config.reasoningEffort,
     });
   } catch (err: any) {
     buffer.stop();
@@ -627,6 +740,7 @@ async function runDraft(
       messages: buildDraftMessages(prepared),
       signal: controller.signal,
       onDelta: collect,
+      cacheKey: state.cacheKey,
     });
 
     buffer.stop();
@@ -698,6 +812,9 @@ async function runDraft(
       rootSession: grade.rootSession,
       selfRisk: draft.selfRisk ?? 'none',
       chars: outcome.chars,
+      promptTokens: promptTokens(outcome.usage),
+      cachedTokens: cachedTokens(outcome.usage),
+      reasoningEffort: config.reasoningEffort,
       ms: Date.now() - startedAt,
     });
   } catch (err: any) {
@@ -835,6 +952,20 @@ async function runAgent(
     items: [],
     at: startedAt,
   };
+
+  /**
+   * 跨轮上下文：**先**从服务端会话历史构建，再把本轮 user/record 入库。
+   *
+   * 以前只透传客户端的纯文字 history —— 工具结果全丢，agent 被打断后
+   * 「继续」等于失忆，同一批文件会再读一遍，还容易停在「正在封装」的
+   * 意向陈述上。服务端 history 含 items（工具 + 输出），优先用它；
+   * 客户端 history 仅在服务端为空时兜底（旧会话 / 刚 clear）。
+   */
+  const historyBudgets = agentHistoryBudgets(config);
+  const serverPriorHistory = buildPriorHistoryMessages(state.history, historyBudgets.priorChars);
+  const clientPriorHistory = Array.isArray(message.history) ? message.history : [];
+  const priorHistory = serverPriorHistory.length > 0 ? serverPriorHistory : clientPriorHistory;
+
   pushHistory(state, { kind: 'user', text: raw.question || '', withScreen: Boolean(raw.text.trim()), at: startedAt });
   pushHistory(state, record);
 
@@ -857,7 +988,7 @@ async function runAgent(
         goal: raw.question,
         prepared,
         maxSteps,
-        history: Array.isArray(message.history) ? message.history : undefined,
+        history: priorHistory,
       }),
       client: session.client,
       whitelist: config.commandWhitelist,
@@ -865,6 +996,8 @@ async function runAgent(
       maxSteps,
       signal: controller.signal,
       approvalMemory,
+      cacheKey: state.cacheKey,
+      historyCharBudget: historyBudgets.loopChars,
       events: {
         onStep: (step) => send({ type: 'agent_step', id, step }),
         onMessage: (content) => {
@@ -947,6 +1080,7 @@ async function runAgent(
     record.stopReason = result.stopReason;
     record.steps = result.steps;
     record.ms = Date.now() - startedAt;
+    record.usage = result.usage;
     send({
       type: 'agent_done',
       id,
@@ -955,6 +1089,7 @@ async function runAgent(
       stopReason: result.stopReason,
       toolCalls: result.toolCalls,
       ms: record.ms,
+      usage: result.usage,
     });
 
     sshLog('ai agent done', {
@@ -963,6 +1098,11 @@ async function runAgent(
       toolCalls: result.toolCalls,
       stopReason: result.stopReason,
       ms: Date.now() - startedAt,
+      promptTokens: promptTokens(result.usage),
+      cachedTokens: cachedTokens(result.usage),
+      completionTokens: result.usage?.completion_tokens,
+      reasoningTokens: reasoningTokens(result.usage),
+      reasoningEffort: config.reasoningEffort,
     });
   } catch (err: any) {
     const aborted = controller.signal.aborted;

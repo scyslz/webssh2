@@ -14,15 +14,19 @@ export interface AiConfigView {
   endpoint: string;
   hasKey: boolean;
   keyFromEnv: boolean;
+  /** 模型上下文窗口（总输入 token 预算） */
+  contextWindowTokens: number;
   maxInputTokens: number;
   maxOutputTokens: number;
+  /** auto = 不显式发送，沿用端点默认；off = 明确关闭思考 */
+  reasoningEffort: 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max';
   redactPrivateIp: boolean;
   commandWhitelist: string[];
 }
 
 export type AiRiskLevel = 'safe' | 'caution' | 'dangerous';
 
-/** 发给服务端的对话历史（纯文字，用于让 Agent 延续上下文）。role 限定为两端都会用的两个 */
+/** 发给服务端的对话历史（用于让 Agent 延续上下文）。role 限定为两端都会用的两个 */
 export type ChatMessage = { role: 'user' | 'assistant'; content: string };
 
 export interface AiGradeHit {
@@ -132,6 +136,51 @@ export interface AiAgentIdentity {
   isRoot: boolean;
 }
 
+/** 服务端原样透传的 usage。缓存字段的落点在不同网关不一样，见 cachedTokenCount */
+export interface AiUsage {
+  prompt_tokens?: number;
+  input_tokens?: number;
+  completion_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  prompt_cache_hit_tokens?: number;
+  prompt_cache_miss_tokens?: number;
+  cached_tokens?: number;
+  cache_read_input_tokens?: number;
+  completion_thinking_tokens?: number;
+  prompt_tokens_details?: { cached_tokens?: number };
+  input_tokens_details?: { cached_tokens?: number };
+  completion_tokens_details?: { reasoning_tokens?: number };
+}
+
+/** prompt 总数：兼容 chat 与 responses 两种 usage 形状 */
+export function promptTokenCount(usage?: AiUsage): number | undefined {
+  return usage?.prompt_tokens ?? usage?.input_tokens;
+}
+
+/** 缓存命中 token 数；undefined = 端点没报这个字段，不等于 0 命中 */
+export function cachedTokenCount(usage?: AiUsage): number | undefined {
+  const candidates = [
+    usage?.prompt_tokens_details?.cached_tokens,
+    usage?.input_tokens_details?.cached_tokens,
+    usage?.prompt_cache_hit_tokens,
+    usage?.cached_tokens,
+    usage?.cache_read_input_tokens,
+  ].filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+  if (candidates.length === 0) return undefined;
+  return candidates.find((value) => value > 0) ?? 0;
+}
+
+/** 推理 token；不同网关放在 completion_tokens_details 或顶层 completion_thinking_tokens */
+export function reasoningTokenCount(usage?: AiUsage): number | undefined {
+  const candidates = [
+    usage?.completion_tokens_details?.reasoning_tokens,
+    usage?.completion_thinking_tokens,
+  ].filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+  if (candidates.length === 0) return undefined;
+  return candidates.find((value) => value > 0) ?? 0;
+}
+
 export interface AiAgentDone {
   answer: string;
   steps: number;
@@ -139,6 +188,8 @@ export interface AiAgentDone {
   stopReason: 'final' | 'max-steps' | 'cancelled';
   toolCalls: number;
   ms?: number;
+  /** 整轮 agent 的 usage 汇总 */
+  usage?: AiUsage;
 }
 
 /**
@@ -176,7 +227,7 @@ export interface AiDiagnoseRequest {
 
 export interface AiDoneMeta {
   model?: string;
-  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+  usage?: AiUsage;
   finishReason?: string;
   firstTokenMs?: number;
   ms?: number;
@@ -196,6 +247,11 @@ export interface AiHistoryEntry {
   final?: string;
   stopReason?: string;
   steps?: number;
+  /** 文本/agent 完成时的 usage（含缓存命中），历史回放后仍能显示 */
+  usage?: AiUsage;
+  model?: string;
+  /** 文本回答的字符数（历史回放用） */
+  chars?: number;
   /** 条目创建时间（epoch ms），由服务端给，刷新/接管后仍在 */
   at?: number;
   /** agent run 的服务端实测总耗时（完成后才有） */
@@ -263,6 +319,14 @@ export class AiWSClient {
    *  - 断线后自动重连，服务端会把断开期间缓冲的事件重放回来，用户看到同一条跑动中的会话。
    */
   private sessionId = '';
+  /** 本客户端（浏览器 tab）的稳定标识；服务端用来记录面板归属/日志，不作为过滤条件 */
+  private clientId = '';
+  /** 最近一次本地面板意图；断线时先记住，连上再发 */
+  private panelDesired: boolean | null = null;
+  /** 本次 close 是否要求服务端同时清空对话历史（AI 面板 X 触发，一次性） */
+  private panelClearPending = false;
+  /** Reset 意图：断线时先记住，连上后补发，收到 cleared 才算完成 */
+  private resetPending = false;
   private reconnectTimer: number | null = null;
   private closedByUser = false;
 
@@ -291,11 +355,12 @@ export class AiWSClient {
   /** 服务端确认历史已清空 */
   onCleared?: () => void;
   /**
-   * 面板开关状态（会话级，跨设备同步）。
+   * 面板开关状态（以服务端为准）。
    *
    * - 建连后的 ready 帧会带一次当前状态；
-   * - 任一设备切换面板时广播。
-   * 前端据此自动打开/关闭面板，实现「重连或接管后延续原设备的面板状态」。
+   * - 任一设备切换面板时服务端广播，这里据此自动开/关。
+   * 唯一例外：本机刚刚明确关掉（panelDesired === false）时，忽略晚到的 open，
+   * 避免 close 还在路上又被拉起来。
    */
   onPanelState?: (open: boolean) => void;
 
@@ -305,6 +370,11 @@ export class AiWSClient {
    */
   setPassiveHandlers(handlers: AiHandlers) {
     this.passiveHandlers = handlers || {};
+  }
+
+  /** 设置本客户端（tab）标识；必须在 connect 前调用，供面板状态归属判断 */
+  setClientId(clientId: string | undefined) {
+    this.clientId = clientId || '';
   }
 
   /** 绑定 / 更新目标 SSH 会话。变了就断开重连到新的 AI 会话 */
@@ -344,6 +414,10 @@ export class AiWSClient {
         clearTimeout(timer);
         this.startPing();
         this.handlers.onStatus?.('open');
+        // 面板可能在断线期间被开关；连上后把最新意图补发一次。
+        // 这一步必须在 resolve 之前：调用方的 connect().then(...) 不该再硬编码 true。
+        if (this.panelDesired !== null) this.sendPanelState();
+        if (this.resetPending) this.sendReset();
         resolve();
       };
 
@@ -398,15 +472,21 @@ export class AiWSClient {
     if (message.type === 'ready' || message.type === 'config') {
       if (message.config) this.onConfig?.(message.config);
       /*
-       * ready 帧带回当前面板开关状态，但**只在 true 时**通知上层打开面板。
+       * ready 帧带回当前面板开关状态，但**只在 true 且 owner 是本客户端时**
+       * 通知上层打开面板。
        *
-       * 不能在 false 时触发「关闭」：新 tab 刚刚挂载面板时，自己的 ai_panel_open
-       * 还没送到服务端，ready 里的 panelOpen 仍是上一次的 false —— 若据此关闭，
-       * 面板会「刚弹出就被卸载」，然后再被用户点开，表现为挂载两次。
-       * 真正的「别人关掉了面板」由运行时的 ai_panel_state 广播表达，不走这里。
+       * - false 不触发关闭：新 tab 刚挂载面板时，自己的 ai_panel_open 还没送到，
+       *   ready 里的 panelOpen 仍是上一次的 false；据此关闭会「刚弹出就被卸载」。
+       *   真正的关闭由本客户端的 ai_panel_close / 广播表达。
+       * - owner 不是自己也不开：别的设备打开的面板不能把本机已关的面板拉起来。
        */
       if (message.type === 'ready' && message.panelOpen === true) {
-        this.onPanelState?.(true);
+        // 本地明确关着（panelDesired === false）时，服务端的 open 可能是 close 丢失
+        // 留下的陈旧值；不能因为它把面板重新拉起来。
+        // 其它情况以服务端为准：网络恢复/接管后按服务端记录恢复。
+        if (this.panelDesired !== false) {
+          this.onPanelState?.(true);
+        }
       }
       // ready 里带着「有一条 run 在跑」的信息。agent 走随后的 agent_start 认回；
       // 非 agent（diagnose/draft）没有 agent_start，这里直接通知面板建 text entry。
@@ -424,9 +504,12 @@ export class AiWSClient {
     }
     if (message.type === 'pong') return;
 
-    // 面板开关状态变化（别的设备打开/关闭了）
+    // 面板开关状态变化。以服务端为准：别的设备真的打开了，这里也跟着开；
+    // 但如果本机刚明确关掉（close 还在路上），忽略晚到的 open，避免来回拉。
     if (message.type === 'ai_panel_state') {
-      this.onPanelState?.(message.open === true);
+      const open = message.open === true;
+      if (open && this.panelDesired === false) return;
+      this.onPanelState?.(open);
       return;
     }
 
@@ -436,6 +519,9 @@ export class AiWSClient {
       return;
     }
     if (message.type === 'cleared') {
+      // 服务端确认历史已清；到这里才认为 Reset / 明确 close 清历史完成。
+      this.resetPending = false;
+      this.panelClearPending = false;
       this.onCleared?.();
       return;
     }
@@ -606,6 +692,7 @@ export class AiWSClient {
             : 'final') as AiAgentDone['stopReason'],
           toolCalls: Number(message.toolCalls) || 0,
           ms: typeof message.ms === 'number' ? message.ms : undefined,
+          usage: message.usage,
         });
         return;
       case 'agent_error':
@@ -663,10 +750,11 @@ export class AiWSClient {
    * 会持续收到 tool_call / tool_result / approval_required，最后才是 done。
    * 中途要表态就通过 `handlers.onAgentApproval`。
    *
-   * @param sessionId 要借用的 SSH 会话。Agent 复用**当前这个终端 tab** 的连接，
-   *                  不给就跑不起来 —— 一个只会思考不能执行的 Agent 没有意义。
-   * @param history 同一条对话里前几轮的问答（纯文字），让模型延续上下文。
-   */
+    * @param sessionId 要借用的 SSH 会话。Agent 复用**当前这个终端 tab** 的连接，
+    *                  不给就跑不起来 —— 一个只会思考不能执行的 Agent 没有意义。
+    * @param history 同一条对话里前几轮的上下文（含截断后的工具摘要），让模型延续上下文。
+    *                服务端有自己的会话级 history 时优先用服务端的，这里作兜底。
+    */
   async agent(
     request: AiDiagnoseRequest,
     options: { sessionId: string; maxSteps: number; history?: ChatMessage[] },
@@ -709,16 +797,51 @@ export class AiWSClient {
     return id;
   }
 
-  /** 让服务端清空这条会话的对话历史（与本地清空配套） */
+  /**
+   * Reset 语义：让服务端清空这条会话的上下文（对话历史 + 事件缓冲），面板保持打开。
+   * 与「关闭面板」区分：隐藏/关闭都不清历史，只有这个 Reset 动作才清。
+   */
   clearHistory() {
-    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'clear' }));
+    this.resetPending = true;
+    this.sendReset();
   }
 
-  /** 上报面板开关状态（会话级，服务端记住并同步给其它设备） */
-  setPanelOpen(open: boolean) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: open ? 'ai_panel_open' : 'ai_panel_close' }));
-    }
+  private sendReset() {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'clear' }));
+    // pending 等服务端 `cleared` 再清；断线时 onopen 会补发。
+  }
+
+  /**
+   * 上报面板开关状态（服务端权威，clientId 仅用于归属/日志）。
+   *
+   * 即使当前 socket 没连上也先记住意图：connect 的 onopen 会补发。
+   * 否则「面板刚挂载就开始连、用户在连上之前点关闭」会丢掉 close，
+   * 服务端仍停在 open=true，下一个设备接管时就会莫名弹出面板。
+   *
+   * `clearHistory` 只在 AI 面板的 X（明确关闭）时传 true：网络断开/组件被动卸载
+   * 只同步开关，不碰历史；history 要留到明确 close 才清。
+   */
+  setPanelOpen(open: boolean, clearHistory = false) {
+    const clearing = !open && clearHistory;
+    const changed = this.panelDesired !== open || (clearing && !this.panelClearPending);
+    this.panelDesired = open;
+    if (open) this.panelClearPending = false;
+    else if (clearing) this.panelClearPending = true;
+    if (!changed) return;
+    this.sendPanelState();
+  }
+
+  private sendPanelState() {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    const payload: Record<string, unknown> = {
+      type: this.panelDesired ? 'ai_panel_open' : 'ai_panel_close',
+      clientId: this.clientId,
+    };
+    if (this.panelClearPending) payload.clearHistory = true;
+    this.ws.send(JSON.stringify(payload));
+    // pending 不在这里清：等服务端回 `cleared` 再清。否则 send 刚出去连接就断，
+    // 清历史的动作会永久丢失，和之前丢 close 是同一类问题。
   }
 
   /** 一次 run 结束（done/error）：只清跟踪态，不动别人的 handlers */
@@ -778,7 +901,7 @@ export async function fetchAiConfig(): Promise<AiConfigView> {
 }
 
 export async function saveAiConfig(
-  patch: Partial<Pick<AiConfigView, 'enabled' | 'baseUrl' | 'model' | 'redactPrivateIp' | 'maxInputTokens' | 'maxOutputTokens' | 'commandWhitelist'>>,
+  patch: Partial<Pick<AiConfigView, 'enabled' | 'baseUrl' | 'model' | 'reasoningEffort' | 'redactPrivateIp' | 'contextWindowTokens' | 'maxInputTokens' | 'maxOutputTokens' | 'commandWhitelist'>>,
   apiKey?: string | null,
 ): Promise<AiConfigView> {
   const body: Record<string, unknown> = { ...patch };
@@ -798,7 +921,14 @@ export async function testAiConfig(): Promise<{ ok: boolean; message: string; mo
   return res.json();
 }
 
-export async function fetchAiModels(opts?: { baseUrl?: string; apiKey?: string }): Promise<{ ok: boolean; models?: string[]; message?: string }> {
+/**
+ * 拉取端点支持的模型列表。
+ * 传当前表单里的 baseUrl / 未保存的 apiKey，首次配置时也能先 Fetch 再 Save。
+ */
+export async function fetchAiModels(opts?: {
+  baseUrl?: string;
+  apiKey?: string;
+}): Promise<{ ok: boolean; models?: string[]; message?: string }> {
   const res = await apiFetch(apiUrl('/ai/models'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

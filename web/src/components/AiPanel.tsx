@@ -12,7 +12,8 @@ import {
   ShieldAlert,
   Sparkles,
   Square,
-  Trash2,
+  EyeOff,
+  RotateCcw,
   Monitor,
   X,
 } from 'lucide-react';
@@ -22,6 +23,9 @@ import {
   fetchAiModels,
   saveAiConfig,
   testAiConfig,
+  cachedTokenCount,
+  promptTokenCount,
+  reasoningTokenCount,
   type AiAgentApproval,
   type AiAgentDone,
   type AiConfigView,
@@ -29,6 +33,7 @@ import {
   type AiDoneMeta,
   type AiDraft,
   type AiRiskLevel,
+  type AiUsage,
   type TerminalBridge,
   type AiAgentIdentity,
   type ChatMessage,
@@ -63,6 +68,10 @@ interface AiPanelProps {
   target?: { host?: string; username?: string; cwd?: string };
   /** 当前 tab 的 SSH 会话 id。Agent 复用这个会话执行工具。 */
   sessionId?: string;
+  /** 当前浏览器 tab 的稳定 id，用于把面板开关状态限定在本客户端 */
+  clientId?: string;
+  /** 本地面板是否打开（用户意图）。变化时同步给服务端；关闭后面板仍挂载保活 */
+  open?: boolean;
   /** 现取终端上下文：有选区取选区，否则取末尾若干行。是函数不是快照 */
   getContext?: () => { text: string; source: 'selection' | 'tail' } | null;
   /** 目标终端的 SSH 连接是否就绪；没连上就只能走只读诊断 */
@@ -124,6 +133,19 @@ const describeCall = (item: Extract<AgentItem, { kind: 'tool' }>): string => {
   return args.length > 300 ? `${args.slice(0, 300)}…` : (args || '(no arguments)');
 };
 
+/** 跨轮 history 里的单条工具摘要。未执行的不算事实；输出截断防历史爆预算 */
+const PRIOR_TOOL_HISTORY_CHARS = 1600;
+const toolItemHistorySummary = (item: Extract<AgentItem, { kind: 'tool' }>): string | null => {
+  if (item.status === 'awaiting' || item.status === 'pending' || item.status === 'running') return null;
+  const output = item.output || '';
+  if (!output) return null;
+  const display = describeCall(item);
+  const snippet = output.length > PRIOR_TOOL_HISTORY_CHARS
+    ? `${output.slice(0, PRIOR_TOOL_HISTORY_CHARS)}\n…[truncated in history; re-read the source if you need the rest]…`
+    : output;
+  return `earlier tool call: ${item.tool} ${display}\n${snippet}`;
+};
+
 const clipOutput = (text: string) => {
   if (text.length <= AGENT_OUTPUT_CLIP_CHARS) return text;
   const head = Math.floor(AGENT_OUTPUT_CLIP_CHARS * 0.6);
@@ -150,6 +172,33 @@ const formatElapsed = (ms: number) => {
   if (s < 60) return `${s}s`;
   const m = Math.floor(s / 60);
   return `${m}m${String(s % 60).padStart(2, '0')}s`;
+};
+
+const formatTokens = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n));
+
+/**
+ * 一行 usage：总 token / 缓存命中率 / 思考 token。
+ *
+ * 缓存命中率用「命中数 ÷ prompt 总数」算，而不是 total_tokens —— 后者含输出，
+ * 会把比例稀释成一个看起来很低的数字。端点不报缓存字段时整段省略，
+ * 不显示「0%」误导人。
+ */
+const usageSummary = (usage?: AiUsage): string => {
+  if (!usage) return '';
+  const parts: string[] = [];
+  const total = usage.total_tokens
+    || ((promptTokenCount(usage) ?? 0) + (usage.completion_tokens ?? usage.output_tokens ?? 0));
+  if (total > 0) parts.push(`${formatTokens(total)} tokens`);
+
+  const prompt = promptTokenCount(usage);
+  const cached = cachedTokenCount(usage);
+  if (prompt && cached !== undefined) {
+    parts.push(`cache ${Math.round((cached / prompt) * 100)}% (${formatTokens(cached)}/${formatTokens(prompt)})`);
+  }
+
+  const reasoning = reasoningTokenCount(usage);
+  if (reasoning) parts.push(`reasoning ${formatTokens(reasoning)}`);
+  return parts.join(' · ');
 };
 
 /** 卡片起始时间的时钟显示（本地时区，HH:MM:SS） */
@@ -261,7 +310,10 @@ const historyToEntry = (e: AiHistoryEntry, index: number): ChatEntry => {
     return { id, kind: 'user', text: e.text || '', withScreen: Boolean(e.withScreen), at: e.at };
   }
   if (e.kind === 'text') {
-    return { id, kind: 'text', answer: e.answer || '', error: e.error, aborted: e.aborted, streaming: false, at: e.at };
+    return {
+      id, kind: 'text', answer: e.answer || '', error: e.error, aborted: e.aborted, streaming: false, at: e.at,
+      meta: e.usage || e.model ? { usage: e.usage, model: e.model, chars: e.chars } : undefined,
+    };
   }
   if (e.kind === 'agent') {
     const items: AgentItem[] = (e.items || []).map((it, i): AgentItem => {
@@ -298,7 +350,7 @@ const historyToEntry = (e: AiHistoryEntry, index: number): ChatEntry => {
       // 历史里这条 run 若已完成，runStartedAt 就是它的起点；未完成时接管方会由
       // resumed 的 startedAt 覆盖，所以这里统一用 at 兜底。
       runStartedAt: e.at,
-      meta: e.ms !== undefined ? { ms: e.ms } : undefined,
+      meta: e.ms !== undefined || e.usage ? { ms: e.ms, usage: e.usage } : undefined,
     };
   }
   // text
@@ -397,6 +449,8 @@ export const AiPanel: React.FC<AiPanelProps> = ({
   theme,
   target,
   sessionId,
+  clientId,
+  open = true,
   getContext,
   terminalConnected = false,
   onRunCommand,
@@ -423,6 +477,14 @@ export const AiPanel: React.FC<AiPanelProps> = ({
   // 表单
   const [formBaseUrl, setFormBaseUrl] = useState('');
   const [formModel, setFormModel] = useState('');
+  const [formReasoning, setFormReasoning] = useState<AiConfigView['reasoningEffort']>('auto');
+  const [formContextWindow, setFormContextWindow] = useState('128000');
+  const [formMaxInput, setFormMaxInput] = useState('8000');
+  const [formMaxOutput, setFormMaxOutput] = useState('2000');
+  const [modelOptions, setModelOptions] = useState<string[]>([]);
+  const [fetchingModels, setFetchingModels] = useState(false);
+  const [modelsError, setModelsError] = useState<string | null>(null);
+  const modelListId = `ai-models-${clientId || 'default'}`;
   const [formApiKey, setFormApiKey] = useState('');
   const [formRedactIp, setFormRedactIp] = useState(false);
   const [formWhitelist, setFormWhitelist] = useState('');
@@ -448,10 +510,6 @@ export const AiPanel: React.FC<AiPanelProps> = ({
     setMaxSteps(v);
     try { globalSet('webssh_ai_maxsteps', String(v)); } catch {}
   }, []);
-  const [modelOptions, setModelOptions] = useState<string[]>([]);
-  const [fetchingModels, setFetchingModels] = useState(false);
-  const [modelsError, setModelsError] = useState<string | null>(null);
-
   // draft 的高风险二次确认
   const [confirmRun, setConfirmRun] = useState<{ sessionId: string; entryId: string } | null>(null);
 
@@ -497,6 +555,8 @@ export const AiPanel: React.FC<AiPanelProps> = ({
   const followedRunRef = useRef<{ id: string; kind: 'diagnose' | 'draft' } | null>(null);
   /** 跟随流已落地的 text entry id（首个 delta 到达时惰性创建） */
   const followedTextEntryRef = useRef<string | null>(null);
+  /** 本机 diagnose/draft 发出的 text entry id：Stop 时要把 streaming 收掉 */
+  const activeTextEntryRef = useRef<string | null>(null);
   /** 供 client 初始化 effect 调用（effect 早于下面的 useCallback 定义跑） */
   const appendEntryRef = useRef<(entry: ChatEntry) => void>(() => {});
   const patchEntryRef = useRef<(entryId: string, patch: Partial<ChatEntry>) => void>(() => {});
@@ -548,6 +608,10 @@ export const AiPanel: React.FC<AiPanelProps> = ({
     setConfig(next);
     setFormBaseUrl(next.baseUrl);
     setFormModel(next.model);
+    setFormReasoning(next.reasoningEffort || 'auto');
+    setFormContextWindow(String(next.contextWindowTokens || 128000));
+    setFormMaxInput(String(next.maxInputTokens || 8000));
+    setFormMaxOutput(String(next.maxOutputTokens || 2000));
     setFormRedactIp(next.redactPrivateIp);
     setFormWhitelist((next.commandWhitelist || []).join(', '));
   }, []);
@@ -742,7 +806,7 @@ export const AiPanel: React.FC<AiPanelProps> = ({
         lastAgentEntryRef.current = null;
         if (target) patchEntryRef.current(target, {
           final: payload.answer, stopReason: payload.stopReason, steps: payload.steps, streaming: false,
-          meta: { ms: payload.ms },
+          meta: { ms: payload.ms, usage: payload.usage },
         });
         endRunRef.current();
       },
@@ -756,6 +820,9 @@ export const AiPanel: React.FC<AiPanelProps> = ({
     });
     // 绑定当前 tab 的 SSH 会话：/ai 连接据此 attach 到对应 AI 会话，
     // 服务端断连期间继续跑、缓冲事件，这里重连后自动接回（同一条会话）。
+    // clientId 用来让服务端区分「面板状态是哪个 tab 的」：别的设备接管时
+    // 不会因为服务端还记着 open 就把本机面板硬拉起来。
+    client.setClientId(clientId);
     client.setSession(sessionId);
     clientRef.current = client;
 
@@ -763,11 +830,10 @@ export const AiPanel: React.FC<AiPanelProps> = ({
       .then((next) => { if (!cancelled) applyConfig(next); })
       .catch((err) => { if (!cancelled) setConfigError(err.message || 'Failed to load config'); });
 
-    // 本组件挂载 = 面板打开：连上后上报（服务端广播给其它设备）。
-    // 断开时在 cleanup 上报 close —— 但要注意仅当连接已建立，否则发不出去也无所谓。
-    const reportOpen = () => client.setPanelOpen(true);
-    if (client.isOpen()) reportOpen();
-    else void client.connect().then(reportOpen).catch(() => {});
+    // 连接由 client 自己负责；面板开关意图由下面的 open effect 同步。
+    // 不能在这里 connect().then(open) —— 用户在连上之前点关闭时，
+    // 晚到的 then 会把 close 覆盖成 open（服务端于是记着「开着」，接管后弹面板）。
+    if (!client.isOpen()) void client.connect().catch(() => {});
 
     return () => {
       cancelled = true;
@@ -776,7 +842,19 @@ export const AiPanel: React.FC<AiPanelProps> = ({
       client.close();
       clientRef.current = null;
     };
-  }, [applyConfig]);
+  }, [applyConfig, clientId]);
+
+  /**
+   * 面板可见性变化 → 上报服务端（客户端级）。
+   *
+   * 关闭后组件仍挂载（保活 / 保留流式状态），所以不能只靠 mount effect 上报；
+   * 用户重新打开时也必须把 open=true 补回去，否则服务端一直以为关着。
+   */
+  useEffect(() => {
+    clientRef.current?.setPanelOpen(open);
+    // clientId / applyConfig 变化会重建 client（见上面的 mount effect），
+    // 新 client 的 panelDesired 是空的，必须在这里补一次。
+  }, [open, clientId, applyConfig]);
 
   // 会话切换（重连/新开）时把绑定更新到新 sessionId
   useEffect(() => {
@@ -866,8 +944,15 @@ export const AiPanel: React.FC<AiPanelProps> = ({
         if (m.goal) out.push({ role: 'user', content: m.goal });
         for (const it of m.items) {
           if (it.kind === 'message') out.push({ role: 'assistant', content: it.text });
+          else if (it.kind === 'tool') {
+            // 工具摘要必须进历史：否则 continue 后模型失忆，会把同一文件再读一遍。
+            // 前缀与服务端系统提示词规则对齐，标明「早先实测、可能截断」。
+            const summary = toolItemHistorySummary(it);
+            if (summary) out.push({ role: 'assistant', content: summary });
+          }
         }
         if (m.final) out.push({ role: 'assistant', content: m.final });
+        else if (m.error) out.push({ role: 'assistant', content: `[previous run did not finish: ${m.error}]` });
       }
     }
     return out;
@@ -876,14 +961,33 @@ export const AiPanel: React.FC<AiPanelProps> = ({
   /* ----------------- 发送一条消息 ----------------- */
 
   const stopRun = useCallback(() => {
-    agentRunIdRef.current += 1;
     const resolve = approvalRef.current;
     approvalRef.current = null;
     resolve?.(false, false);
+
+    // 先把 UI 收掉，再 bump runId + cancel。
+    // 不能反过来：cancel() 会同步调 handlers.onError('Cancelled')，而 agent 回调里
+    // 有 `if (!alive() && !resumedEntryRef.current) return` —— 若先 bump，
+    // alive() 已是 false，onError 直接返回，entry.streaming 永远停不掉，
+    // 表现就是「点 Stop 后消息卡还在 working…」。
+    const agentTarget = resumedEntryRef.current ?? lastAgentEntryRef.current;
+    if (agentTarget) {
+      patchEntry(agentTarget, { streaming: false, error: 'Cancelled', aborted: true });
+    }
+    const textTarget = activeTextEntryRef.current ?? followedTextEntryRef.current;
+    if (textTarget) {
+      patchEntry(textTarget, { streaming: false, error: 'Cancelled', aborted: true });
+    }
+    resumedEntryRef.current = null;
+    followedRunRef.current = null;
+    followedTextEntryRef.current = null;
+    activeTextEntryRef.current = null;
+    // lastAgentEntryRef 保留：entry 还在消息列表里，重连时 onResumed 靠它找回
+
+    agentRunIdRef.current += 1;
     clientRef.current?.cancel();
-    setBusy(false);
-    busyRef.current = false;
-  }, []);
+    endRun();
+  }, [patchEntry]);
 
   /**
    * 终端断开 → **本地**停掉正在跑的 Agent 的 UI 状态，但**不向服务端发 cancel**。
@@ -905,10 +1009,12 @@ export const AiPanel: React.FC<AiPanelProps> = ({
     busyRef.current = false;
   }, [terminalConnected]);
 
-  const clearActiveSession = useCallback(() => {
+  const resetActiveSession = useCallback(() => {
     const id = activeIdRef.current;
     setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, messages: [], title: 'New chat' } : s)));
-    // 服务端也存着这条会话的历史（供接管设备重建），不清的话下次挂载又会被回放回来
+    // 服务端也存着这条会话的历史（供接管设备重建），不清的话下次挂载又会被回放回来。
+    // UI 语义是 Reset（清空上下文），不是「关闭面板」：
+    // 这里刻意不调用 setPanelOpen / onClose，面板开/关状态保持原样。
     clientRef.current?.clearHistory();
   }, []);
 
@@ -916,10 +1022,10 @@ export const AiPanel: React.FC<AiPanelProps> = ({
     const text = rawText.trim();
     if (!text) return;
 
-    // `/clear` 清掉当前会话的全部上下文（对话历史 + 标题），不发给模型
-    if (text === '/clear') {
+    // `/reset`（兼容旧 `/clear`）清掉当前会话的全部上下文，不发给模型
+    if (text === '/reset' || text === '/clear') {
       if (busyRef.current) stopRun();
-      clearActiveSession();
+      resetActiveSession();
       setInput('');
       return;
     }
@@ -949,19 +1055,22 @@ export const AiPanel: React.FC<AiPanelProps> = ({
       // 本机发起 = owned，跟随态一律让位，避免被动 handlers 又往同一 entry 里塞
       followedRunRef.current = null;
       followedTextEntryRef.current = null;
+      activeTextEntryRef.current = entryId;
       appendEntry({ id: entryId, kind: 'text', answer: '', streaming: true, at: Date.now() });
       client.diagnose(
         { text: textToSend, source: sourceToSend, question: text, host: target?.host, username: target?.username, cwd: target?.cwd },
         {
           onPrepared: (payload) => patchEntry(entryId, { prepared: payload }),
           onDelta: (chunk) => { acc += chunk; patchEntry(entryId, { answer: acc }); },
-          onDone: (meta) => { patchEntry(entryId, { meta, streaming: false }); endRun(); },
+          onDone: (meta) => { if (activeTextEntryRef.current === entryId) activeTextEntryRef.current = null; patchEntry(entryId, { meta, streaming: false }); endRun(); },
           onError: (msg, aborted) => {
+            if (activeTextEntryRef.current === entryId) activeTextEntryRef.current = null;
             patchEntry(entryId, { error: msg, aborted, streaming: false });
             endRun();
           },
         },
       ).catch((err: any) => {
+        if (activeTextEntryRef.current === entryId) activeTextEntryRef.current = null;
         patchEntry(entryId, { error: err?.message || 'Request failed', streaming: false });
         endRun();
       });
@@ -981,6 +1090,7 @@ export const AiPanel: React.FC<AiPanelProps> = ({
     resumedEntryRef.current = null;
     followedRunRef.current = null;
     followedTextEntryRef.current = null;
+    activeTextEntryRef.current = null;
 
     client.agent(
       { text: textToSend, source: sourceToSend, question: text, host: target?.host, username: target?.username, cwd: target?.cwd },
@@ -1033,7 +1143,7 @@ export const AiPanel: React.FC<AiPanelProps> = ({
           lastAgentEntryRef.current = null;
           patchEntry(target, {
             final: payload.answer, stopReason: payload.stopReason, steps: payload.steps, streaming: false,
-            meta: { ms: payload.ms },
+            meta: { ms: payload.ms, usage: payload.usage },
           });
           endRun();
         },
@@ -1051,7 +1161,7 @@ export const AiPanel: React.FC<AiPanelProps> = ({
       patchEntry(entryId, { error: err?.message || 'Agent failed to start', streaming: false });
       endRun();
     });
-  }, [appendEntry, appendAgentItem, includeScreen, getContext, target?.host, target?.username, target?.cwd, sessionId, terminalConnected, patchEntry, patchAgentItem, setSessionTitleFromText, buildHistory, clearActiveSession, stopRun, maxSteps]);
+  }, [appendEntry, appendAgentItem, includeScreen, getContext, target?.host, target?.username, target?.cwd, sessionId, terminalConnected, patchEntry, patchAgentItem, setSessionTitleFromText, buildHistory, resetActiveSession, stopRun, maxSteps]);
 
   /* ----------------- draft 命令执行 ----------------- */
 
@@ -1071,15 +1181,58 @@ export const AiPanel: React.FC<AiPanelProps> = ({
 
   /* ----------------- 配置保存 / 测试 ----------------- */
 
+  const handleFetchModels = async () => {
+    setFetchingModels(true);
+    setModelsError(null);
+    try {
+      const result = await fetchAiModels({
+        baseUrl: formBaseUrl,
+        apiKey: formApiKey.trim() || undefined,
+      });
+      if (!result.ok || !result.models?.length) {
+        setModelsError(result.message || 'No models returned');
+        return;
+      }
+      setModelOptions(result.models);
+      // 当前值不在列表里（首次配置 / 手填的别名）就落到第一个，避免下拉显示空。
+      if (!formModel || !result.models.includes(formModel)) {
+        setFormModel(result.models[0]);
+      }
+    } catch (err: any) {
+      setModelsError(err?.message || 'Fetch failed');
+    } finally {
+      setFetchingModels(false);
+    }
+  };
+
   const handleSave = async () => {
     setSaving(true);
     setTestResult(null);
+    const positiveInt = (value: string) => {
+      const n = Number(value);
+      return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+    };
+    const contextWindowTokens = positiveInt(formContextWindow);
+    const maxInputTokens = positiveInt(formMaxInput);
+    const maxOutputTokens = positiveInt(formMaxOutput);
     try {
       const next = await saveAiConfig(
-        { baseUrl: formBaseUrl, model: formModel, redactPrivateIp: formRedactIp, commandWhitelist: formWhitelist.split(/[,\n]/).map((s) => s.trim()).filter(Boolean) },
+        {
+          baseUrl: formBaseUrl,
+          model: formModel,
+          reasoningEffort: formReasoning,
+          redactPrivateIp: formRedactIp,
+          commandWhitelist: formWhitelist.split(/[,\n]/).map((s) => s.trim()).filter(Boolean),
+          ...(contextWindowTokens ? { contextWindowTokens } : {}),
+          ...(maxInputTokens ? { maxInputTokens } : {}),
+          ...(maxOutputTokens ? { maxOutputTokens } : {}),
+        },
         formApiKey.trim() ? formApiKey.trim() : undefined,
       );
       setConfig(next);
+      setFormContextWindow(String(next.contextWindowTokens));
+      setFormMaxInput(String(next.maxInputTokens));
+      setFormMaxOutput(String(next.maxOutputTokens));
       setFormApiKey('');
       setConfigError(null);
     } catch (err: any) {
@@ -1098,29 +1251,6 @@ export const AiPanel: React.FC<AiPanelProps> = ({
       setTestResult({ ok: false, message: err?.message || 'Test failed' });
     } finally {
       setTesting(false);
-    }
-  };
-
-  const handleFetchModels = async () => {
-    setFetchingModels(true);
-    setModelsError(null);
-    try {
-      const result = await fetchAiModels({
-        baseUrl: formBaseUrl,
-        apiKey: formApiKey.trim() || undefined,
-      });
-      if (!result.ok || !result.models?.length) {
-        setModelsError(result.message || 'No models returned');
-        return;
-      }
-      setModelOptions(result.models);
-      if (!formModel || !result.models.includes(formModel)) {
-        setFormModel(result.models[0]);
-      }
-    } catch (err: any) {
-      setModelsError(err?.message || 'Fetch failed');
-    } finally {
-      setFetchingModels(false);
     }
   };
 
@@ -1198,25 +1328,32 @@ export const AiPanel: React.FC<AiPanelProps> = ({
           <button
             onClick={() => { clientRef.current?.setPanelOpen(false); onClose(); }}
             className={`p-1.5 sm:p-1 rounded-md cursor-pointer ${palette.button}`}
-            title="Close"
+            title="Hide (keep conversation)"
+          >
+            <EyeOff className="w-3.5 h-3.5" />
+          </button>
+          <button
+            onClick={() => { clientRef.current?.setPanelOpen(false, true); onClose(); }}
+            className={`p-1.5 sm:p-1 rounded-md cursor-pointer ${palette.button}`}
+            title="Close and reset context"
           >
             <X className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
 
-      {/* 单会话：显示当前对话标题 + 清空。多 chat 已移除（服务端按 SSH 会话只存一条） */}
+      {/* 单会话：显示当前对话标题 + Reset（清空上下文，不关面板）。多 chat 已移除 */}
       {!showSettings && (
       <div className={`flex items-center gap-1.5 px-2 py-1 border-b shrink-0 ${palette.header}`}>
         <span className={`flex-1 min-w-0 truncate text-[10px] font-mono ${palette.subtle}`} title={activeSession?.title || 'New chat'}>
           {activeSession?.title || 'New chat'}
         </span>
         <button
-          onClick={() => { if (busyRef.current) stopRun(); clearActiveSession(); }}
+          onClick={() => { if (busyRef.current) stopRun(); resetActiveSession(); }}
           className={`p-1 min-w-[26px] min-h-[26px] sm:min-w-[30px] sm:min-h-[30px] flex items-center justify-center rounded-md border cursor-pointer shrink-0 ${palette.button}`}
-          title="Clear conversation"
+          title="Reset context (clear conversation)"
         >
-          <Trash2 className="w-3 h-3" />
+          <RotateCcw className="w-3 h-3" />
         </button>
       </div>
       )}
@@ -1300,47 +1437,115 @@ export const AiPanel: React.FC<AiPanelProps> = ({
                 <div className={`text-[10px] font-semibold uppercase tracking-wider ${palette.subtle}`}>Model</div>
                 <label className="block space-y-1">
                   <span className="font-medium">Base URL</span>
-                  <input value={formBaseUrl} onChange={(e) => setFormBaseUrl(e.target.value)} placeholder="https://api.example.com/v1" spellCheck={false} autoCapitalize="off" autoCorrect="off" className={`h-9 sm:h-[30px] w-full rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none ${palette.input}`} />
-                </label>
-                <label className="block space-y-1">
-                  <span className="font-medium">API Key</span>
-                  <input type="password" value={formApiKey} onChange={(e) => setFormApiKey(e.target.value)} disabled={config?.keyFromEnv} placeholder={config?.keyFromEnv ? 'from env' : config?.hasKey ? 'saved' : 'optional'} autoComplete="off" className={`h-9 sm:h-[30px] w-full rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none disabled:opacity-50 ${palette.input}`} />
+                  <input value={formBaseUrl} onChange={(e) => { setFormBaseUrl(e.target.value); setModelOptions([]); setModelsError(null); }} placeholder="https://api.example.com/v1" spellCheck={false} autoCapitalize="off" autoCorrect="off" className={`h-9 sm:h-[30px] w-full rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none ${palette.input}`} />
                 </label>
                 <label className="block space-y-1">
                   <span className="font-medium">Model</span>
                   <div className="flex items-center gap-1.5">
-                    {modelOptions.length > 0 ? (
-                      <select
-                        value={formModel}
-                        onChange={(e) => setFormModel(e.target.value)}
-                        className={`h-9 sm:h-[30px] min-w-0 flex-1 rounded-md border px-1.5 text-[16px] sm:text-[11px] font-mono focus:outline-none ${palette.input}`}
-                      >
-                        {formModel && !modelOptions.includes(formModel) ? (
-                          <option value={formModel}>{formModel}</option>
-                        ) : null}
-                        {modelOptions.map((id) => (
-                          <option key={id} value={id}>{id}</option>
-                        ))}
-                      </select>
-                    ) : (
-                      <input value={formModel} onChange={(e) => setFormModel(e.target.value)} placeholder="gpt-4o-mini" spellCheck={false} autoCapitalize="off" autoCorrect="off" className={`h-9 sm:h-[30px] min-w-0 flex-1 rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none ${palette.input}`} />
-                    )}
+                    <input
+                      list={modelListId}
+                      value={formModel}
+                      onChange={(e) => setFormModel(e.target.value)}
+                      placeholder="gpt-4o-mini"
+                      spellCheck={false}
+                      autoCapitalize="off"
+                      autoCorrect="off"
+                      className={`h-9 sm:h-[30px] min-w-0 flex-1 rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none ${palette.input}`}
+                    />
+                    <datalist id={modelListId}>
+                      {modelOptions.map((id) => (
+                        <option key={id} value={id} />
+                      ))}
+                    </datalist>
                     <button
                       type="button"
                       onClick={handleFetchModels}
                       disabled={fetchingModels || !formBaseUrl.trim()}
                       className={`${buttonClass} ${palette.button} shrink-0`}
-                      title="Fetch models"
+                      title="Fetch model list from this Base URL"
                     >
                       {fetchingModels ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
                       <span>Fetch</span>
                     </button>
                   </div>
-                  {modelOptions.length > 0 && (
-                    <input value={formModel} onChange={(e) => setFormModel(e.target.value)} placeholder="or type a model id" spellCheck={false} autoCapitalize="off" autoCorrect="off" className={`h-9 sm:h-[30px] w-full rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none ${palette.input}`} />
+                  {modelsError && (
+                    <span className="block text-[10px] leading-snug text-rose-500">{modelsError}</span>
                   )}
-                  {modelsError && <span className="text-rose-500">{modelsError}</span>}
+                  <span className={`block text-[10px] leading-snug ${palette.subtle}`}>
+                    {modelOptions.length > 0
+                      ? `${modelOptions.length} models fetched — pick one or type a model id.`
+                      : 'Fetch lists models from Base URL. Pin a concrete model when you can — auto may switch upstreams and start a cold prompt cache.'}
+                  </span>
                 </label>
+                <label className="block space-y-1">
+                  <span className="font-medium">Reasoning</span>
+                  <select
+                    value={formReasoning}
+                    onChange={(e) => setFormReasoning(e.target.value as AiConfigView['reasoningEffort'])}
+                    className={`h-9 sm:h-[30px] w-full rounded-md border px-1.5 text-[16px] sm:text-[11px] focus:outline-none ${palette.input}`}
+                  >
+                    <option value="auto">Auto — provider default (nothing sent)</option>
+                    <option value="off">Off</option>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                    <option value="max">Max</option>
+                  </select>
+                  <span className={`block text-[10px] leading-snug ${palette.subtle}`}>
+                    Auto sends nothing and keeps the endpoint default. Other values are sent as <code>reasoning_effort</code> — pick one your gateway supports.
+                  </span>
+                </label>
+                <label className="block space-y-1">
+                  <span className="font-medium">API Key</span>
+                  <input type="password" value={formApiKey} onChange={(e) => setFormApiKey(e.target.value)} disabled={config?.keyFromEnv} placeholder={config?.keyFromEnv ? 'from env' : config?.hasKey ? 'saved' : 'optional'} autoComplete="off" className={`h-9 sm:h-[30px] w-full rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none disabled:opacity-50 ${palette.input}`} />
+                </label>
+              </div>
+              <div className="space-y-1.5 border-t pt-2 border-inherit">
+                <div className={`text-[10px] font-semibold uppercase tracking-wider ${palette.subtle}`}>Token budget</div>
+                <div className="grid grid-cols-2 gap-2">
+                  <label className="block space-y-1">
+                    <span className="font-medium">Context window</span>
+                    <input
+                      type="number"
+                      inputMode="numeric"
+                      min={2000}
+                      max={2000000}
+                      step={1000}
+                      value={formContextWindow}
+                      onChange={(e) => setFormContextWindow(e.target.value)}
+                      className={`h-9 sm:h-[30px] w-full rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none ${palette.input}`}
+                    />
+                  </label>
+                  <label className="block space-y-1">
+                    <span className="font-medium">Max output</span>
+                    <input
+                      type="number"
+                      inputMode="numeric"
+                      min={128}
+                      max={1000000}
+                      step={128}
+                      value={formMaxOutput}
+                      onChange={(e) => setFormMaxOutput(e.target.value)}
+                      className={`h-9 sm:h-[30px] w-full rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none ${palette.input}`}
+                    />
+                  </label>
+                </div>
+                <label className="block space-y-1">
+                  <span className="font-medium">Terminal context</span>
+                  <input
+                    type="number"
+                    inputMode="numeric"
+                    min={500}
+                    max={2000000}
+                    step={500}
+                    value={formMaxInput}
+                    onChange={(e) => setFormMaxInput(e.target.value)}
+                    className={`h-9 sm:h-[30px] w-full rounded-md border px-2 text-[16px] sm:text-[11px] leading-tight font-mono focus:outline-none ${palette.input}`}
+                  />
+                </label>
+                <span className={`block text-[10px] leading-snug ${palette.subtle}`}>
+                  Context window = total input budget used to size agent history; Terminal context = max terminal output sent with a request; Max output = <code>max_tokens</code> per reply. Values beyond the model limit may be rejected by the endpoint.
+                </span>
               </div>
               <div className="space-y-1.5 border-t pt-2 border-inherit">
                 <div className={`text-[10px] font-semibold uppercase tracking-wider ${palette.subtle}`}>Behavior</div>
@@ -1573,7 +1778,7 @@ const ChatEntryView: React.FC<{
             {entry.meta && (
               <span className={`text-[10px] font-mono ${palette.subtle}`}>
                 {entry.meta.ms !== undefined ? `${entry.meta.ms}ms · ` : ''}{`${entry.meta.chars || 0} chars`}
-                {entry.meta.usage?.total_tokens ? ` · ${entry.meta.usage.total_tokens} tokens` : ''}
+                {entry.meta.usage ? ` · ${usageSummary(entry.meta.usage)}` : ''}
               </span>
             )}
           </div>
@@ -1616,7 +1821,7 @@ const ChatEntryView: React.FC<{
           {entry.meta && (
             <div className={`text-[10px] font-mono ${palette.subtle}`}>
               {entry.meta.ms !== undefined ? `${entry.meta.ms}ms · ` : ''}{`${entry.meta.chars || 0} chars`}
-              {entry.meta.usage?.total_tokens ? ` · ${entry.meta.usage.total_tokens} tokens` : ''}
+              {entry.meta.usage ? ` · ${usageSummary(entry.meta.usage)}` : ''}
             </div>
           )}
         </div>
@@ -1670,6 +1875,9 @@ const ChatEntryView: React.FC<{
       )}
       {entry.error && (
         <div className="flex items-start gap-2 text-rose-500"><AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" /><span className="leading-relaxed">{entry.error}</span></div>
+      )}
+      {entry.meta?.usage && (
+        <div className={`text-[10px] font-mono ${palette.subtle}`}>{usageSummary(entry.meta.usage)}</div>
       )}
     </div>
   );

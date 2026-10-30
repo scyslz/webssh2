@@ -42,7 +42,7 @@ Three WebSocket channels with clearly separated responsibilities:
 Key design points:
 
 - **The `/ai` channel never owns an SSH connection.** It borrows an existing session from the session manager via `sessionId` and runs tools as new channels on that already-authenticated connection. If the session is gone, the agent refuses to start rather than fail step by step.
-- **AI state is session-scoped.** An `AiSession` (conversation history, approval memory, in-flight run, event buffer) lives alongside the SSH session. A dropped `/ai` connection only detaches — the run continues. On reconnect or takeover the server replays a **full conversation snapshot** (`ai_history`) plus the resumed-run marker; the client rebuilds from that and follows subsequent events live. A device that never sent a request attaches as a passive follower, so it keeps receiving output instead of waiting for a refresh.
+- **AI state is session-scoped.** An `AiSession` (conversation history, approval memory, in-flight run, event buffer) lives alongside the SSH session. A dropped `/ai` connection only detaches — the run continues. On reconnect or takeover the server replays a **full conversation snapshot** (`ai_history`) plus the resumed-run marker; the client rebuilds from that and follows subsequent events live. A device that never sent a request attaches as a passive follower, so it keeps receiving output instead of waiting for a refresh. Panel visibility is server-authoritative: reconnect and takeover restore it from the session's `panelOpen` state (the takeover path re-reads it over HTTP instead of trusting a stale `/sys` snapshot). A network drop never clears it. **Hide** only hides the panel and keeps the conversation; **Reset** clears the conversation context and revokes the session's "Approve Session" auto-approval memory while keeping the panel open; **Close** (X) hides the panel and clears its state/history/auto-approval, as does closing the terminal tab. `panelClientId` records the last opener for attribution/logging.
 - **Risk grading is server-side.** The model proposes tool calls; the server grades each command (`safe` / `caution` / `dangerous`) and decides whether human approval is required. The model's self-assessment is shown only for comparison.
 - **AI credentials are separate.** The provider API key is stored encrypted, never in the plain config file, and never returned to the client.
 
@@ -154,13 +154,22 @@ Commonly configurable options:
 
 AI configuration is split in two places:
 
-- Non-secret settings (`enabled`, `baseUrl`, `model`, token budgets, `redactPrivateIp`, `commandWhitelist`) go into `conf/webssh_config.json`.
+- Non-secret settings (`enabled`, `baseUrl`, `model`, `reasoningEffort`, `contextWindowTokens`, `maxInputTokens`, `maxOutputTokens`, `redactPrivateIp`, `commandWhitelist`) go into `conf/webssh_config.json`.
 - The API key goes into an encrypted `<data dir>/ai_secrets.json`.
+
+`reasoningEffort` is sent as `reasoning_effort` on every chat request: `auto` sends nothing (the provider default applies), `off` sends `none`, and `low` / `medium` / `high` / `max` are passed through. Support for individual levels is endpoint-specific; an unsupported value is reported as a configuration error instead of being retried silently.
+
+Token budgets are configurable from AI Settings: `contextWindowTokens` (default 128000) is the total input budget used to size agent history and tool output; `maxInputTokens` (default 8000) limits how much terminal output is attached to a request; `maxOutputTokens` (default 2000) is sent as `max_tokens`. Set these to match the model's actual limits; oversized values may be rejected by the endpoint.
+
+The model field has a **Fetch** button that calls the endpoint's `/v1/models` list (using the current, possibly unsaved Base URL and API key), so you can pick from the gateway's advertised models instead of typing an id by hand.
+
+Agent conversations are kept in an append-only order (system → prior turns → current task) so the unchanged prefix can be reused by provider-side prompt caching. Requests also carry a stable per-session `prompt_cache_key` where the endpoint supports it, and the UI shows cache hit rate / reasoning tokens from `usage`. Pin a concrete model rather than `auto` if you want the most stable cache routing.
 
 Environment variables override the stored config, so you can avoid persisting secrets in containers:
 
 - `WEBSSH_AI_BASE_URL`
 - `WEBSSH_AI_MODEL`
+- `WEBSSH_AI_REASONING` (`auto` / `off` / `low` / `medium` / `high` / `max`)
 - `WEBSSH_AI_API_KEY`
 
 Agent behavior is bounded: a configurable max step count per request (hard-capped server-side), output truncation limits per tool, and an optional command allowlist for skipping approval on known-safe binaries.

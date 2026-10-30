@@ -33,12 +33,29 @@ export interface QuickCommandConfig {
  * AI 配置里可以落盘的部分。**API key 不在这里** —— 它单独存进 ai_secrets.json
  * 的加密存储（见 server/ai/config.ts），避免跟着普通配置一起被备份/导出。
  */
+/**
+ * 推理强度。`auto` = 不发任何字段，沿用端点的默认值；`off` = 明确要求不思考。
+ *
+ * 值域刻意跟着 OpenAI 的 `reasoning_effort` 走（none 由 off 映射），
+ * 但 `max` 是部分网关（DeepSeek / 聚合层）才有的档位 —— 发之前先确认端点支持，
+ * 不支持时 provider 会把 400 翻译成可操作的提示（见 provider.ts）。
+ */
+export type AiReasoningEffort = 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max';
+
 export interface AiSettings {
   enabled?: boolean;
   baseUrl?: string;
   model?: string;
+  /**
+   * 模型上下文窗口（总输入 token 预算）。用于给 agent 历史/tool 输出定预算；
+   * 不是硬截断，实际 prompt 还受准备阶段和请求体大小限制。
+   */
+  contextWindowTokens?: number;
+  /** 终端输出最多带多少 token 给模型（diagnose/draft/agent 的 terminal_tail） */
   maxInputTokens?: number;
+  /** 单次回复的 max_tokens（推理开启时 provider 会抬到至少 4096） */
   maxOutputTokens?: number;
+  reasoningEffort?: AiReasoningEffort;
   redactPrivateIp?: boolean;
   /**
    * 追加到默认只读白名单里的命令名。命中白名单 + 判分 safe + 非 root 会话，

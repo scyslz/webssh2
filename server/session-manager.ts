@@ -85,10 +85,13 @@ export interface SessionHealth {
   /**
    * 该会话的 AI 面板是否开着。
    *
-   * 面板开关是会话级状态（存于 session.ai.panelOpen）。接管/重连方在**挂载面板前**
-   * 通过 /sys 快照读到这里，就知道要不要自动打开 —— 无需先建一条 /ai 连接。
+   * 面板开关是客户端级状态（存于 session.ai.panelOpen / panelClientId）。
+   * 重连/接管方在**挂载面板前**通过 /sys 快照读这里；只有 clientId 与自己一致
+   * （同一个浏览器 tab 刷新）才自动打开，别的设备接管时不会硬开。
    */
   aiPanelOpen?: boolean;
+  /** 最后打开面板的客户端 tab.id；仅归属/日志，不作为恢复过滤条件 */
+  aiPanelClientId?: string;
 }
 
 export interface HealthSnapshot {
@@ -189,6 +192,14 @@ export interface SessionManager {
     host?: string;
     username?: string;
   };
+  /**
+   * 现查某个会话的 AI 面板状态。
+   *
+   * `/sys` 快照是周期性推送的，接管设备点开 sessions 弹窗时拿到的快照可能已经滞后
+   * （用户刚在另一台设备关掉面板，快照里还是 open=true）。接管前用这个 HTTP 端点
+   * 现查一次，才能避免「明明关了，接管后又弹出来」。
+   */
+  getAiPanelState(sessionId: string): { open: boolean; clientId: string };
   createLiveSession(
     sessionId: string,
     sshConfig: ParsedSSHInfo,
@@ -392,6 +403,7 @@ export function createSessionManager(): SessionManager {
         title: session.title,
         credentialId: session.sshConfig.id || undefined,
         aiPanelOpen: Boolean(session.ai?.panelOpen),
+        aiPanelClientId: session.ai?.panelClientId || '',
       });
     }
     return {
@@ -1266,6 +1278,14 @@ export function createSessionManager(): SessionManager {
         lastActivity: session.lastActivity,
         host: session.sshConfig.host,
         username: session.sshConfig.username,
+      };
+    },
+    getAiPanelState(sessionId: string) {
+      const session = sshSessions.get(sessionId);
+      const ai = session?.ai || aiSessions.get(sessionId);
+      return {
+        open: Boolean(ai?.panelOpen),
+        clientId: ai?.panelClientId || '',
       };
     },
     createLiveSession,

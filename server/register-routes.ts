@@ -18,5 +18,5 @@ export function registerRoutes(app: express.Express, sessionManager: SessionMana
   registerSshRoutes(app, sessionManager);
   registerConfigRoutes(app);
   registerFileRoutes(app, sessionManager);
-  registerAiRoutes(app);
+  registerAiRoutes(app, sessionManager);
 }

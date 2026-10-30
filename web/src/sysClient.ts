@@ -13,8 +13,10 @@ export interface SessionHealth {
   shared: boolean;
   title?: string;
   credentialId?: string;
-  /** 该会话 AI 面板是否开着（会话级状态，接管/重连方据此自动打开面板） */
+  /** 该会话 AI 面板是否开着（客户端级状态；只有 clientId 匹配才自动打开） */
   aiPanelOpen?: boolean;
+  /** 最后打开面板的客户端 tab.id；仅归属/日志，不作为恢复过滤条件 */
+  aiPanelClientId?: string;
 }
 
 export interface HealthSnapshot {

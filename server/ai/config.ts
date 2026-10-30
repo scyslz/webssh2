@@ -4,6 +4,7 @@ import {
   readEncryptedFile,
   writeAppConfig,
   writeEncryptedFile,
+  type AiReasoningEffort,
   type AiSettings,
 } from '../lib.ts';
 
@@ -17,13 +18,24 @@ import {
  */
 const AI_SECRET_FILE = 'ai_secrets.json';
 
+export const DEFAULT_CONTEXT_WINDOW_TOKENS = 128000;
 export const DEFAULT_MAX_INPUT_TOKENS = 8000;
 export const DEFAULT_MAX_OUTPUT_TOKENS = 2000;
+/**
+ * 开启推理后输出预算的下限。
+ *
+ * `max_tokens` 同时覆盖思考与最终回答；2000 的默认值很容易被思考吃干净，
+ * 结果就是内容为空、finish_reason=length。这里只在「明确开了推理」时抬到 4096，
+ * 不改变 auto/off 下的既有行为。
+ */
+export const REASONING_MIN_OUTPUT_TOKENS = 4096;
 /** 上下限用来兜住手填的离谱值；下限 500 保证 prepareContext 的字符下限不会先咬到预算 */
+const MIN_CONTEXT_WINDOW_TOKENS = 2000;
+const MAX_CONTEXT_WINDOW_TOKENS = 2_000_000;
 const MIN_MAX_INPUT_TOKENS = 500;
-const MAX_MAX_INPUT_TOKENS = 200000;
+const MAX_MAX_INPUT_TOKENS = 2_000_000;
 const MIN_MAX_OUTPUT_TOKENS = 128;
-const MAX_MAX_OUTPUT_TOKENS = 8192;
+const MAX_MAX_OUTPUT_TOKENS = 1_000_000;
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, Math.floor(value)));
 
@@ -55,8 +67,11 @@ export interface ResolvedAiConfig {
   baseUrl: string;
   model: string;
   apiKey: string;
+  /** 模型上下文窗口（总输入预算，给 agent history 定预算用） */
+  contextWindowTokens: number;
   maxInputTokens: number;
   maxOutputTokens: number;
+  reasoningEffort: AiReasoningEffort;
   redactPrivateIp: boolean;
   commandWhitelist: string[];
   keyFromEnv: boolean;
@@ -73,10 +88,22 @@ export interface PublicAiConfig {
   endpoint: string;
   hasKey: boolean;
   keyFromEnv: boolean;
+  contextWindowTokens: number;
   maxInputTokens: number;
   maxOutputTokens: number;
+  reasoningEffort: AiReasoningEffort;
   redactPrivateIp: boolean;
   commandWhitelist: string[];
+}
+
+const REASONING_EFFORTS: AiReasoningEffort[] = ['auto', 'off', 'low', 'medium', 'high', 'max'];
+
+/** 把任意来路的值收进值域；认不出来就当 auto（不改变端点默认行为） */
+export function normalizeReasoningEffort(value: unknown): AiReasoningEffort {
+  const effort = String(value ?? '').trim().toLowerCase();
+  return (REASONING_EFFORTS as string[]).includes(effort)
+    ? effort as AiReasoningEffort
+    : 'auto';
 }
 
 interface AiSecret {
@@ -101,6 +128,7 @@ export function resolveChatEndpoint(baseUrl: string): string {
   return `${trimmed}/v1/chat/completions`;
 }
 
+/** 把 baseUrl 归一成 `/v1/models`，与 resolveChatEndpoint 同一套写法兼容 */
 export function resolveModelsEndpoint(baseUrl: string): string {
   const trimmed = (baseUrl || '').trim().replace(/\/+$/, '');
   if (!trimmed) return '';
@@ -118,7 +146,13 @@ export function resolveAiConfig(): ResolvedAiConfig {
   const apiKey = envKey || secret.apiKey || '';
   const baseUrl = (process.env.WEBSSH_AI_BASE_URL || settings.baseUrl || '').trim();
   const model = (process.env.WEBSSH_AI_MODEL || settings.model || '').trim();
+  const reasoningEffort = normalizeReasoningEffort(
+    process.env.WEBSSH_AI_REASONING || settings.reasoningEffort,
+  );
 
+  const contextWindowTokens = Number(settings.contextWindowTokens) > 0
+    ? clamp(Number(settings.contextWindowTokens), MIN_CONTEXT_WINDOW_TOKENS, MAX_CONTEXT_WINDOW_TOKENS)
+    : DEFAULT_CONTEXT_WINDOW_TOKENS;
   const maxInputTokens = Number(settings.maxInputTokens) > 0
     ? clamp(Number(settings.maxInputTokens), MIN_MAX_INPUT_TOKENS, MAX_MAX_INPUT_TOKENS)
     : DEFAULT_MAX_INPUT_TOKENS;
@@ -140,8 +174,10 @@ export function resolveAiConfig(): ResolvedAiConfig {
     baseUrl,
     model,
     apiKey,
+    contextWindowTokens,
     maxInputTokens,
     maxOutputTokens,
+    reasoningEffort,
     redactPrivateIp: settings.redactPrivateIp ?? false,
     commandWhitelist: normalizeWhitelist(settings.commandWhitelist),
     keyFromEnv: Boolean(envKey),
@@ -160,8 +196,10 @@ export function publicAiConfig(): PublicAiConfig {
     endpoint: resolveChatEndpoint(config.baseUrl),
     hasKey: Boolean(config.apiKey),
     keyFromEnv: config.keyFromEnv,
+    contextWindowTokens: config.contextWindowTokens,
     maxInputTokens: config.maxInputTokens,
     maxOutputTokens: config.maxOutputTokens,
+    reasoningEffort: config.reasoningEffort,
     redactPrivateIp: config.redactPrivateIp,
     commandWhitelist: config.commandWhitelist,
   };
@@ -183,15 +221,26 @@ export function saveAiSettings(
   if (patch.enabled !== undefined) next.enabled = patch.enabled;
   if (patch.baseUrl !== undefined) next.baseUrl = String(patch.baseUrl).trim();
   if (patch.model !== undefined) next.model = String(patch.model).trim();
+  if (patch.reasoningEffort !== undefined) next.reasoningEffort = normalizeReasoningEffort(patch.reasoningEffort);
   if (patch.redactPrivateIp !== undefined) next.redactPrivateIp = Boolean(patch.redactPrivateIp);
   if (patch.commandWhitelist !== undefined) next.commandWhitelist = normalizeWhitelist(patch.commandWhitelist);
+  if (patch.contextWindowTokens !== undefined) {
+    const value = Number(patch.contextWindowTokens);
+    if (Number.isFinite(value) && value > 0) {
+      next.contextWindowTokens = clamp(value, MIN_CONTEXT_WINDOW_TOKENS, MAX_CONTEXT_WINDOW_TOKENS);
+    }
+  }
   if (patch.maxInputTokens !== undefined) {
     const value = Number(patch.maxInputTokens);
-    if (Number.isFinite(value) && value > 0) next.maxInputTokens = Math.floor(value);
+    if (Number.isFinite(value) && value > 0) {
+      next.maxInputTokens = clamp(value, MIN_MAX_INPUT_TOKENS, MAX_MAX_INPUT_TOKENS);
+    }
   }
   if (patch.maxOutputTokens !== undefined) {
     const value = Number(patch.maxOutputTokens);
-    if (Number.isFinite(value) && value > 0) next.maxOutputTokens = Math.floor(value);
+    if (Number.isFinite(value) && value > 0) {
+      next.maxOutputTokens = clamp(value, MIN_MAX_OUTPUT_TOKENS, MAX_MAX_OUTPUT_TOKENS);
+    }
   }
 
   writeAppConfig({ ...config, ai: next });
