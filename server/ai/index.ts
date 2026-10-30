@@ -117,11 +117,13 @@ type AiHistoryEntry =
 interface AiSession {
   sessionId: string;
   /**
-   * 稳定的 prompt-cache 路由键，跟着 SSH 会话走。
+   * prompt-cache 路由键，正常跟随 SSH 会话。
    *
    * 同一个会话的 diagnose / draft / agent 全部复用它 —— 网关据此把请求
    * 路由到同一份前缀缓存；用 sessionId 哈希而不是原值，避免把会话标识
    * 直接写进上游日志。
+   *
+   * 普通重连/接管/Hide 不变；**Reset / Close+clear 会轮换**（新对话 = 新缓存命名空间）。
    */
   cacheKey: string;
   sockets: Set<WebSocket>;
@@ -190,12 +192,52 @@ function pushHistory(session: AiSession, entry: AiHistoryEntry): void {
   }
 }
 
+function makeCacheKey(seed: string): string {
+  return `webssh2-${createHash('sha256').update(seed).digest('hex').slice(0, 32)}`;
+}
+
+/**
+ * Reset / Close+clear 时轮换 prompt cache key。
+ *
+ * 清空上下文等于开始一段新对话，旧前缀已经不可能再用；换 key 让网关把新对话
+ * 当成新的缓存命名空间。普通重连/接管/Hide 不轮换。
+ */
+function rotateCacheKey(session: AiSession): void {
+  session.cacheKey = makeCacheKey(`${session.sessionId || 'anon'}:${randomUUID()}`);
+}
+
+/**
+ * 清空一条 AI 会话的上下文：abort run、拒绝挂起审批、撤销自动放行、清 history/buffer，
+ * 并轮换 cacheKey。调用方负责广播 `cleared`。
+ */
+function resetAiContext(session: AiSession, reason: 'reset' | 'close'): boolean {
+  const autoApproveCleared = Boolean(session.approvalMemory);
+  session.active?.controller.abort();
+  session.active = null;
+  session.respondApproval?.('', false);
+  session.respondApproval = null;
+  session.pendingApprovalInfo = null;
+  // 新对话不继承上一段对话的「Approve Session」免审批授权。
+  session.approvalMemory = null;
+  session.history = [];
+  session.buffer = [];
+  session.bufferBytes = 0;
+  rotateCacheKey(session);
+  sshLog('ai context reset', {
+    sessionId: session.sessionId,
+    reason,
+    autoApproveCleared,
+    cacheKeyRotated: true,
+  });
+  return autoApproveCleared;
+}
+
 export function createAiSession(sessionId: string): AiSession {
   // 没有 SSH 会话的只读连接拿一个随机 key，避免所有匿名连接共享同一条缓存路径。
   const cacheSeed = sessionId || `anon-${randomUUID()}`;
   return {
     sessionId,
-    cacheKey: `webssh2-${createHash('sha256').update(cacheSeed).digest('hex').slice(0, 32)}`,
+    cacheKey: makeCacheKey(cacheSeed),
     sockets: new Set(),
     active: null,
     respondApproval: null,
@@ -498,23 +540,13 @@ function attachSocket(session: AiSession, ws: WebSocket, hooks?: AiSshHooks) {
          * 刚清空的历史马上又被填回来。
          */
         if (!open && message.clearHistory === true) {
-          const autoApproveCleared = Boolean(session.approvalMemory);
-          session.active?.controller.abort();
-          session.active = null;
-          session.respondApproval?.('', false);
-          session.respondApproval = null;
-          session.pendingApprovalInfo = null;
-          // 清上下文同时撤销「Approve Session」的自动放行记忆：
-          // 新对话不应继承上一段对话攒下来的免审批授权。
-          session.approvalMemory = null;
-          session.history = [];
-          session.buffer = [];
-          session.bufferBytes = 0;
+          const autoApproveCleared = resetAiContext(session, 'close');
           send({ type: 'cleared' });
           sshLog('ai panel closed with history cleared', {
             sessionId: session.sessionId,
             clientId,
             autoApproveCleared,
+            cacheKeyRotated: true,
           });
         }
         return;
@@ -522,23 +554,11 @@ function attachSocket(session: AiSession, ws: WebSocket, hooks?: AiSshHooks) {
 
       case 'clear': {
         /**
-         * Reset 语义：清空这条 AI 会话的上下文（历史 + 事件缓冲），但**不关面板**。
-         * 有正在跑的 run 先 abort，否则 run 会继续往刚清空的 history 里写。
-         * 同时撤销 approvalMemory（Approve Session 的自动放行）——新上下文不应
-         * 继承上一段对话攒下来的免审批授权。
+         * Reset 语义：清空上下文（history/buffer/approvalMemory），轮换 cacheKey，
+         * 但**不关面板**。有正在跑的 run 先 abort，否则它会继续往刚清空的 history 写。
          */
-        const autoApproveCleared = Boolean(session.approvalMemory);
-        session.active?.controller.abort();
-        session.active = null;
-        session.respondApproval?.('', false);
-        session.respondApproval = null;
-        session.pendingApprovalInfo = null;
-        session.approvalMemory = null;
-        session.history = [];
-        session.buffer = [];
-        session.bufferBytes = 0;
+        resetAiContext(session, 'reset');
         send({ type: 'cleared' });
-        sshLog('ai context reset', { sessionId: session.sessionId, autoApproveCleared });
         return;
       }
 
